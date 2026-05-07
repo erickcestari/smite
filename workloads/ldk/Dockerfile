@@ -3,7 +3,6 @@ FROM debian:bookworm AS builder
 # Build arguments
 ARG LLVM_V=19
 ARG BITCOIN_VERSION=29.2
-ARG SCENARIO
 
 ENV LLVM_V=${LLVM_V}
 
@@ -61,7 +60,7 @@ ENV AFL_NO_CFG_FUZZING=1
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo afl build --release
 
-# Copy smite workspace files and build the Rust ldk-scenario binary
+# Copy smite workspace files and build all scenario binaries
 WORKDIR /smite
 COPY Cargo.toml Cargo.lock ./
 COPY smite/ smite/
@@ -69,8 +68,10 @@ COPY smite-ir/ smite-ir/
 COPY smite-ir-mutator/ smite-ir-mutator/
 COPY smite-nyx-sys/ smite-nyx-sys/
 COPY smite-scenarios/ smite-scenarios/
-RUN TARGET_PATH=/ldk-wrapper/target/release/ldk-node-wrapper \
-    cargo build -p smite-scenarios --bin ldk_${SCENARIO} --release --features nyx
+RUN set -eu; for f in smite-scenarios/src/bin/ldk_*.rs; do \
+        TARGET_PATH=/ldk-wrapper/target/release/ldk-node-wrapper \
+            cargo build -p smite-scenarios --bin "$(basename $f .rs)" --release --features nyx; \
+    done
 
 # Build crash handler shared libraries, LD_PRELOADed into ldk-node-wrapper to
 # report crashes immediately (before process teardown closes TCP sockets).

@@ -4,7 +4,6 @@ FROM debian:bookworm AS builder
 ARG LLVM_V=19
 ARG CLN_VERSION=v25.12.1
 ARG BITCOIN_VERSION=29.2
-ARG SCENARIO
 
 ENV LLVM_V=${LLVM_V}
 
@@ -81,7 +80,7 @@ RUN CC=afl-clang-lto ./configure --prefix=/usr/local --disable-rust \
 COPY workloads/cln/build-cln-lto.sh /tmp/
 RUN chmod +x /tmp/build-cln-lto.sh && /tmp/build-cln-lto.sh
 
-# Copy smite workspace files and build the Rust cln-scenario binary
+# Copy smite workspace files and build all scenario binaries
 WORKDIR /smite
 COPY Cargo.toml Cargo.lock ./
 COPY smite/ smite/
@@ -89,8 +88,10 @@ COPY smite-ir/ smite-ir/
 COPY smite-ir-mutator/ smite-ir-mutator/
 COPY smite-nyx-sys/ smite-nyx-sys/
 COPY smite-scenarios/ smite-scenarios/
-RUN TARGET_MAP_SIZE=$(cat /tmp/total-map-size) \
-    cargo build -p smite-scenarios --bin cln_${SCENARIO} --release --features nyx
+RUN set -eu; for f in smite-scenarios/src/bin/cln_*.rs; do \
+        TARGET_MAP_SIZE=$(cat /tmp/total-map-size) \
+            cargo build -p smite-scenarios --bin "$(basename $f .rs)" --release --features nyx; \
+    done
 
 # Build crash handler shared libraries, LD_PRELOADed into CLN to bypass its
 # blocking crashdump signal handler. Two variants:

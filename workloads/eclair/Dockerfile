@@ -4,7 +4,6 @@ FROM eclipse-temurin:21 AS builder
 # Build arguments
 ARG ECLAIR_VERSION=v0.13.1
 ARG BITCOIN_VERSION=29.2
-ARG SCENARIO
 
 # Install build dependencies.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -61,7 +60,7 @@ RUN java -cp target/eclair-sancov-0.0.0.jar EclairEdgeCounter \
     > /tmp/eclair-edge-count.txt && \
     echo "Eclair edge count: $(cat /tmp/eclair-edge-count.txt)"
 
-# Copy smite workspace and build the eclair scenario binary.
+# Copy smite workspace files and build all scenario binaries
 WORKDIR /smite
 COPY Cargo.toml Cargo.lock ./
 COPY smite/ smite/
@@ -69,8 +68,10 @@ COPY smite-ir/ smite-ir/
 COPY smite-ir-mutator/ smite-ir-mutator/
 COPY smite-nyx-sys/ smite-nyx-sys/
 COPY smite-scenarios/ smite-scenarios/
-RUN TARGET_MAP_SIZE=$(cat /tmp/eclair-edge-count.txt) \
-    cargo build -p smite-scenarios --bin eclair_${SCENARIO} --release --features nyx
+RUN set -eu; for f in smite-scenarios/src/bin/eclair_*.rs; do \
+        TARGET_MAP_SIZE=$(cat /tmp/eclair-edge-count.txt) \
+            cargo build -p smite-scenarios --bin "$(basename $f .rs)" --release --features nyx; \
+    done
 
 # Build JVM crash handler shared libraries, LD_PRELOADed into the JVM to
 # report crashes before atexit handlers close TCP sockets. Two variants:

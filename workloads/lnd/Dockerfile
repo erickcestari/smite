@@ -5,7 +5,6 @@ ARG LLVM_V=19
 ARG GO_VERSION=1.24.11
 ARG LND_VERSION=v0.20.0-beta
 ARG BITCOIN_VERSION=29.2
-ARG SCENARIO
 
 ENV LLVM_V=${LLVM_V}
 
@@ -62,7 +61,7 @@ RUN cd cmd/lncli && go build
 COPY ./workloads/lnd/sancov.go /lnd/sancov.go
 RUN cd cmd/lnd && CGO_ENABLED=1 go build -v -tags=libfuzzer -gcflags=all=-d=libfuzzer
 
-# Copy smite workspace files and build the Rust lnd-scenario binary
+# Copy smite workspace files and build all scenario binaries
 WORKDIR /smite
 COPY Cargo.toml Cargo.lock ./
 COPY smite/ smite/
@@ -70,7 +69,10 @@ COPY smite-ir/ smite-ir/
 COPY smite-ir-mutator/ smite-ir-mutator/
 COPY smite-nyx-sys/ smite-nyx-sys/
 COPY smite-scenarios/ smite-scenarios/
-RUN TARGET_PATH=/lnd/cmd/lnd/lnd cargo build -p smite-scenarios --bin lnd_${SCENARIO} --release --features nyx
+RUN set -eu; for f in smite-scenarios/src/bin/lnd_*.rs; do \
+        TARGET_PATH=/lnd/cmd/lnd/lnd \
+            cargo build -p smite-scenarios --bin "$(basename $f .rs)" --release --features nyx; \
+    done
 
 # Runtime image
 FROM debian:bookworm-slim
