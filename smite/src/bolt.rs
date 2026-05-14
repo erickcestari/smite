@@ -14,6 +14,7 @@ mod funding_created;
 mod funding_signed;
 mod gossip_timestamp_filter;
 mod init;
+mod node_announcement;
 mod open_channel;
 mod open_channel2;
 mod ping;
@@ -48,6 +49,7 @@ pub use funding_created::FundingCreated;
 pub use funding_signed::FundingSigned;
 pub use gossip_timestamp_filter::GossipTimestampFilter;
 pub use init::{Init, InitTlvs};
+pub use node_announcement::NodeAnnouncement;
 pub use open_channel::{OpenChannel, OpenChannelTlvs};
 pub use open_channel2::{OpenChannel2, OpenChannel2Tlvs};
 pub use ping::Ping;
@@ -156,6 +158,8 @@ pub mod msg_type {
     pub const UPDATE_FAIL_HTLC: u16 = 131;
     /// `update_fail_malformed_htlc` message (BOLT 2).
     pub const UPDATE_FAIL_MALFORMED_HTLC: u16 = 135;
+    /// `node_announcement` message (BOLT 7).
+    pub const NODE_ANNOUNCEMENT: u16 = 257;
     /// Gossip timestamp filter message (BOLT 7).
     pub const GOSSIP_TIMESTAMP_FILTER: u16 = 265;
 }
@@ -210,6 +214,8 @@ pub enum Message {
     UpdateFailHtlc(UpdateFailHtlc),
     /// `update_fail_malformed_htlc` message (type 135).
     UpdateFailMalformedHtlc(UpdateFailMalformedHtlc),
+    /// `node_announcement` message (type 257).
+    NodeAnnouncement(NodeAnnouncement),
     /// Gossip timestamp filter message (type 265).
     GossipTimestampFilter(GossipTimestampFilter),
     /// Unknown message type.
@@ -252,6 +258,7 @@ impl Message {
             Self::UpdateFulfillHtlc(_) => msg_type::UPDATE_FULFILL_HTLC,
             Self::UpdateFailHtlc(_) => msg_type::UPDATE_FAIL_HTLC,
             Self::UpdateFailMalformedHtlc(_) => msg_type::UPDATE_FAIL_MALFORMED_HTLC,
+            Self::NodeAnnouncement(_) => msg_type::NODE_ANNOUNCEMENT,
             Self::GossipTimestampFilter(_) => msg_type::GOSSIP_TIMESTAMP_FILTER,
             Self::Unknown { msg_type, .. } => *msg_type,
         }
@@ -286,6 +293,7 @@ impl Message {
             Self::UpdateFulfillHtlc(m) => out.extend(m.encode()),
             Self::UpdateFailHtlc(m) => out.extend(m.encode()),
             Self::UpdateFailMalformedHtlc(m) => out.extend(m.encode()),
+            Self::NodeAnnouncement(m) => out.extend(m.encode()),
             Self::GossipTimestampFilter(m) => out.extend(m.encode()),
             Self::Unknown { payload, .. } => out.extend(payload),
         }
@@ -331,6 +339,9 @@ impl Message {
             msg_type::UPDATE_FAIL_MALFORMED_HTLC => Ok(Self::UpdateFailMalformedHtlc(
                 UpdateFailMalformedHtlc::decode(cursor)?,
             )),
+            msg_type::NODE_ANNOUNCEMENT => {
+                Ok(Self::NodeAnnouncement(NodeAnnouncement::decode(cursor)?))
+            }
             msg_type::GOSSIP_TIMESTAMP_FILTER => Ok(Self::GossipTimestampFilter(
                 GossipTimestampFilter::decode(cursor)?,
             )),
@@ -366,6 +377,7 @@ mod tests {
     use super::*;
     use bitcoin::Txid;
     use bitcoin::hashes::{Hash, sha256};
+    use bitcoin::secp256k1::ecdsa::Signature;
     use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
     use types::CHAIN_HASH_SIZE;
 
@@ -777,6 +789,30 @@ mod tests {
         assert_eq!(decoded, Message::UpdateFailMalformedHtlc(msg));
     }
 
+    /// Valid `NodeAnnouncement` message for testing.
+    fn sample_node_announcement() -> NodeAnnouncement {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x11; 32]).expect("valid secret");
+
+        NodeAnnouncement {
+            signature: Signature::from_compact(&[0u8; 64]).unwrap(),
+            features: vec![0x01, 0x02],
+            timestamp: 1_700_000_000,
+            node_id: PublicKey::from_secret_key(&secp, &sk),
+            rgb_color: [0xaa, 0xbb, 0xcc],
+            alias: [0x42; 32],
+            addresses: vec![0x01, 0x7f, 0x00, 0x00, 0x01, 0x23, 0x45],
+        }
+    }
+
+    #[test]
+    fn message_node_announcement_roundtrip() {
+        let na = sample_node_announcement();
+        let encoded = Message::NodeAnnouncement(na.clone()).encode();
+        let decoded = Message::decode(&encoded).unwrap();
+        assert_eq!(decoded, Message::NodeAnnouncement(na));
+    }
+
     #[test]
     fn message_gossip_timestamp_filter_roundtrip() {
         let chain_hash = [0x6f; 32];
@@ -922,6 +958,10 @@ mod tests {
             })
             .msg_type(),
             msg_type::UPDATE_FAIL_MALFORMED_HTLC
+        );
+        assert_eq!(
+            Message::NodeAnnouncement(sample_node_announcement()).msg_type(),
+            msg_type::NODE_ANNOUNCEMENT
         );
         assert_eq!(
             Message::GossipTimestampFilter(GossipTimestampFilter::no_gossip([0u8; 32])).msg_type(),
