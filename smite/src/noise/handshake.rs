@@ -137,18 +137,19 @@ impl NoiseHandshake {
     fn initialize_state(responder_static: &PublicKey) -> ([u8; 32], [u8; 32]) {
         // h = SHA256(protocolName)
         // ck = h
-        let ck = Sha256::hash(PROTOCOL_NAME).to_byte_array();
+        let mut h = Sha256::hash(PROTOCOL_NAME).to_byte_array();
+        let ck = h;
 
         // h = SHA256(h || prologue)
-        let h = {
+        h = {
             let mut sha = Sha256::engine();
-            sha.input(&ck);
+            sha.input(&h);
             sha.input(PROLOGUE);
             Sha256::from_engine(sha).to_byte_array()
         };
 
         // h = SHA256(h || rs.pub.serializeCompressed())
-        let h = {
+        h = {
             let mut sha = Sha256::engine();
             sha.input(&h);
             sha.input(&responder_static.serialize());
