@@ -17,6 +17,15 @@
 //!   bypasses our custom mutators. This was an AFL++ bug fixed upstream in
 //!   commit eddb2701b022351fb34b696ccf923bb856e9d953.
 //!
+//! # Logging
+//!
+//! Logging is opt-in: [`afl_custom_init`] installs a logger only when
+//! `RUST_LOG` is set. With `RUST_LOG` unset, every `log::*!` callsite is a
+//! no-op and AFL's stderr stays clean. Useful filters:
+//! - `RUST_LOG=smite_ir_mutator::trim=debug` -- print the decoded `Program`
+//!   before and after each successful trim.
+//! - `RUST_LOG=debug` -- everything this crate emits.
+//!
 //! # Buffer ownership
 //!
 //! `MutatorState` owns a `Vec<u8>` (`out_buf`) that holds the serialized
@@ -151,14 +160,26 @@ fn warn_on_unset_afl_env() {
 /// Allocates a new [`MutatorState`] and returns an opaque pointer to it. AFL++
 /// passes this pointer back on every function call as the `data` argument.
 ///
+/// Also installs `simple_logger` if `RUST_LOG` is set, so `log::*!` callsites
+/// in this crate become live. Without `RUST_LOG` no logger is installed and
+/// every callsite is a no-op. Set
+/// `RUST_LOG=smite_ir_mutator::trim=debug` to see trim before/after dumps.
+///
 /// # Safety
 ///
 /// The returned pointer is heap-allocated via `Box::into_raw` and must be freed
 /// by a matching call to [`afl_custom_deinit`].
+///
+/// # Panics
+///
+/// Panics if `RUST_LOG` is set and `simple_logger` fails to initialize.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn afl_custom_init(_afl: *const c_void, seed: c_uint) -> *mut c_void {
     #[cfg(not(test))]
     warn_on_unset_afl_env();
+    if std::env::var_os("RUST_LOG").is_some() {
+        simple_logger::init_with_env().expect("logger initializes");
+    }
     Box::into_raw(Box::new(MutatorState::new(seed))).cast::<c_void>()
 }
 
@@ -267,11 +288,21 @@ pub unsafe extern "C" fn afl_custom_init_trim(
         return 0;
     };
 
+    let before = log::log_enabled!(target: "smite_ir_mutator::trim", log::Level::Debug)
+        .then(|| program.clone());
+
     let mut trimmed = program;
     let dce_changed = DeadCodeEliminator.minimize(&mut trimmed);
     let cse_changed = CommonSubexpressionEliminator.minimize(&mut trimmed);
     if (!dce_changed && !cse_changed) || !state.serialize(&trimmed, buf_size) {
         return 0;
+    }
+
+    if let Some(before) = before {
+        log::debug!(
+            target: "smite_ir_mutator::trim",
+            "dce={dce_changed} cse={cse_changed}\n--- before ---\n{before}--- after ---\n{trimmed}---"
+        );
     }
 
     1
