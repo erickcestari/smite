@@ -1096,6 +1096,39 @@ fn pick_variable_reuses_existing() {
 }
 
 #[test]
+fn pick_variable_uses_unspent_affine() {
+    let mut rng = SmallRng::seed_from_u64(0);
+    let mut builder = ProgramBuilder::new();
+    OpenChannelGenerator.generate(&mut builder, &mut rng);
+
+    let msg_idx = builder.pick_variable(VariableType::OpenChannelMessage, &mut rng);
+    let unspent_sent_open_channel = builder.append(Operation::SendOpenChannel, &[msg_idx]);
+
+    // pick_variable should prefer an unspent affine variable.
+    let idx = builder.pick_variable(VariableType::SentOpenChannel, &mut rng);
+    assert_eq!(idx, unspent_sent_open_channel);
+}
+
+#[test]
+#[should_panic(expected = "cannot generate fresh SentOpenChannel: affine type")]
+fn pick_variable_panics_on_empty_affine() {
+    let mut rng = SmallRng::seed_from_u64(0);
+    let mut builder = ProgramBuilder::new();
+    builder.pick_variable(VariableType::SentOpenChannel, &mut rng);
+}
+
+#[test]
+#[should_panic(expected = "no candidates for SentOpenChannel")]
+fn pick_variable_panics_on_all_affine_consumed() {
+    let mut rng = SmallRng::seed_from_u64(0);
+    let mut builder = ProgramBuilder::new();
+    OpenChannelGenerator.generate(&mut builder, &mut rng);
+
+    // All `SentOpenChannel` have been already consumed.
+    builder.pick_variable(VariableType::SentOpenChannel, &mut rng);
+}
+
+#[test]
 #[should_panic(expected = "cannot generate fresh Message")]
 fn generate_fresh_message_panics() {
     let mut rng = SmallRng::seed_from_u64(0);
@@ -1117,6 +1150,14 @@ fn generate_fresh_funding_transaction_panics() {
     let mut rng = SmallRng::seed_from_u64(0);
     let mut builder = ProgramBuilder::new();
     builder.generate_fresh(VariableType::FundingTransaction, &mut rng);
+}
+
+#[test]
+#[should_panic(expected = "cannot generate fresh SentOpenChannel: affine type")]
+fn generate_fresh_sent_open_channel_panics() {
+    let mut rng = SmallRng::seed_from_u64(0);
+    let mut builder = ProgramBuilder::new();
+    builder.generate_fresh(VariableType::SentOpenChannel, &mut rng);
 }
 
 #[test]
@@ -1163,6 +1204,20 @@ fn append_type_mismatch_panics() {
     let mut builder = ProgramBuilder::new();
     let amount = builder.generate_fresh(VariableType::Amount, &mut rng);
     builder.append(Operation::DerivePoint, &[amount]);
+}
+
+#[test]
+#[should_panic(expected = "RecvAcceptChannel input 0: affine SentOpenChannel already consumed")]
+fn append_rejects_affine_overuse() {
+    let mut rng = SmallRng::seed_from_u64(0);
+    let mut builder = ProgramBuilder::new();
+    OpenChannelGenerator.generate(&mut builder, &mut rng);
+
+    let msg_idx = builder.pick_variable(VariableType::OpenChannelMessage, &mut rng);
+    let sent_open_channel = builder.append(Operation::SendOpenChannel, &[msg_idx]);
+    // Add consecutive `RecvAcceptChannel`s.
+    builder.append(Operation::RecvAcceptChannel, &[sent_open_channel]);
+    builder.append(Operation::RecvAcceptChannel, &[sent_open_channel]);
 }
 
 // -- Program::validate tests --
@@ -1373,6 +1428,34 @@ fn validate_rejects_oversized_features() {
             instr: 0,
             len: MAX_MESSAGE_SIZE + 1,
         }),
+    );
+}
+
+#[test]
+fn validate_accepts_unused_affine() {
+    let mut program = generate_open_channel_program(0);
+    // Remove the `RecvAcceptChannel` instruction at the end.
+    program.instructions.pop();
+
+    // Validation should pass despite the unspent `SentOpenChannel`.
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn validate_rejects_affine_overuse() {
+    let mut program = generate_open_channel_program(0);
+    let sent_open_channel = program.instructions.len() - 2;
+    // Add another `RecvAcceptChannel` in addition to the existing one.
+    program.instructions.push(Instruction {
+        operation: Operation::RecvAcceptChannel,
+        inputs: vec![sent_open_channel],
+    });
+    assert_eq!(
+        program.validate(),
+        Err(ValidateError::AffineOverUse {
+            index: sent_open_channel,
+            var_type: VariableType::SentOpenChannel,
+        })
     );
 }
 

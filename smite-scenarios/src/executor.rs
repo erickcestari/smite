@@ -1693,6 +1693,71 @@ mod tests {
         assert!(matches!(err, ExecuteError::InvalidPrivateKey));
     }
 
+    #[test]
+    fn execute_send_open_channel_wrong_type() {
+        let instrs = vec![
+            Instruction {
+                operation: Operation::LoadAmount(42),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::SendOpenChannel,
+                inputs: vec![0],
+            },
+        ];
+
+        let program = Program {
+            instructions: instrs,
+        };
+
+        let err = execute(
+            &program,
+            &sample_context(),
+            &mut MockConnection::new(),
+            &mut MockBitcoinCli::default(),
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ExecuteError::TypeMismatch {
+                expected: VariableType::OpenChannelMessage,
+                got: VariableType::Amount,
+            }
+        ));
+    }
+
+    #[test]
+    fn execute_affine_overuse() {
+        let mut instrs = send_open_channel_instructions();
+        let sent_open_channel = instrs.len() - 1;
+        instrs.extend([
+            Instruction {
+                operation: Operation::RecvAcceptChannel,
+                inputs: vec![sent_open_channel],
+            },
+            Instruction {
+                operation: Operation::RecvAcceptChannel,
+                inputs: vec![sent_open_channel],
+            },
+        ]);
+        let program = Program {
+            instructions: instrs,
+        };
+        let mut conn = MockConnection::new();
+        let ac_bytes = Message::AcceptChannel(sample_accept_channel()).encode();
+        conn.queue_recv(ac_bytes);
+        let err = execute(
+            &program,
+            &sample_context(),
+            &mut conn,
+            &mut MockBitcoinCli::default(),
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecuteError::AffineOverUse { index } if index == sent_open_channel));
+    }
+
     // -- extract_field tests --
 
     // TODO: Once we can actually construct and send accept_channel messages, it
