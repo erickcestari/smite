@@ -37,15 +37,16 @@ use std::os::raw::{c_char, c_uint, c_void};
 use std::slice;
 
 use rand::rngs::SmallRng;
-use rand::{RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng, seq::IteratorRandom};
 
 use smite_ir::generators::{
-    ChannelAnnouncementGenerator, ChannelUpdateGenerator, NodeAnnouncementGenerator,
+    AnyGenerator, ChannelAnnouncementGenerator, ChannelUpdateGenerator, NodeAnnouncementGenerator,
     OpenChannelGenerator,
 };
 use smite_ir::minimizers::{CommonSubexpressionEliminator, DeadCodeEliminator, Minimizer};
 use smite_ir::mutators::{
-    InputSwapMutator, InstructionDeleteMutator, InstructionReorderMutator, OperationParamMutator,
+    GeneratorInsertionMutator, InputSwapMutator, InstructionDeleteMutator,
+    InstructionReorderMutator, OperationParamMutator,
 };
 use smite_ir::{Generator, Mutator, Program, ProgramBuilder};
 
@@ -100,7 +101,7 @@ impl MutatorState {
         let stack = 1u32 << self.rng.random_range(0..=4);
         for _ in 0..stack {
             // Uniform pick between the available mutators.
-            let name = match self.rng.random_range(0..4) {
+            let name = match self.rng.random_range(0..5) {
                 0 => {
                     OperationParamMutator.mutate(program, &mut self.rng);
                     "op-param"
@@ -116,6 +117,15 @@ impl MutatorState {
                 3 => {
                     InstructionReorderMutator.mutate(program, &mut self.rng);
                     "instr-reorder"
+                }
+                4 => {
+                    let generator = *AnyGenerator::ALL
+                        .iter()
+                        .choose(&mut self.rng)
+                        .expect("AnyGenerator::ALL is non-empty");
+                    let mutator = GeneratorInsertionMutator::new(generator);
+                    mutator.mutate(program, &mut self.rng);
+                    "gen-insert"
                 }
                 _ => unreachable!("random_range() bound out of sync with match arms"),
             };
@@ -557,7 +567,8 @@ mod tests {
                     name == "op-param"
                         || name == "input-swap"
                         || name == "instr-delete"
-                        || name == "instr-reorder",
+                        || name == "instr-reorder"
+                        || name == "gen-insert",
                     "unexpected mutator name in description: {name:?} (full: {s:?})",
                 );
             }
