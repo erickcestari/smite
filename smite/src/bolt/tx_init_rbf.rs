@@ -103,16 +103,10 @@ impl TxInitRbfTlvs {
     ///
     /// # Errors
     ///
-    /// Returns `Truncated` if `funding_output_contribution` has invalid length.
+    /// Returns a `BoltError` if `funding_output_contribution` has invalid
+    /// length.
     fn from_stream(stream: &TlvStream) -> Result<Self, BoltError> {
-        let funding_output_contribution =
-            if let Some(data) = stream.get(TLV_FUNDING_OUTPUT_CONTRIBUTION) {
-                let mut cursor = data;
-                Some(i64::read(&mut cursor)?)
-            } else {
-                None
-            };
-
+        let funding_output_contribution = stream.get_as::<i64>(TLV_FUNDING_OUTPUT_CONTRIBUTION)?;
         let require_confirmed_inputs = stream.get(TLV_REQUIRE_CONFIRMED_INPUTS).is_some();
 
         Ok(Self {
