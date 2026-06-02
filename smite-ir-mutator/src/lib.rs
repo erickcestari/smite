@@ -40,7 +40,8 @@ use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 
 use smite_ir::generators::{
-    ChannelAnnouncementGenerator, NodeAnnouncementGenerator, OpenChannelGenerator,
+    ChannelAnnouncementGenerator, ChannelUpdateGenerator, NodeAnnouncementGenerator,
+    OpenChannelGenerator,
 };
 use smite_ir::minimizers::{CommonSubexpressionEliminator, DeadCodeEliminator, Minimizer};
 use smite_ir::mutators::{InputSwapMutator, OperationParamMutator};
@@ -75,10 +76,11 @@ impl MutatorState {
     /// the registered generators.
     fn generate_fresh(&mut self) -> Program {
         let mut builder = ProgramBuilder::new();
-        match self.rng.random_range(0..3) {
+        match self.rng.random_range(0..4) {
             0 => OpenChannelGenerator.generate(&mut builder, &mut self.rng),
             1 => ChannelAnnouncementGenerator.generate(&mut builder, &mut self.rng),
             2 => NodeAnnouncementGenerator.generate(&mut builder, &mut self.rng),
+            3 => ChannelUpdateGenerator.generate(&mut builder, &mut self.rng),
             _ => unreachable!("random_range() bound out of sync with match arms"),
         }
         self.last_sequence.clear();

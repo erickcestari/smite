@@ -6,10 +6,12 @@
 //! `ProgramBuilder`.
 
 mod channel_announcement;
+mod channel_update;
 mod node_announcement;
 mod open_channel;
 
 pub use channel_announcement::ChannelAnnouncementGenerator;
+pub use channel_update::ChannelUpdateGenerator;
 pub use node_announcement::NodeAnnouncementGenerator;
 pub use open_channel::OpenChannelGenerator;
 
