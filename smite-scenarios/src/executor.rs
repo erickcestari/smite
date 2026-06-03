@@ -169,6 +169,7 @@ pub fn execute(
             Operation::LoadFeeratePerKw(v) => Some(Variable::FeeratePerKw(*v)),
             Operation::LoadBlockHeight(v) => Some(Variable::BlockHeight(*v)),
             Operation::LoadTimestamp(v) => Some(Variable::Timestamp(*v)),
+            Operation::LoadForwardingFee(v) => Some(Variable::ForwardingFee(*v)),
             Operation::LoadU16(v) => Some(Variable::U16(*v)),
             Operation::LoadU8(v) => Some(Variable::U8(*v)),
             Operation::LoadBytes(b) => Some(Variable::Bytes(b.clone())),

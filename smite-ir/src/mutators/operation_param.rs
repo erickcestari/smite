@@ -43,7 +43,8 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
         }
         Operation::LoadFeeratePerKw(v)
         | Operation::LoadBlockHeight(v)
-        | Operation::LoadTimestamp(v) => {
+        | Operation::LoadTimestamp(v)
+        | Operation::LoadForwardingFee(v) => {
             *v = tweak_u32(*v, rng);
             true
         }
