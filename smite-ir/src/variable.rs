@@ -34,6 +34,9 @@ pub enum Variable {
     BlockHeight(u32),
     /// Unix timestamp in seconds.
     Timestamp(u32),
+    /// BOLT 7 `channel_update` fee (`fee_base_msat` in millisatoshi or
+    /// `fee_proportional_millionths` in millionths).
+    ForwardingFee(u32),
     /// Generic u16 protocol parameter (`to_self_delay`, `max_accepted_htlcs`,
     /// `cltv_expiry_delta`, etc.).
     U16(u16),
@@ -64,6 +67,7 @@ impl Variable {
             Self::FeeratePerKw(_) => VariableType::FeeratePerKw,
             Self::BlockHeight(_) => VariableType::BlockHeight,
             Self::Timestamp(_) => VariableType::Timestamp,
+            Self::ForwardingFee(_) => VariableType::ForwardingFee,
             Self::U16(_) => VariableType::U16,
             Self::U8(_) => VariableType::U8,
             Self::Features(_) => VariableType::Features,
@@ -88,6 +92,7 @@ pub enum VariableType {
     FeeratePerKw,
     BlockHeight,
     Timestamp,
+    ForwardingFee,
     U16,
     U8,
     Features,
