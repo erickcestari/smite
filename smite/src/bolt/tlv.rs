@@ -231,6 +231,7 @@ impl TlvStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bolt::wire::EmptyTlv;
 
     // ===== Basic functionality tests =====
 
@@ -319,6 +320,29 @@ mod tests {
                 tlv_type: 1,
                 expected: 8,
                 actual: 9
+            })
+        );
+    }
+
+    #[test]
+    fn get_as_empty_tlv_exact_length() {
+        let mut stream = TlvStream::new();
+        stream.add(1, vec![]);
+
+        assert_eq!(stream.get_as::<EmptyTlv>(1).unwrap(), Some(EmptyTlv));
+    }
+
+    #[test]
+    fn get_as_empty_tlv_overlength_rejected() {
+        let mut stream = TlvStream::new();
+        stream.add(1, vec![0xff]);
+
+        assert_eq!(
+            stream.get_as::<EmptyTlv>(1),
+            Err(BoltError::TlvTrailingBytes {
+                tlv_type: 1,
+                expected: 0,
+                actual: 1,
             })
         );
     }

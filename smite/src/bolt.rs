@@ -68,7 +68,7 @@ pub use update_fail_htlc::{UpdateFailHtlc, UpdateFailHtlcTlvs};
 pub use update_fail_malformed_htlc::UpdateFailMalformedHtlc;
 pub use update_fulfill_htlc::{UpdateFulfillHtlc, UpdateFulfillHtlcTlvs};
 pub use warning::Warning;
-pub use wire::WireFormat;
+pub use wire::{EmptyTlv, WireFormat};
 
 /// Errors that can occur during BOLT message encoding/decoding.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
