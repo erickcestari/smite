@@ -114,167 +114,200 @@ pub enum ExecuteError {
     InsufficientFunds(#[from] smite::channel_tx::InsufficientFunds),
 }
 
-/// Executes an IR program against a target over the given connection.
-///
-/// # Errors
-///
-/// Returns an error on a connection/send/receive failure, a decode failure of
-/// a received message, an unexpected message type from the target, or when
-/// wallet funds are insufficient to perform a channel operation.
-///
-/// # Panics
-///
-/// Panics on any invariant violation of the program:
-/// - input count does not match the operation's expected input count
-/// - input variable index out of bounds
-/// - input variable refers to a void instruction
-/// - input variable has the wrong type
-/// - `MineBlocks(0)` (panics inside `BitcoinCli::mine_blocks`)
-/// - `LoadShutdownScript(AnySegwit { .. })` with an out-of-range version or
-///   program length (panics inside the encoder)
-/// - `LoadBytes` / `LoadFeatures` payload exceeding `MAX_MESSAGE_SIZE` (panics
-///   inside the encoder)
-/// - `LoadPrivateKey` whose bytes are all-zero or >= the secp256k1 curve
-///   order (probability ~2^-128 for uniform random input)
-#[allow(clippy::too_many_lines)]
-pub fn execute(
-    program: &Program,
-    context: &ProgramContext,
-    conn: &mut impl Connection,
-    bitcoin_cli: &mut impl BitcoinRpc,
-    start: std::time::Instant,
-) -> Result<(), ExecuteError> {
-    let secp = Secp256k1::new();
-    let mut variables: Vec<Option<Variable>> = Vec::with_capacity(program.instructions.len());
+/// Executes IR programs against a target over an established connection.
+pub struct Executor<C, B> {
+    /// Connection used to send and receive Lightning messages.
+    conn: C,
+    /// Interface to bitcoind for wallet and chain operations.
+    bitcoin_cli: B,
+    /// Immutable state captured during snapshot setup.
+    context: ProgramContext,
+}
 
-    for instr in &program.instructions {
-        let expected_count = instr.operation.input_types().len();
-        assert_eq!(
-            instr.inputs.len(),
-            expected_count,
-            "{:?}: expected {expected_count} inputs, got {}",
-            instr.operation,
-            instr.inputs.len(),
-        );
-
-        let result = match &instr.operation {
-            // -- Load operations --
-            Operation::LoadAmount(v) => Some(Variable::Amount(*v)),
-            Operation::LoadShortChannelId(v) => {
-                Some(Variable::ShortChannelId(ShortChannelId::from_u64(*v)))
-            }
-            Operation::LoadFeeratePerKw(v) => Some(Variable::FeeratePerKw(*v)),
-            Operation::LoadBlockHeight(v) => Some(Variable::BlockHeight(*v)),
-            Operation::LoadTimestamp(v) => Some(Variable::Timestamp(*v)),
-            Operation::LoadForwardingFee(v) => Some(Variable::ForwardingFee(*v)),
-            Operation::LoadU16(v) => Some(Variable::U16(*v)),
-            Operation::LoadU8(v) => Some(Variable::U8(*v)),
-            Operation::LoadBytes(b) => Some(Variable::Bytes(b.clone())),
-            Operation::LoadFeatures(b) => Some(Variable::Features(b.clone())),
-            Operation::LoadPrivateKey(k) => Some(Variable::PrivateKey(*k)),
-            Operation::LoadChannelId(id) => Some(Variable::ChannelId(ChannelId::new(*id))),
-            Operation::LoadShutdownScript(variant) => Some(Variable::Bytes(variant.encode())),
-            Operation::LoadChannelType(variant) => Some(Variable::Features(variant.encode())),
-            Operation::LoadTargetPubkeyFromContext => Some(Variable::Point(context.target_pubkey)),
-            Operation::LoadChainHashFromContext => Some(Variable::ChainHash(context.chain_hash)),
-
-            // -- Compute operations --
-            Operation::DerivePoint => {
-                let key_bytes = resolve_private_key(&variables, instr.inputs[0]);
-                let sk = SecretKey::from_slice(&key_bytes).expect("valid private key");
-                let pk = PublicKey::from_secret_key(&secp, &sk);
-                Some(Variable::Point(pk))
-            }
-
-            Operation::ExtractAcceptChannel(field) => {
-                let ac = resolve_accept_channel(&variables, instr.inputs[0]);
-                Some(extract_field(ac, *field))
-            }
-
-            Operation::CreateFundingTransaction => {
-                let ft = create_funding_transaction(&variables, &instr.inputs, bitcoin_cli)?;
-                Some(Variable::FundingTransaction(ft))
-            }
-
-            // -- Build operations --
-            Operation::BuildOpenChannel => {
-                let oc = build_open_channel(&variables, &instr.inputs);
-                let encoded = Message::OpenChannel(oc).encode();
-                Some(Variable::OpenChannelMessage(encoded))
-            }
-
-            Operation::BuildChannelAnnouncement => {
-                let ca = build_channel_announcement(&variables, &instr.inputs);
-                let encoded = Message::ChannelAnnouncement(ca).encode();
-                Some(Variable::Message(encoded))
-            }
-
-            Operation::BuildNodeAnnouncement { rgb_color, alias } => {
-                let na = build_node_announcement(&variables, &instr.inputs, *rgb_color, *alias);
-                let encoded = Message::NodeAnnouncement(na).encode();
-                Some(Variable::Message(encoded))
-            }
-
-            Operation::BuildChannelUpdate => {
-                let cu = build_channel_update(&variables, &instr.inputs);
-                let encoded = Message::ChannelUpdate(cu).encode();
-                Some(Variable::Message(encoded))
-            }
-
-            // -- Act operations --
-            Operation::SendMessage => {
-                let bytes = resolve_message(&variables, instr.inputs[0]);
-                let msg_type = bytes.get(..2).map(|b| u16::from_be_bytes([b[0], b[1]]));
-                log::debug!(
-                    "[{:?}] SendMessage: type {msg_type:?}, {} bytes",
-                    start.elapsed(),
-                    bytes.len(),
-                );
-                conn.send_message(bytes)?;
-                None
-            }
-
-            Operation::SendOpenChannel => {
-                let bytes = resolve_open_channel_message(&variables, instr.inputs[0]);
-                log::debug!(
-                    "[{:?}] SendOpenChannel: {} bytes",
-                    start.elapsed(),
-                    bytes.len(),
-                );
-                conn.send_message(bytes)?;
-                Some(Variable::SentOpenChannel)
-            }
-
-            Operation::RecvAcceptChannel => {
-                consume_sent_open_channel(&mut variables, instr.inputs[0]);
-                log::debug!("[{:?}] RecvAcceptChannel: waiting", start.elapsed());
-                let ac = recv_accept_channel(conn)?;
-                log::debug!("[{:?}] RecvAcceptChannel: received", start.elapsed());
-                Some(Variable::AcceptChannel(ac))
-            }
-
-            Operation::MineBlocks(v) => {
-                bitcoin_cli.mine_blocks(*v);
-                log::debug!("[{:?}] MineBlocks: mined {} block(s)", start.elapsed(), v);
-                None
-            }
-
-            Operation::BroadcastTransaction => {
-                let ft = resolve_funding_transaction(&variables, instr.inputs[0]);
-                log::debug!(
-                    "[{:?}] BroadcastTransaction: txid={}",
-                    start.elapsed(),
-                    ft.tx.compute_txid(),
-                );
-                bitcoin_cli.sign_and_broadcast_tx(&ft.tx);
-                None
-            }
-        };
-
-        variables.push(result);
+impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
+    /// Creates an executor with the given connection, bitcoin-cli handle, and
+    /// program context.
+    pub fn new(conn: C, bitcoin_cli: B, context: ProgramContext) -> Self {
+        Self {
+            conn,
+            bitcoin_cli,
+            context,
+        }
     }
 
-    Ok(())
+    /// Returns a mutable reference to the underlying connection.
+    pub fn conn_mut(&mut self) -> &mut C {
+        &mut self.conn
+    }
+
+    /// Executes an IR program against the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a connection/send/receive failure, a decode failure of
+    /// a received message, an unexpected message type from the target, or when
+    /// wallet funds are insufficient to perform a channel operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics on any invariant violation of the program:
+    /// - input count does not match the operation's expected input count
+    /// - input variable index out of bounds
+    /// - input variable refers to a void instruction
+    /// - input variable has the wrong type
+    /// - `MineBlocks(0)` (panics inside `BitcoinCli::mine_blocks`)
+    /// - `LoadShutdownScript(AnySegwit { .. })` with an out-of-range version or
+    ///   program length (panics inside the encoder)
+    /// - `LoadBytes` / `LoadFeatures` payload exceeding `MAX_MESSAGE_SIZE` (panics
+    ///   inside the encoder)
+    /// - `LoadPrivateKey` whose bytes are all-zero or >= the secp256k1 curve
+    ///   order (probability ~2^-128 for uniform random input)
+    #[allow(clippy::too_many_lines)]
+    pub fn execute(
+        &mut self,
+        program: &Program,
+        start: std::time::Instant,
+    ) -> Result<(), ExecuteError> {
+        let secp = Secp256k1::new();
+        let mut variables: Vec<Option<Variable>> = Vec::with_capacity(program.instructions.len());
+
+        for instr in &program.instructions {
+            let expected_count = instr.operation.input_types().len();
+            assert_eq!(
+                instr.inputs.len(),
+                expected_count,
+                "{:?}: expected {expected_count} inputs, got {}",
+                instr.operation,
+                instr.inputs.len(),
+            );
+
+            let result = match &instr.operation {
+                // -- Load operations --
+                Operation::LoadAmount(v) => Some(Variable::Amount(*v)),
+                Operation::LoadShortChannelId(v) => {
+                    Some(Variable::ShortChannelId(ShortChannelId::from_u64(*v)))
+                }
+                Operation::LoadFeeratePerKw(v) => Some(Variable::FeeratePerKw(*v)),
+                Operation::LoadBlockHeight(v) => Some(Variable::BlockHeight(*v)),
+                Operation::LoadTimestamp(v) => Some(Variable::Timestamp(*v)),
+                Operation::LoadForwardingFee(v) => Some(Variable::ForwardingFee(*v)),
+                Operation::LoadU16(v) => Some(Variable::U16(*v)),
+                Operation::LoadU8(v) => Some(Variable::U8(*v)),
+                Operation::LoadBytes(b) => Some(Variable::Bytes(b.clone())),
+                Operation::LoadFeatures(b) => Some(Variable::Features(b.clone())),
+                Operation::LoadPrivateKey(k) => Some(Variable::PrivateKey(*k)),
+                Operation::LoadChannelId(id) => Some(Variable::ChannelId(ChannelId::new(*id))),
+                Operation::LoadShutdownScript(variant) => Some(Variable::Bytes(variant.encode())),
+                Operation::LoadChannelType(variant) => Some(Variable::Features(variant.encode())),
+                Operation::LoadTargetPubkeyFromContext => {
+                    Some(Variable::Point(self.context.target_pubkey))
+                }
+                Operation::LoadChainHashFromContext => {
+                    Some(Variable::ChainHash(self.context.chain_hash))
+                }
+
+                // -- Compute operations --
+                Operation::DerivePoint => {
+                    let key_bytes = resolve_private_key(&variables, instr.inputs[0]);
+                    let sk = SecretKey::from_slice(&key_bytes).expect("valid private key");
+                    let pk = PublicKey::from_secret_key(&secp, &sk);
+                    Some(Variable::Point(pk))
+                }
+
+                Operation::ExtractAcceptChannel(field) => {
+                    let ac = resolve_accept_channel(&variables, instr.inputs[0]);
+                    Some(extract_field(ac, *field))
+                }
+
+                Operation::CreateFundingTransaction => {
+                    let ft = create_funding_transaction(
+                        &variables,
+                        &instr.inputs,
+                        &mut self.bitcoin_cli,
+                    )?;
+                    Some(Variable::FundingTransaction(ft))
+                }
+
+                // -- Build operations --
+                Operation::BuildOpenChannel => {
+                    let oc = build_open_channel(&variables, &instr.inputs);
+                    let encoded = Message::OpenChannel(oc).encode();
+                    Some(Variable::OpenChannelMessage(encoded))
+                }
+
+                Operation::BuildChannelAnnouncement => {
+                    let ca = build_channel_announcement(&variables, &instr.inputs);
+                    let encoded = Message::ChannelAnnouncement(ca).encode();
+                    Some(Variable::Message(encoded))
+                }
+
+                Operation::BuildNodeAnnouncement { rgb_color, alias } => {
+                    let na = build_node_announcement(&variables, &instr.inputs, *rgb_color, *alias);
+                    let encoded = Message::NodeAnnouncement(na).encode();
+                    Some(Variable::Message(encoded))
+                }
+
+                Operation::BuildChannelUpdate => {
+                    let cu = build_channel_update(&variables, &instr.inputs);
+                    let encoded = Message::ChannelUpdate(cu).encode();
+                    Some(Variable::Message(encoded))
+                }
+
+                // -- Act operations --
+                Operation::SendMessage => {
+                    let bytes = resolve_message(&variables, instr.inputs[0]);
+                    let msg_type = bytes.get(..2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+                    log::debug!(
+                        "[{:?}] SendMessage: type {msg_type:?}, {} bytes",
+                        start.elapsed(),
+                        bytes.len(),
+                    );
+                    self.conn.send_message(bytes)?;
+                    None
+                }
+
+                Operation::SendOpenChannel => {
+                    let bytes = resolve_open_channel_message(&variables, instr.inputs[0]);
+                    log::debug!(
+                        "[{:?}] SendOpenChannel: {} bytes",
+                        start.elapsed(),
+                        bytes.len(),
+                    );
+                    self.conn.send_message(bytes)?;
+                    Some(Variable::SentOpenChannel)
+                }
+
+                Operation::RecvAcceptChannel => {
+                    consume_sent_open_channel(&mut variables, instr.inputs[0]);
+                    log::debug!("[{:?}] RecvAcceptChannel: waiting", start.elapsed());
+                    let ac = recv_accept_channel(&mut self.conn)?;
+                    log::debug!("[{:?}] RecvAcceptChannel: received", start.elapsed());
+                    Some(Variable::AcceptChannel(ac))
+                }
+
+                Operation::MineBlocks(v) => {
+                    self.bitcoin_cli.mine_blocks(*v);
+                    log::debug!("[{:?}] MineBlocks: mined {} block(s)", start.elapsed(), v);
+                    None
+                }
+
+                Operation::BroadcastTransaction => {
+                    let ft = resolve_funding_transaction(&variables, instr.inputs[0]);
+                    log::debug!(
+                        "[{:?}] BroadcastTransaction: txid={}",
+                        start.elapsed(),
+                        ft.tx.compute_txid(),
+                    );
+                    self.bitcoin_cli.sign_and_broadcast_tx(&ft.tx);
+                    None
+                }
+            };
+
+            variables.push(result);
+        }
+
+        Ok(())
+    }
 }
 
 // -- Variable resolution --
@@ -1024,18 +1057,17 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
 
-        assert_eq!(conn.sent.len(), 1);
-        let oc = decode_open_channel(&conn.sent[0]);
+        assert_eq!(executor.conn.sent.len(), 1);
+        let oc = decode_open_channel(&executor.conn.sent[0]);
         assert_eq!(oc.chain_hash, [0xcc; 32]);
         assert_eq!(oc.temporary_channel_id, ChannelId::new([0xbb; 32]));
         assert_eq!(oc.funding_satoshis, 100_000);
@@ -1109,18 +1141,17 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
 
-        assert_eq!(conn.sent.len(), 1);
-        let ca = match Message::decode(&conn.sent[0]).expect("valid message") {
+        assert_eq!(executor.conn.sent.len(), 1);
+        let ca = match Message::decode(&executor.conn.sent[0]).expect("valid message") {
             Message::ChannelAnnouncement(ca) => ca,
             other => panic!(
                 "expected ChannelAnnouncement, got type {}",
@@ -1181,18 +1212,17 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
 
-        assert_eq!(conn.sent.len(), 1);
-        let na = match Message::decode(&conn.sent[0]).expect("valid message") {
+        assert_eq!(executor.conn.sent.len(), 1);
+        let na = match Message::decode(&executor.conn.sent[0]).expect("valid message") {
             Message::NodeAnnouncement(na) => na,
             other => panic!("expected NodeAnnouncement, got type {}", other.msg_type()),
         };
@@ -1274,18 +1304,17 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
 
-        assert_eq!(conn.sent.len(), 1);
-        let cu = match Message::decode(&conn.sent[0]).expect("valid message") {
+        assert_eq!(executor.conn.sent.len(), 1);
+        let cu = match Message::decode(&executor.conn.sent[0]).expect("valid message") {
             Message::ChannelUpdate(cu) => cu,
             other => panic!("expected ChannelUpdate, got type {}", other.msg_type()),
         };
@@ -1331,17 +1360,16 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
 
-        let oc = decode_open_channel(&conn.sent[0]);
+        let oc = decode_open_channel(&executor.conn.sent[0]);
         assert_eq!(
             oc.tlvs.upfront_shutdown_script,
             Some(vec![0x00, 0x14, 0xab])
@@ -1381,17 +1409,16 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
 
-        let oc = decode_open_channel(&conn.sent[0]);
+        let oc = decode_open_channel(&executor.conn.sent[0]);
         let secp = Secp256k1::new();
         let expected =
             PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x11; 32]).unwrap());
@@ -1444,16 +1471,15 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        conn.queue_recv(ac_bytes);
-        execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor.conn.queue_recv(ac_bytes);
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
     }
 
     #[test]
@@ -1470,16 +1496,15 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        conn.queue_recv(init_bytes);
-        let err = execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap_err();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor.conn.queue_recv(init_bytes);
+        let err = executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap_err();
         assert!(matches!(
             err,
             ExecuteError::UnexpectedMessage {
@@ -1509,29 +1534,28 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        conn.queue_recv(ping_bytes);
-        conn.queue_recv(ac_bytes);
-        execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor.conn.queue_recv(ping_bytes);
+        executor.conn.queue_recv(ac_bytes);
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
 
         // Verify exactly two messages were sent: `open_channel` and `pong`.
-        assert_eq!(conn.sent.len(), 2);
+        assert_eq!(executor.conn.sent.len(), 2);
 
         // Verify the first message was `open_channel`.
-        let oc = Message::decode(&conn.sent[0]).unwrap();
+        let oc = Message::decode(&executor.conn.sent[0]).unwrap();
         let Message::OpenChannel(_) = oc else {
             panic!("expected OpenChannel, got {:?}", oc.msg_type());
         };
 
         // Verify the second message was the pong.
-        let pong = Message::decode(&conn.sent[1]).unwrap();
+        let pong = Message::decode(&executor.conn.sent[1]).unwrap();
         let Message::Pong(pong) = pong else {
             panic!("expected Pong, got {:?}", pong.msg_type());
         };
@@ -1549,13 +1573,12 @@ mod tests {
                 inputs: vec![], // expects 1 input
             }],
         };
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut MockConnection::new(),
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        );
+        let _ = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+        .execute(&program, std::time::Instant::now());
     }
 
     #[test]
@@ -1573,13 +1596,12 @@ mod tests {
                 },
             ],
         };
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut MockConnection::new(),
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        );
+        let _ = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+        .execute(&program, std::time::Instant::now());
     }
 
     #[test]
@@ -1591,13 +1613,12 @@ mod tests {
                 inputs: vec![99],
             }],
         };
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut MockConnection::new(),
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        );
+        let _ = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+        .execute(&program, std::time::Instant::now());
     }
 
     #[test]
@@ -1615,13 +1636,12 @@ mod tests {
                 },
             ],
         };
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut MockConnection::new(),
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        );
+        let _ = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+        .execute(&program, std::time::Instant::now());
     }
 
     #[test]
@@ -1640,13 +1660,12 @@ mod tests {
                 },
             ],
         };
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut MockConnection::new(),
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        );
+        let _ = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+        .execute(&program, std::time::Instant::now());
     }
 
     #[test]
@@ -1664,13 +1683,12 @@ mod tests {
                 },
             ],
         };
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut MockConnection::new(),
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        );
+        let _ = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+        .execute(&program, std::time::Instant::now());
     }
 
     #[test]
@@ -1691,13 +1709,12 @@ mod tests {
             instructions: instrs,
         };
 
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut MockConnection::new(),
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        );
+        let _ = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+        .execute(&program, std::time::Instant::now());
     }
 
     #[test]
@@ -1718,16 +1735,14 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
         let ac_bytes = Message::AcceptChannel(sample_accept_channel()).encode();
-        conn.queue_recv(ac_bytes);
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
         );
+        executor.conn.queue_recv(ac_bytes);
+        let _ = executor.execute(&program, std::time::Instant::now());
     }
 
     // MineBlocks should track calls to mine_blocks
@@ -1740,20 +1755,17 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        let mut mock_cli = MockBitcoinCli::default();
-        let context = sample_context();
-        execute(
-            &program,
-            &context,
-            &mut conn,
-            &mut mock_cli,
-            std::time::Instant::now(),
-        )
-        .unwrap();
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
 
         // Verify that mine_blocks was called with the correct number
-        assert_eq!(mock_cli.mine_blocks_calls, vec![6]);
+        assert_eq!(executor.bitcoin_cli.mine_blocks_calls, vec![6]);
     }
 
     #[test]
@@ -1772,37 +1784,33 @@ mod tests {
         let program = Program {
             instructions: instrs,
         };
-        let mut conn = MockConnection::new();
-        let _ = execute(
-            &program,
-            &sample_context(),
-            &mut conn,
-            &mut MockBitcoinCli::default(),
-            std::time::Instant::now(),
-        );
+        let _ = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+        .execute(&program, std::time::Instant::now());
     }
 
     #[test]
     fn execute_create_and_broadcast_tx() {
-        let mut conn = MockConnection::new();
-        let mut mock_cli = MockBitcoinCli {
+        let mock_cli = MockBitcoinCli {
             utxos: vec![sample_utxo()],
             change_spk: sample_change_spk(),
             ..Default::default()
         };
-        execute(
-            &Program {
-                instructions: create_and_broadcast_tx_instructions(),
-            },
-            &sample_context(),
-            &mut conn,
-            &mut mock_cli,
-            std::time::Instant::now(),
-        )
-        .expect("tx construction and broadcast should succeed");
+        let mut executor = Executor::new(MockConnection::new(), mock_cli, sample_context());
+        executor
+            .execute(
+                &Program {
+                    instructions: create_and_broadcast_tx_instructions(),
+                },
+                std::time::Instant::now(),
+            )
+            .expect("tx construction and broadcast should succeed");
 
-        assert_eq!(mock_cli.broadcast_calls.len(), 1);
-        let broadcast_tx = &mock_cli.broadcast_calls[0];
+        assert_eq!(executor.bitcoin_cli.broadcast_calls.len(), 1);
+        let broadcast_tx = &executor.bitcoin_cli.broadcast_calls[0];
         assert_eq!(
             broadcast_tx.compute_txid().to_string(),
             "09b0549b35f14ee862f63bd75811c6c27963c4dea6766ec6836952ec78df1e7e"
@@ -1816,22 +1824,19 @@ mod tests {
             amount: Amount::from_sat(1_000),
             ..sample_utxo()
         };
-        let mut conn = MockConnection::new();
-        let mut mock_cli = MockBitcoinCli {
+        let mock_cli = MockBitcoinCli {
             utxos: vec![small_utxo],
             change_spk: sample_change_spk(),
             ..Default::default()
         };
-        let err = execute(
-            &Program {
-                instructions: create_and_broadcast_tx_instructions(),
-            },
-            &sample_context(),
-            &mut conn,
-            &mut mock_cli,
-            std::time::Instant::now(),
-        )
-        .unwrap_err();
+        let err = Executor::new(MockConnection::new(), mock_cli, sample_context())
+            .execute(
+                &Program {
+                    instructions: create_and_broadcast_tx_instructions(),
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap_err();
         let ExecuteError::InsufficientFunds(funds_err) = err else {
             panic!("expected InsufficientFunds, got {err:?}");
         };

@@ -3,12 +3,13 @@
 
 use std::marker::PhantomData;
 
+use smite::bitcoin::BitcoinCli;
 use smite::noise::NoiseConnection;
 use smite::scenarios::{Scenario, ScenarioError, ScenarioResult};
 use smite_ir::Program;
 
 use super::{SnapshotSetup, ping_pong};
-use crate::executor::{self, ExecuteError, ProgramContext};
+use crate::executor::{ExecuteError, Executor};
 use crate::targets::Target;
 
 /// Scenario that executes IR programs against a target over an encrypted
@@ -19,8 +20,10 @@ use crate::targets::Target;
 /// (out-of-bounds variable refs, type mismatches, `MineBlocks(0)`, etc.).
 pub struct IrScenario<T: Target, S: SnapshotSetup<T>> {
     target: T,
-    conn: NoiseConnection,
-    context: ProgramContext,
+    /// Executes IR programs and owns the connection, bitcoin-cli handle, and
+    /// program context. Created once before the snapshot and reused across
+    /// fuzzing runs.
+    executor: Executor<NoiseConnection, BitcoinCli>,
     // S is only used for static dispatch on S::setup(), not stored.
     _phantom: PhantomData<S>,
 }
@@ -29,10 +32,11 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
     fn new(_args: &[String]) -> Result<Self, ScenarioError> {
         let target = T::start(T::Config::default())?;
         let (conn, context) = S::setup(&target)?;
+        let bitcoin_cli = target.bitcoin_cli().clone();
+        let executor = Executor::new(conn, bitcoin_cli, context);
         Ok(Self {
             target,
-            conn,
-            context,
+            executor,
             _phantom: PhantomData,
         })
     }
@@ -52,13 +56,7 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
             input.len(),
         );
 
-        match executor::execute(
-            &program,
-            &self.context,
-            &mut self.conn,
-            &mut self.target.bitcoin_cli().clone(),
-            start,
-        ) {
+        match self.executor.execute(&program, start) {
             Ok(()) => {
                 log::debug!("[{:?}] Program executed successfully", start.elapsed());
             }
@@ -91,7 +89,7 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
 
         // Ping-pong sync to ensure the target has at least done the initial
         // processing of all previous messages. Timeouts here signal a hang.
-        if let Err(e) = ping_pong(&mut self.conn) {
+        if let Err(e) = ping_pong(self.executor.conn_mut()) {
             log::debug!("[{:?}] ping_pong: {e}", start.elapsed());
             if e.is_timeout() {
                 return ScenarioResult::Fail("target hung (ping timeout)".into());
