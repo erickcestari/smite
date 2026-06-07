@@ -188,6 +188,10 @@ pub enum Operation {
     /// Produces a `SentOpenChannel` variable.
     /// Input: `OpenChannelMessage`.
     SendOpenChannel,
+    /// Send a `funding_created` message over the connection.
+    /// Produces a `SentFundingCreated` variable.
+    /// Input: `FundingCreatedMessage`.
+    SendFundingCreated,
     /// Receive and parse an `accept_channel` response.
     /// Produces an `AcceptChannel` compound variable.
     RecvAcceptChannel,
@@ -644,6 +648,7 @@ impl fmt::Display for Operation {
             Self::BuildChannelUpdate => write!(f, "BuildChannelUpdate"),
             Self::SendMessage => write!(f, "SendMessage"),
             Self::SendOpenChannel => write!(f, "SendOpenChannel"),
+            Self::SendFundingCreated => write!(f, "SendFundingCreated"),
         }
     }
 }
@@ -677,6 +682,7 @@ impl Operation {
             | Self::BuildChannelUpdate => Some(VariableType::Message),
             Self::SendMessage | Self::MineBlocks(_) | Self::BroadcastTransaction => None,
             Self::SendOpenChannel => Some(VariableType::SentOpenChannel),
+            Self::SendFundingCreated => Some(VariableType::SentFundingCreated),
             Self::RecvAcceptChannel => Some(VariableType::AcceptChannel),
         }
     }
@@ -714,6 +720,7 @@ impl Operation {
             ],
             Self::SendMessage => vec![VariableType::Message],
             Self::SendOpenChannel => vec![VariableType::OpenChannelMessage],
+            Self::SendFundingCreated => vec![VariableType::FundingCreatedMessage],
             Self::RecvAcceptChannel => vec![VariableType::SentOpenChannel],
             Self::BroadcastTransaction => vec![VariableType::FundingTransaction],
 
@@ -830,6 +837,7 @@ impl Operation {
             | Self::BuildChannelUpdate
             | Self::SendMessage
             | Self::SendOpenChannel
+            | Self::SendFundingCreated
             | Self::MineBlocks(_)
             | Self::BroadcastTransaction => vec![],
 
@@ -847,6 +855,7 @@ impl Operation {
         match self {
             Self::SendMessage
             | Self::SendOpenChannel
+            | Self::SendFundingCreated
             | Self::RecvAcceptChannel
             | Self::MineBlocks(_)
             | Self::CreateFundingTransaction
@@ -910,6 +919,7 @@ impl Operation {
             | Self::BuildChannelUpdate
             | Self::SendMessage
             | Self::SendOpenChannel
+            | Self::SendFundingCreated
             | Self::RecvAcceptChannel
             | Self::BroadcastTransaction => false,
         }

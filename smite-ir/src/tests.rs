@@ -461,7 +461,7 @@ fn postcard_roundtrip() {
             },
             Instruction {
                 operation: Operation::DerivePoint,
-                inputs: vec![7],
+                inputs: vec![8],
             },
             Instruction {
                 operation: Operation::LoadFeeratePerKw(15_000),
@@ -469,11 +469,11 @@ fn postcard_roundtrip() {
             },
             Instruction {
                 operation: Operation::CreateFundingTransaction,
-                inputs: vec![1, 8, 4, 9],
+                inputs: vec![1, 9, 5, 10],
             },
             Instruction {
                 operation: Operation::BroadcastTransaction,
-                inputs: vec![10],
+                inputs: vec![11],
             },
             Instruction {
                 operation: Operation::LoadU16(144),
@@ -482,12 +482,13 @@ fn postcard_roundtrip() {
             Instruction {
                 operation: Operation::BuildFundingCreated,
                 inputs: vec![
-                    10, 4, 5, 0, 1, 1, 1, 4, 12, 1, 1, 1, 1, 4, 12, 3, 5, 10, 1, 1,
+                    11, 5, 6, 0, 1, 1, 1, 5, 13, 9, 9, 9, 9, 5, 13, 3, 5, 10, 1, 9,
                 ],
             },
         ],
     };
 
+    assert_well_formed(&program);
     let bytes = postcard::to_allocvec(&program).expect("postcard serialization");
     let decoded: Program = postcard::from_bytes(&bytes).expect("postcard deserialization");
     assert_eq!(program, decoded);
@@ -596,7 +597,7 @@ fn displays_create_and_broadcast_tx_program() {
 }
 
 #[test]
-fn displays_build_funding_created_program() {
+fn displays_build_and_send_funding_created_program() {
     let instructions = vec![
         // Funding transaction.
         Instruction {
@@ -667,6 +668,11 @@ fn displays_build_funding_created_program() {
                 4, 2, 5, 0, 7, 7, 7, 8, 9, 11, 11, 11, 11, 8, 9, 12, 13, 14, 7, 11,
             ],
         },
+        // Send funding_created.
+        Instruction {
+            operation: Operation::SendFundingCreated,
+            inputs: vec![15],
+        },
     ];
 
     let program = Program { instructions };
@@ -693,6 +699,7 @@ fn displays_build_funding_created_program() {
         "v13 = LoadAmount(0)".into(),
         "v14 = LoadFeeratePerKw(253)".into(),
         "v15 = BuildFundingCreated(v4, v2, v5, v0, v7, v7, v7, v8, v9, v11, v11, v11, v11, v8, v9, v12, v13, v14, v7, v11)".into(),
+        "v16 = SendFundingCreated(v15)".into(),
     ];
 
     assert_eq!(lines.len(), expected.len(), "line count mismatch");

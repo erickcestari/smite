@@ -291,6 +291,17 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                     Some(Variable::SentOpenChannel)
                 }
 
+                Operation::SendFundingCreated => {
+                    let bytes = resolve_funding_created_message(&variables, instr.inputs[0]);
+                    log::debug!(
+                        "[{:?}] SendFundingCreated: {} bytes",
+                        start.elapsed(),
+                        bytes.len(),
+                    );
+                    self.conn.send_message(bytes)?;
+                    Some(Variable::SentFundingCreated)
+                }
+
                 Operation::RecvAcceptChannel => {
                     consume_sent_open_channel(&mut variables, instr.inputs[0]);
                     log::debug!("[{:?}] RecvAcceptChannel: waiting", start.elapsed());
@@ -479,6 +490,16 @@ fn resolve_open_channel_message(variables: &[Option<Variable>], index: usize) ->
         other => panic!(
             "variable {index}: expected OpenChannelMessage, got {:?}",
             other.var_type()
+        ),
+    }
+}
+
+fn resolve_funding_created_message(variables: &[Option<Variable>], index: usize) -> &[u8] {
+    match resolve(variables, index) {
+        Variable::FundingCreatedMessage(v) => v,
+        other => panic!(
+            "variable {index}: expected FundingCreatedMessage, got {:?}",
+            other.var_type(),
         ),
     }
 }
@@ -1930,7 +1951,7 @@ mod tests {
         assert_eq!(funds_err.required, Amount::from_sat(10_007_290));
     }
 
-    fn build_funding_created_instructions() -> Vec<Instruction> {
+    fn build_and_send_funding_created_instructions() -> Vec<Instruction> {
         let mut instrs = create_and_broadcast_tx_instructions();
         instrs.extend(vec![
             Instruction {
@@ -1967,32 +1988,50 @@ mod tests {
                     6, 4, 8, 0, 1, 1, 1, 9, 10, 3, 3, 3, 3, 9, 10, 11, 12, 13, 1, 3,
                 ],
             },
+            Instruction {
+                operation: Operation::SendFundingCreated,
+                inputs: vec![15],
+            },
         ]);
         instrs
     }
 
     #[test]
-    fn execute_build_funding_created() {
+    fn execute_build_and_send_funding_created() {
         let mock_cli = MockBitcoinCli {
             utxos: vec![sample_utxo()],
             change_spk: sample_change_spk(),
             ..Default::default()
         };
-        Executor::new(MockConnection::new(), mock_cli, sample_context())
+        let mut executor = Executor::new(MockConnection::new(), mock_cli, sample_context());
+        executor
             .execute(
                 &Program {
-                    instructions: build_funding_created_instructions(),
+                    instructions: build_and_send_funding_created_instructions(),
                 },
                 std::time::Instant::now(),
             )
-            .expect("BuildFundingCreated execution should succeed");
+            .unwrap();
+
+        assert_eq!(executor.conn.sent.len(), 1);
+        let fc = match Message::decode(&executor.conn.sent[0]).expect("valid message") {
+            Message::FundingCreated(fc) => fc,
+            other => panic!("expected FundingCreated, got type {}", other.msg_type()),
+        };
+
+        assert_eq!(fc.temporary_channel_id, ChannelId::new([0xbb; 32]));
+        assert_eq!(
+            fc.funding_txid.to_string(),
+            "09b0549b35f14ee862f63bd75811c6c27963c4dea6766ec6836952ec78df1e7e"
+        );
+        assert_eq!(fc.funding_output_index, 0);
     }
 
     #[test]
     fn execute_build_funding_created_push_exceeds_funding() {
         // push_msat (v12) larger than the funding amount surfaces the commitment
         // construction error.
-        let mut instrs = build_funding_created_instructions();
+        let mut instrs = build_and_send_funding_created_instructions();
         instrs[12] = Instruction {
             operation: Operation::LoadAmount(20_000_000_000),
             inputs: vec![],
@@ -2020,7 +2059,7 @@ mod tests {
     fn execute_build_funding_created_funding_msat_overflow() {
         // Re-point funding_satoshis (input index 1) to the u64::MAX amount (v14)
         // so converting it to millisatoshis overflows.
-        let mut instrs = build_funding_created_instructions();
+        let mut instrs = build_and_send_funding_created_instructions();
         instrs[15].inputs[1] = 14;
         let mock_cli = MockBitcoinCli {
             utxos: vec![sample_utxo()],

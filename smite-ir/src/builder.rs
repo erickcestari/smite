@@ -231,6 +231,9 @@ impl ProgramBuilder {
             VariableType::SentOpenChannel => {
                 panic!("cannot generate fresh SentOpenChannel: affine type")
             }
+            VariableType::SentFundingCreated => {
+                panic!("cannot generate fresh SentFundingCreated: affine type")
+            }
         }
     }
 

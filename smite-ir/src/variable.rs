@@ -58,6 +58,8 @@ pub enum Variable {
     // Affine (single-use) variables
     /// `open_channel` has been sent, so `accept_channel` may now be received.
     SentOpenChannel,
+    /// `funding_created` has been sent, so `funding_signed` may now be received.
+    SentFundingCreated,
 }
 
 impl Variable {
@@ -85,6 +87,7 @@ impl Variable {
             Self::AcceptChannel(_) => VariableType::AcceptChannel,
             Self::FundingTransaction(_) => VariableType::FundingTransaction,
             Self::SentOpenChannel => VariableType::SentOpenChannel,
+            Self::SentFundingCreated => VariableType::SentFundingCreated,
         }
     }
 }
@@ -113,13 +116,14 @@ pub enum VariableType {
     AcceptChannel,
     FundingTransaction,
     SentOpenChannel,
+    SentFundingCreated,
 }
 
 impl VariableType {
     #[must_use]
     pub fn is_affine(&self) -> bool {
         match self {
-            Self::SentOpenChannel => true,
+            Self::SentOpenChannel | Self::SentFundingCreated => true,
 
             Self::Bytes
             | Self::ChainHash
