@@ -606,7 +606,7 @@ fn format_hex(bytes: &[u8]) -> String {
 }
 
 /// Print an Operation. Operations that take no variable inputs include parens
-/// (e.g., `LoadAmount(100000)`, `RecvAcceptChannel()`). Operations that do take
+/// (e.g., `LoadAmount(100000)`, `LoadChainHashFromContext()`). Operations that do take
 /// inputs omit parens so `Program::Display` can append them `(v0, v1, ...)`.
 impl fmt::Display for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -629,9 +629,7 @@ impl fmt::Display for Operation {
             Self::LoadChannelType(v) => write!(f, "LoadChannelType({v})"),
             Self::LoadTargetPubkeyFromContext => write!(f, "LoadTargetPubkeyFromContext()"),
             Self::LoadChainHashFromContext => write!(f, "LoadChainHashFromContext()"),
-            Self::RecvAcceptChannel => write!(f, "RecvAcceptChannel()"),
             Self::MineBlocks(v) => write!(f, "MineBlocks({v})"),
-            Self::BroadcastTransaction => write!(f, "BroadcastTransaction"),
             // Operations with inputs: parens added by Program::Display.
             Self::DerivePoint => write!(f, "DerivePoint"),
             Self::ExtractAcceptChannel(field) => write!(f, "Extract{field}"),
@@ -649,6 +647,8 @@ impl fmt::Display for Operation {
             Self::SendMessage => write!(f, "SendMessage"),
             Self::SendOpenChannel => write!(f, "SendOpenChannel"),
             Self::SendFundingCreated => write!(f, "SendFundingCreated"),
+            Self::RecvAcceptChannel => write!(f, "RecvAcceptChannel"),
+            Self::BroadcastTransaction => write!(f, "BroadcastTransaction"),
         }
     }
 }

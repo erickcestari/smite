@@ -149,13 +149,13 @@ fn display_open_channel_program() {
             ],
         },
         Instruction {
-            operation: Operation::SendMessage,
+            operation: Operation::SendOpenChannel,
             inputs: vec![26],
         },
         // Receive accept_channel and extract fields.
         Instruction {
             operation: Operation::RecvAcceptChannel,
-            inputs: vec![],
+            inputs: vec![27],
         },
         Instruction {
             operation: Operation::ExtractAcceptChannel(AcceptChannelField::FundingPubkey),
@@ -203,8 +203,8 @@ fn display_open_channel_program() {
         "v24 = LoadShutdownScript(Empty)".into(),
         "v25 = LoadFeatures()".into(),
         "v26 = BuildOpenChannel(v13, v12, v14, v15, v16, v17, v18, v19, v20, v21, v22, v1, v3, v5, v7, v9, v11, v23, v24, v25)".into(),
-        "SendMessage(v26)".into(),
-        "v28 = RecvAcceptChannel()".into(),
+        "v27 = SendOpenChannel(v26)".into(),
+        "v28 = RecvAcceptChannel(v27)".into(),
         "v29 = ExtractFundingPubkey(v28)".into(),
         "v30 = ExtractFirstPerCommitmentPoint(v28)".into(),
     ];
