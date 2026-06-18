@@ -224,8 +224,10 @@ mod tests {
     fn wait_for_pid_file(path: &Path) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
-            if let Ok(contents) = fs::read_to_string(path) {
-                return contents.trim().parse().unwrap();
+            if let Ok(contents) = fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse()
+            {
+                return pid;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
