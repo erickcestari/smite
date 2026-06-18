@@ -8,8 +8,9 @@ use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bitcoin::{OutPoint, ScriptBuf};
 use smite::bitcoin::{BitcoinCli, Utxo};
 use smite::bolt::{
-    AcceptChannel, ChannelAnnouncement, ChannelId, ChannelUpdate, FundingCreated, FundingSigned,
-    Message, NodeAnnouncement, OpenChannel, OpenChannelTlvs, Pong, ShortChannelId, msg_type,
+    AcceptChannel, AnnouncementSignatures, ChannelAnnouncement, ChannelId, ChannelUpdate,
+    FundingCreated, FundingSigned, Message, NodeAnnouncement, OpenChannel, OpenChannelTlvs, Pong,
+    ShortChannelId, msg_type,
 };
 use smite::channel_tx::{
     ChannelConfig, ChannelPartyConfig, ChannelState, FundingTransaction, HolderIdentity, Side,
@@ -290,6 +291,12 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                 Operation::BuildChannelUpdate => {
                     let cu = build_channel_update(&variables, &instr.inputs);
                     let encoded = Message::ChannelUpdate(cu).encode();
+                    Some(Variable::Message(encoded))
+                }
+
+                Operation::BuildAnnouncementSignatures => {
+                    let ann_sigs = build_announcement_signatures(&variables, &instr.inputs);
+                    let encoded = Message::AnnouncementSignatures(ann_sigs).encode();
                     Some(Variable::Message(encoded))
                 }
 
@@ -776,6 +783,68 @@ fn build_channel_announcement(
     };
     ca.sign(&node_sk_1, &node_sk_2, &bitcoin_sk_1, &bitcoin_sk_2);
     ca
+}
+
+/// Builds an `AnnouncementSignatures` message from 8 input variables.
+///
+/// Signs the `channel_announcement` body with our node and bitcoin secret keys
+/// (inputs 4 and 6). The body is assembled with pubkeys sorted lexicographically
+/// per BOLT 7 using the target's public keys (inputs 5 and 7) directly.
+fn build_announcement_signatures(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+) -> AnnouncementSignatures {
+    let channel_id = resolve_channel_id(variables, inputs[0]);
+    let features = resolve_features(variables, inputs[1]).to_vec();
+    let chain_hash = resolve_chain_hash(variables, inputs[2]);
+    let short_channel_id = resolve_short_channel_id(variables, inputs[3]);
+    let node_sk_1_bytes = resolve_private_key(variables, inputs[4]);
+    let node_id_2 = resolve_pubkey(variables, inputs[5]);
+    let bitcoin_sk_1_bytes = resolve_private_key(variables, inputs[6]);
+    let bitcoin_key_2 = resolve_pubkey(variables, inputs[7]);
+
+    let node_sk_1 = SecretKey::from_slice(&node_sk_1_bytes).expect("valid private key");
+    let bitcoin_sk_1 = SecretKey::from_slice(&bitcoin_sk_1_bytes).expect("valid private key");
+
+    let secp = Secp256k1::new();
+    let node_id_1 = PublicKey::from_secret_key(&secp, &node_sk_1);
+    let bitcoin_key_1 = PublicKey::from_secret_key(&secp, &bitcoin_sk_1);
+
+    // BOLT 7 requires node_id_1 < node_id_2 lexicographically (serialized
+    // compressed form).  Sort the pubkeys so the body we sign is valid.
+    let (n1, n2, bk1, bk2) = if node_id_1.serialize() <= node_id_2.serialize() {
+        (node_id_1, node_id_2, bitcoin_key_1, bitcoin_key_2)
+    } else {
+        (node_id_2, node_id_1, bitcoin_key_2, bitcoin_key_1)
+    };
+
+    let placeholder = Signature::from_compact(&[0u8; 64]).expect("zero bytes parse as a signature");
+    let ca = ChannelAnnouncement {
+        node_signature_1: placeholder,
+        node_signature_2: placeholder,
+        bitcoin_signature_1: placeholder,
+        bitcoin_signature_2: placeholder,
+        features,
+        chain_hash,
+        short_channel_id,
+        node_id_1: n1,
+        node_id_2: n2,
+        bitcoin_key_1: bk1,
+        bitcoin_key_2: bk2,
+        extra: Vec::new(),
+    };
+
+    // Sign the correctly-ordered body digest with our keys only.
+    let digest = ca.signing_digest();
+    let node_signature = secp.sign_ecdsa(&digest, &node_sk_1);
+    let bitcoin_signature = secp.sign_ecdsa(&digest, &bitcoin_sk_1);
+
+    AnnouncementSignatures {
+        channel_id,
+        short_channel_id,
+        node_signature,
+        bitcoin_signature,
+    }
 }
 
 /// Builds a signed `NodeAnnouncement` from 4 input variables.
@@ -1543,6 +1612,157 @@ mod tests {
         let expected_node_id =
             PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&sk_bytes).unwrap());
         assert!(cu.verify(&expected_node_id));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn execute_build_announcement_signatures() {
+        let node_sk_1_bytes = [0x11; 32];
+        let node_sk_2_bytes = [0x22; 32];
+        let bitcoin_sk_1_bytes = [0x33; 32];
+        let bitcoin_sk_2_bytes = [0x44; 32];
+        let channel_id_bytes = [0xbb; 32];
+        let scid = ShortChannelId::new(539_268, 845, 1);
+        let features = vec![0x01, 0x02];
+
+        // Instruction layout:
+        //  v0 = LoadChannelId
+        //  v1 = LoadFeatures
+        //  v2 = LoadChainHashFromContext
+        //  v3 = LoadShortChannelId
+        //  v4 = LoadPrivateKey(node_sk_1)     -- our node signing key
+        //  v5 = LoadPrivateKey(node_sk_2)     -- target's node key (derive pubkey from)
+        //  v6 = DerivePoint(v5)               -- node_id_2 (target's node pubkey)
+        //  v7 = LoadPrivateKey(bitcoin_sk_1)  -- our bitcoin signing key
+        //  v8 = LoadPrivateKey(bitcoin_sk_2)  -- target's bitcoin key (derive pubkey from)
+        //  v9 = DerivePoint(v8)               -- bitcoin_key_2 (target's bitcoin pubkey)
+        // v10 = BuildAnnouncementSignatures(v0, v1, v2, v3, v4, v6, v7, v9)
+        // v11 = SendMessage(v10)
+        let instrs = vec![
+            Instruction {
+                operation: Operation::LoadChannelId(channel_id_bytes),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::LoadFeatures(features.clone()),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::LoadChainHashFromContext,
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::LoadShortChannelId(scid.as_u64()),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::LoadPrivateKey(node_sk_1_bytes),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::LoadPrivateKey(node_sk_2_bytes),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::DerivePoint,
+                inputs: vec![5],
+            },
+            Instruction {
+                operation: Operation::LoadPrivateKey(bitcoin_sk_1_bytes),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::LoadPrivateKey(bitcoin_sk_2_bytes),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::DerivePoint,
+                inputs: vec![8],
+            },
+            Instruction {
+                operation: Operation::BuildAnnouncementSignatures,
+                inputs: vec![0, 1, 2, 3, 4, 6, 7, 9],
+            },
+            Instruction {
+                operation: Operation::SendMessage,
+                inputs: vec![10],
+            },
+        ];
+
+        let program = Program {
+            instructions: instrs,
+        };
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(&program, std::time::Instant::now())
+            .unwrap();
+
+        assert_eq!(executor.conn.sent.len(), 1);
+        let ann_sigs = match Message::decode(&executor.conn.sent[0]).expect("valid message") {
+            Message::AnnouncementSignatures(s) => s,
+            other => panic!(
+                "expected AnnouncementSignatures, got type {}",
+                other.msg_type()
+            ),
+        };
+
+        assert_eq!(ann_sigs.channel_id, ChannelId::new(channel_id_bytes));
+        assert_eq!(ann_sigs.short_channel_id, scid);
+
+        // Verify the signatures in announcement_signatures directly against
+        // the channel_announcement body digest.
+        let secp = Secp256k1::new();
+        let node_sk_1 = SecretKey::from_slice(&node_sk_1_bytes).unwrap();
+        let node_sk_2 = SecretKey::from_slice(&node_sk_2_bytes).unwrap();
+        let bitcoin_sk_1 = SecretKey::from_slice(&bitcoin_sk_1_bytes).unwrap();
+        let bitcoin_sk_2 = SecretKey::from_slice(&bitcoin_sk_2_bytes).unwrap();
+        let node_id_ours = PublicKey::from_secret_key(&secp, &node_sk_1);
+        let node_id_theirs = PublicKey::from_secret_key(&secp, &node_sk_2);
+        let bitcoin_key_ours = PublicKey::from_secret_key(&secp, &bitcoin_sk_1);
+        let bitcoin_key_theirs = PublicKey::from_secret_key(&secp, &bitcoin_sk_2);
+        let (n1, n2, bk1, bk2) = if node_id_ours.serialize() <= node_id_theirs.serialize() {
+            (
+                node_id_ours,
+                node_id_theirs,
+                bitcoin_key_ours,
+                bitcoin_key_theirs,
+            )
+        } else {
+            (
+                node_id_theirs,
+                node_id_ours,
+                bitcoin_key_theirs,
+                bitcoin_key_ours,
+            )
+        };
+        let placeholder = Signature::from_compact(&[0u8; 64]).unwrap();
+        let ca = ChannelAnnouncement {
+            node_signature_1: placeholder,
+            node_signature_2: placeholder,
+            bitcoin_signature_1: placeholder,
+            bitcoin_signature_2: placeholder,
+            features,
+            chain_hash: sample_context().chain_hash,
+            short_channel_id: scid,
+            node_id_1: n1,
+            node_id_2: n2,
+            bitcoin_key_1: bk1,
+            bitcoin_key_2: bk2,
+            extra: Vec::new(),
+        };
+        let digest = ca.signing_digest();
+        assert!(
+            secp.verify_ecdsa(&digest, &ann_sigs.node_signature, &node_id_ours)
+                .is_ok()
+        );
+        assert!(
+            secp.verify_ecdsa(&digest, &ann_sigs.bitcoin_signature, &bitcoin_key_ours)
+                .is_ok()
+        );
     }
 
     #[test]

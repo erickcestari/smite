@@ -179,6 +179,23 @@ pub enum Operation {
     ///   9: `fee_proportional_millionths` (`ForwardingFee`)
     ///  10: `htlc_maximum_msat` (`Amount`)
     BuildChannelUpdate,
+    /// Build an `announcement_signatures` message (BOLT 7, type 259).
+    ///
+    /// Signs the `channel_announcement` body with our node and bitcoin secret
+    /// keys. The body is constructed with pubkeys sorted in the lexicographic
+    /// order required by BOLT 7, using the target's public keys (inputs 5 and
+    /// 7) directly — we do not need the target's secret keys.
+    ///
+    /// Inputs (8):
+    ///   0: `channel_id`       (`ChannelId`)
+    ///   1: `features`         (`Features`)
+    ///   2: `chain_hash`       (`ChainHash`)
+    ///   3: `short_channel_id` (`ShortChannelId`)
+    ///   4: `node_sk_1`        (`PrivateKey`) -- our node signing key
+    ///   5: `node_id_2`        (`Point`)      -- target's node public key
+    ///   6: `bitcoin_sk_1`     (`PrivateKey`) -- our bitcoin signing key
+    ///   7: `bitcoin_key_2`    (`Point`)      -- target's bitcoin public key
+    BuildAnnouncementSignatures,
 
     // -- Act: side effects against the target --
     /// Send an encoded message over the connection.
@@ -648,6 +665,7 @@ impl fmt::Display for Operation {
                 format_hex(alias),
             ),
             Self::BuildChannelUpdate => write!(f, "BuildChannelUpdate"),
+            Self::BuildAnnouncementSignatures => write!(f, "BuildAnnouncementSignatures"),
             Self::SendMessage => write!(f, "SendMessage"),
             Self::SendOpenChannel => write!(f, "SendOpenChannel"),
             Self::SendFundingCreated => write!(f, "SendFundingCreated"),
@@ -684,7 +702,8 @@ impl Operation {
             Self::BuildFundingCreated => Some(VariableType::FundingCreatedMessage),
             Self::BuildChannelAnnouncement
             | Self::BuildNodeAnnouncement { .. }
-            | Self::BuildChannelUpdate => Some(VariableType::Message),
+            | Self::BuildChannelUpdate
+            | Self::BuildAnnouncementSignatures => Some(VariableType::Message),
             Self::SendMessage | Self::MineBlocks(_) | Self::BroadcastTransaction => None,
             Self::SendOpenChannel => Some(VariableType::SentOpenChannel),
             Self::SendFundingCreated => Some(VariableType::SentFundingCreated),
@@ -806,6 +825,17 @@ impl Operation {
                 VariableType::ForwardingFee,  // fee_proportional_millionths
                 VariableType::Amount,         // htlc_maximum_msat
             ],
+
+            Self::BuildAnnouncementSignatures => vec![
+                VariableType::ChannelId,      // channel_id
+                VariableType::Features,       // features
+                VariableType::ChainHash,      // chain_hash
+                VariableType::ShortChannelId, // short_channel_id
+                VariableType::PrivateKey,     // node_sk_1 (our node signing key)
+                VariableType::Point,          // node_id_2 (target's node public key)
+                VariableType::PrivateKey,     // bitcoin_sk_1 (our bitcoin signing key)
+                VariableType::Point,          // bitcoin_key_2 (target's bitcoin public key)
+            ],
         }
     }
 
@@ -841,6 +871,7 @@ impl Operation {
             | Self::BuildChannelAnnouncement
             | Self::BuildNodeAnnouncement { .. }
             | Self::BuildChannelUpdate
+            | Self::BuildAnnouncementSignatures
             | Self::SendMessage
             | Self::SendOpenChannel
             | Self::SendFundingCreated
@@ -890,7 +921,8 @@ impl Operation {
             | Self::BuildOpenChannel
             | Self::BuildFundingCreated
             | Self::BuildNodeAnnouncement { .. }
-            | Self::BuildChannelUpdate => false,
+            | Self::BuildChannelUpdate
+            | Self::BuildAnnouncementSignatures => false,
         }
     }
 
@@ -925,6 +957,7 @@ impl Operation {
             | Self::BuildFundingCreated
             | Self::BuildChannelAnnouncement
             | Self::BuildChannelUpdate
+            | Self::BuildAnnouncementSignatures
             | Self::SendMessage
             | Self::SendOpenChannel
             | Self::SendFundingCreated

@@ -54,6 +54,15 @@ impl ChannelAnnouncement {
         out
     }
 
+    /// Returns the BOLT 7 signing digest: double-SHA256 of the post-signature
+    /// body bytes, as a `secp256k1::Message` ready for signing or verification.
+    #[must_use]
+    pub fn signing_digest(&self) -> secp256k1::Message {
+        let mut body = Vec::new();
+        self.write_body(&mut body);
+        secp256k1::Message::from_digest(sha256d::Hash::hash(&body).to_byte_array())
+    }
+
     /// Computes the BOLT 7 digest over the post-signature body and writes all
     /// four signatures into the struct.
     ///
@@ -67,9 +76,7 @@ impl ChannelAnnouncement {
         bitcoin_sk_2: &SecretKey,
     ) {
         let secp = Secp256k1::new();
-        let mut body = Vec::new();
-        self.write_body(&mut body);
-        let digest = secp256k1::Message::from_digest(sha256d::Hash::hash(&body).to_byte_array());
+        let digest = self.signing_digest();
         self.node_signature_1 = secp.sign_ecdsa(&digest, node_sk_1);
         self.node_signature_2 = secp.sign_ecdsa(&digest, node_sk_2);
         self.bitcoin_signature_1 = secp.sign_ecdsa(&digest, bitcoin_sk_1);
@@ -81,9 +88,7 @@ impl ChannelAnnouncement {
     #[must_use]
     pub fn verify(&self) -> bool {
         let secp = Secp256k1::new();
-        let mut body = Vec::new();
-        self.write_body(&mut body);
-        let digest = secp256k1::Message::from_digest(sha256d::Hash::hash(&body).to_byte_array());
+        let digest = self.signing_digest();
         secp.verify_ecdsa(&digest, &self.node_signature_1, &self.node_id_1)
             .is_ok()
             && secp
