@@ -728,11 +728,7 @@ fn build_funding_created(
     // has already been established (and possibly advanced).
     channel_states
         .entry(channel_id)
-        .or_insert_with(|| ChannelState {
-            config,
-            holder,
-            commitment: state,
-        });
+        .or_insert_with(|| ChannelState::new(config, holder, state));
 
     Ok(FundingCreated {
         temporary_channel_id,
