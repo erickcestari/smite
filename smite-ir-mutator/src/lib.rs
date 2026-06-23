@@ -39,10 +39,7 @@ use std::slice;
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng, seq::IteratorRandom};
 
-use smite_ir::generators::{
-    AnyGenerator, ChannelAnnouncementGenerator, ChannelUpdateGenerator, NodeAnnouncementGenerator,
-    OpenChannelGenerator,
-};
+use smite_ir::generators::AnyGenerator;
 use smite_ir::minimizers::{CommonSubexpressionEliminator, DeadCodeEliminator, Minimizer};
 use smite_ir::mutators::{
     GeneratorInsertionMutator, InputSwapMutator, InstructionDeleteMutator,
@@ -79,13 +76,11 @@ impl MutatorState {
     /// the registered generators.
     fn generate_fresh(&mut self) -> Program {
         let mut builder = ProgramBuilder::new();
-        match self.rng.random_range(0..4) {
-            0 => OpenChannelGenerator.generate(&mut builder, &mut self.rng),
-            1 => ChannelAnnouncementGenerator.generate(&mut builder, &mut self.rng),
-            2 => NodeAnnouncementGenerator.generate(&mut builder, &mut self.rng),
-            3 => ChannelUpdateGenerator.generate(&mut builder, &mut self.rng),
-            _ => unreachable!("random_range() bound out of sync with match arms"),
-        }
+        AnyGenerator::ALL
+            .iter()
+            .choose(&mut self.rng)
+            .expect("AnyGenerator::ALL is non-empty")
+            .generate(&mut builder, &mut self.rng);
         self.last_sequence.clear();
         self.last_sequence.push("fresh");
         builder.build()
@@ -421,6 +416,7 @@ pub unsafe extern "C" fn afl_custom_describe(
 
 #[cfg(test)]
 mod tests {
+    use smite_ir::generators::OpenChannelGenerator;
     use std::ffi::CStr;
     use std::ptr;
 
