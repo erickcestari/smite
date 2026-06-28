@@ -165,7 +165,7 @@ impl BitcoinCli {
             .script_pubkey()
     }
 
-    /// Signs and broadcasts a transaction.
+    /// Signs and broadcasts a transaction, unless it is already confirmed.
     ///
     /// # Panics
     ///
@@ -180,6 +180,14 @@ impl BitcoinCli {
         struct SignRawTransactionResponse {
             hex: String,
             complete: bool,
+        }
+
+        // A confirmed transaction may be broadcast again by the fuzzer. Its
+        // inputs are spent, so the wallet can no longer fully sign it, skip
+        // signing and broadcasting it again.
+        let txid = tx.compute_txid();
+        if self.get_transaction_confirmations(txid) > 0 {
+            return;
         }
 
         let tx_hex = serialize_hex(tx);
@@ -222,7 +230,7 @@ impl BitcoinCli {
             .expect("sendrawtransaction should return a valid UTF-8 txid");
         assert_eq!(
             broadcast_txid.trim(),
-            tx.compute_txid().to_string(),
+            txid.to_string(),
             "sendrawtransaction returned unexpected txid"
         );
     }
