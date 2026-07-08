@@ -10,6 +10,7 @@ use smite::noise::{
     ACT_TWO_SIZE, ENCRYPTED_LENGTH_SIZE, MAC_SIZE, NoiseCipher, NoiseConnection, NoiseHandshake,
 };
 use smite::scenarios::{Scenario, ScenarioError, ScenarioResult};
+use smite::violation::Violation;
 
 use super::{EPHEMERAL_KEY, handshake_with_target, ping_pong};
 use crate::targets::Target;
@@ -313,7 +314,12 @@ impl<T: Target> Scenario for NoiseScenario<T> {
             log::debug!("[{:?}] Syncing via ping-pong", start.elapsed());
             if let Err(e) = ping_pong(&mut self.sync_conn) {
                 log::debug!("[{:?}] Sync ping-pong failed: {e}", start.elapsed());
-                return ScenarioResult::Fail("target unresponsive".into());
+                let violation = if e.is_timeout() {
+                    Violation::Hung
+                } else {
+                    Violation::UnexpectedDisconnect
+                };
+                return ScenarioResult::Fail(violation.to_string());
             }
         }
 
@@ -321,7 +327,7 @@ impl<T: Target> Scenario for NoiseScenario<T> {
 
         if let Err(e) = self.target.check_alive() {
             log::debug!("[{:?}] check_alive: {e}", start.elapsed());
-            return ScenarioResult::Fail("target crashed".into());
+            return ScenarioResult::Fail(Violation::Crashed.to_string());
         }
 
         log::debug!("[{:?}] Target still alive", start.elapsed());

@@ -18,6 +18,7 @@ use smite::channel_tx::{
 };
 use smite::noise::{ConnectionError, NoiseConnection};
 use smite::pending_channel::PendingChannel;
+use smite::violation::Violation;
 use smite_ir::operation::AcceptChannelField;
 use smite_ir::{Operation, Program, Variable};
 use std::collections::HashMap;
@@ -136,30 +137,10 @@ pub enum ExecuteError {
     #[error("commitment: {0}")]
     Commitment(#[from] smite::channel_tx::CommitmentError),
 
-    /// Received a message referencing a channel id we have no tracked state
-    /// for. This covers:
-    /// - a `funding_signed` for a `channel_id` we never opened, or
-    /// - an `accept_channel` for a `temporary_channel_id` we never sent
-    ///   `open_channel` for.
-    #[error("unknown channel: no tracked state for channel id {0:?}")]
-    UnknownChannel(ChannelId),
-
-    /// Received a second `accept_channel` for a `temporary_channel_id` whose
-    /// in-progress negotiation already has one, i.e. the id was reused before
-    /// its negotiation reached `funding_created`.
-    #[error(
-        "temporary_channel_id reuse: previous negotiation for {0:?} has not yet reached funding_created"
-    )]
-    TempChannelIdReuse(ChannelId),
-
-    /// The opener cannot afford the feerate for the commitment transaction.
-    #[error("opener cannot afford commitment fee for channel_id {0:?}")]
-    OpenerCannotAffordFee(ChannelId),
-
-    /// The counterparty's signature in `funding_signed` failed to verify
-    /// against the holder's first commitment transaction.
-    #[error("invalid counterparty signature for channel_id {0:?}")]
-    InvalidCounterpartySignature(ChannelId),
+    /// The target broke a protocol invariant. Surfaced to the scenario as a
+    /// failure; see [`Violation`] for the full catalog of target-bug findings.
+    #[error(transparent)]
+    Violation(#[from] Violation),
 }
 
 /// Executes IR programs against a target over an established connection.
@@ -209,9 +190,9 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
     /// - the target sends an unexpected message type
     /// - wallet funds are insufficient to perform a channel operation
     /// - the initial commitment transaction cannot be constructed
-    /// - no channel state exists for a received `funding_signed`
-    /// - the opener cannot afford the commitment feerate
-    /// - the counterparty's signature fails verification
+    /// - the target commits a [`Violation`] (unknown channel, temporary
+    ///   channel id reuse, opener cannot afford the commitment feerate, or
+    ///   invalid counterparty signature)
     ///
     /// # Panics
     ///
@@ -1072,8 +1053,8 @@ fn recv_funding_signed(conn: &mut impl Connection) -> Result<FundingSigned, Exec
 /// # Errors
 ///
 /// Returns [`ExecuteError::UnexpectedMessage`] if the received message is not a
-/// `channel_ready`, or [`ExecuteError::UnknownChannel`] if no channel state
-/// exists for the message's `channel_id`.
+/// `channel_ready`, or [`Violation::UnknownChannel`] if no channel state exists
+/// for the message's `channel_id`.
 fn recv_channel_ready(
     conn: &mut impl Connection,
     channel_states: &mut HashMap<ChannelId, ChannelState>,
@@ -1090,7 +1071,7 @@ fn recv_channel_ready(
 
     let state = channel_states
         .get_mut(&cr.channel_id)
-        .ok_or(ExecuteError::UnknownChannel(cr.channel_id))?;
+        .ok_or(Violation::UnknownChannel(cr.channel_id))?;
     *state.next_counterparty_per_commitment_point_mut() = Some(cr.second_per_commitment_point);
 
     Ok(())
@@ -1118,29 +1099,29 @@ fn is_channel_ready_expected(
 ///
 /// # Errors
 ///
-/// Returns [`ExecuteError::UnknownChannel`] if no channel state exists for the
-/// given `channel_id`, [`ExecuteError::OpenerCannotAffordFee`] if the opener
-/// cannot afford the commitment feerate, or [`ExecuteError::InvalidCounterpartySignature`]
+/// Returns [`Violation::UnknownChannel`] if no channel state exists for the
+/// given `channel_id`, [`Violation::OpenerCannotAffordFee`] if the opener
+/// cannot afford the commitment feerate, or [`Violation::InvalidCounterpartySignature`]
 /// if the signature is invalid for the holder's initial commitment transaction.
 fn verify_funding_signed(
     fs: &FundingSigned,
     channel_states: &HashMap<ChannelId, ChannelState>,
-) -> Result<(), ExecuteError> {
+) -> Result<(), Violation> {
     let state = channel_states
         .get(&fs.channel_id)
-        .ok_or(ExecuteError::UnknownChannel(fs.channel_id))?;
+        .ok_or(Violation::UnknownChannel(fs.channel_id))?;
 
     // The opener cannot afford the fee, so the acceptor must not send
     // `funding_signed`. Receiving one is a protocol violation.
     if !state.config.can_opener_afford_feerate(&state.commitment) {
-        return Err(ExecuteError::OpenerCannotAffordFee(fs.channel_id));
+        return Err(Violation::OpenerCannotAffordFee(fs.channel_id));
     }
 
     state
         .config
         .verify_counterparty_signature(&state.commitment, &state.holder, &fs.signature)
         .then_some(())
-        .ok_or(ExecuteError::InvalidCounterpartySignature(fs.channel_id))
+        .ok_or(Violation::InvalidCounterpartySignature(fs.channel_id))
 }
 
 /// Records a sent `open_channel`, keyed by `temporary_channel_id`, so the
@@ -1176,22 +1157,22 @@ fn record_send_open_channel(
 ///
 /// # Errors
 ///
-/// Returns [`ExecuteError::UnknownChannel`] if no `open_channel` was recorded
+/// Returns [`Violation::UnknownChannel`] if no `open_channel` was recorded
 /// for the message's `temporary_channel_id`.
 ///
-/// Returns [`ExecuteError::TempChannelIdReuse`] if the negotiation already has an
+/// Returns [`Violation::TempChannelIdReuse`] if the negotiation already has an
 /// `accept_channel` but has not yet reached `funding_created`.
 fn record_recv_accept_channel(
     negotiations: &mut HashMap<ChannelId, PendingChannel>,
     accept_channel: &AcceptChannel,
-) -> Result<(), ExecuteError> {
+) -> Result<(), Violation> {
     let pending = negotiations
         .get_mut(&accept_channel.temporary_channel_id)
-        .ok_or(ExecuteError::UnknownChannel(
+        .ok_or(Violation::UnknownChannel(
             accept_channel.temporary_channel_id,
         ))?;
     if pending.accept_channel.is_some() && !pending.funding_built {
-        return Err(ExecuteError::TempChannelIdReuse(
+        return Err(Violation::TempChannelIdReuse(
             accept_channel.temporary_channel_id,
         ));
     }
@@ -2277,7 +2258,9 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(matches!(err, ExecuteError::UnknownChannel(id) if id == unknown_id));
+        assert!(
+            matches!(err, ExecuteError::Violation(Violation::UnknownChannel(id)) if id == unknown_id)
+        );
     }
 
     #[test]
@@ -2319,7 +2302,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ExecuteError::TempChannelIdReuse(id) if id == temporary_channel_id
+            ExecuteError::Violation(Violation::TempChannelIdReuse(id)) if id == temporary_channel_id
         ));
     }
 
@@ -3020,7 +3003,10 @@ mod tests {
                 std::time::Instant::now(),
             )
             .unwrap_err();
-        assert!(matches!(err, ExecuteError::UnknownChannel(id) if id == channel_id));
+        assert!(matches!(
+            err,
+            ExecuteError::Violation(Violation::UnknownChannel(id)) if id == channel_id
+        ));
     }
 
     #[test]
@@ -3067,7 +3053,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ExecuteError::OpenerCannotAffordFee(id) if id == channel_id
+            ExecuteError::Violation(Violation::OpenerCannotAffordFee(id)) if id == channel_id
         ));
     }
 
@@ -3107,7 +3093,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ExecuteError::InvalidCounterpartySignature(id) if id == channel_id
+            ExecuteError::Violation(Violation::InvalidCounterpartySignature(id)) if id == channel_id
         ));
     }
 

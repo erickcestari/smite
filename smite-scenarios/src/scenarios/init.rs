@@ -6,6 +6,7 @@ use smite::bolt;
 use smite::bolt::{Init, Message};
 use smite::noise::{MAX_MESSAGE_SIZE, NoiseConnection};
 use smite::scenarios::{Scenario, ScenarioError, ScenarioResult};
+use smite::violation::Violation;
 
 use super::{handshake_with_target, ping_pong};
 use crate::targets::Target;
@@ -68,7 +69,7 @@ impl<T: Target> Scenario for InitScenario<T> {
         if let Err(e) = ping_pong(&mut self.conn) {
             log::debug!("[{:?}] ping_pong: {e}", start.elapsed());
             if e.is_timeout() {
-                return ScenarioResult::Fail("target hung (ping timeout)".into());
+                return ScenarioResult::Fail(Violation::Hung.to_string());
             }
             // Non-timeout error likely means the target closed the connection.
             // This is expected for invalid init messages, but it could also
@@ -79,7 +80,7 @@ impl<T: Target> Scenario for InitScenario<T> {
 
         if let Err(e) = self.target.check_alive() {
             log::debug!("[{:?}] check_alive: {e}", start.elapsed());
-            return ScenarioResult::Fail("target crashed".into());
+            return ScenarioResult::Fail(Violation::Crashed.to_string());
         }
 
         ScenarioResult::Ok
