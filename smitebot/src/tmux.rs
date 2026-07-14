@@ -99,6 +99,36 @@ pub fn dead_windows(session: &str) -> io::Result<Vec<String>> {
         .collect())
 }
 
+/// Returns the foreground PID of each pane in `session`.
+///
+/// Each pane runs `exec afl-fuzz`, so these are the live afl-fuzz PIDs. `stop`
+/// uses them as the authoritative source because state.json PIDs can be missing
+/// when startup verification times out. Errors if the `tmux list-panes` command
+/// fails (e.g. the session vanished); an empty vec means the session has no panes.
+pub fn list_pane_pids(session: &str) -> io::Result<Vec<u32>> {
+    let target = format!("={session}");
+    let output = Command::new("tmux")
+        .args(["list-panes", "-s", "-t", &target, "-F", "#{pane_pid}"])
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "tmux list-panes failed for session {session}: {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect())
+}
+
+/// Kills a tmux session and all of its windows.
+pub fn kill_session(session: &str) -> io::Result<()> {
+    let target = format!("={session}");
+    run_tmux(&["kill-session", "-t", &target])
+}
+
 /// Attaches to a session, using `switch-client` when already inside tmux.
 pub fn attach(session: &str) -> io::Result<()> {
     let target = format!("={session}");

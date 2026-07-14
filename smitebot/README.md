@@ -53,6 +53,16 @@ After spawning, startup is verified by polling for `fuzzer_stats` files. Because
 
 Campaign state is saved to `~/.smitebot/runs/<campaign-id>/state.json` for use by future `stop` and `status` commands.
 
+### smitebot stop
+
+Stops a running campaign: reaps every runner's process group — afl-fuzz and its Nyx QEMU child, which shares the group — tears down the tmux session, and records the stop time in `state.json`.
+
+```bash
+smitebot stop <campaign-id>
+```
+
+`<campaign-id>` is the directory name under `~/.smitebot/runs` (printed by `smitebot start`). 
+
 ### smitebot config
 
 Validates a campaign configuration file, reports the resolved settings, and checks that referenced paths exist on disk.

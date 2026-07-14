@@ -35,6 +35,8 @@ pub struct CampaignState {
     pub smite_git_hash: String,
     /// Unix timestamp (seconds since epoch) when the campaign started.
     pub start_time: u64,
+    /// Unix timestamp when the campaign was stopped; `None` while running.
+    pub stop_time: Option<u64>,
     /// Name of the tmux session hosting the campaign runners.
     pub tmux_session: String,
     /// State of each AFL++ runner process.
@@ -51,6 +53,8 @@ pub enum Status {
     Running,
     /// One or more runners failed to start.
     Failed,
+    /// Campaign was torn down by `smitebot stop`.
+    Stopped,
 }
 
 /// State of a single AFL++ runner process.
@@ -86,6 +90,16 @@ pub enum StateError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to read state from {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to parse state from {}: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
 }
 
 impl CampaignState {
@@ -109,6 +123,7 @@ impl CampaignState {
             sharedir: config.sharedir.clone(),
             smite_git_hash,
             start_time: utils::epoch_secs(),
+            stop_time: None,
             tmux_session,
             runners: Vec::new(),
         }
@@ -144,6 +159,18 @@ impl CampaignState {
         })?;
         Ok(())
     }
+
+    /// Loads campaign state from a JSON file written by `save`.
+    pub fn load(path: &Path) -> Result<Self, StateError> {
+        let contents = fs::read_to_string(path).map_err(|source| StateError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        serde_json::from_str(&contents).map_err(|source| StateError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +189,7 @@ mod tests {
             sharedir: PathBuf::from("/tmp/smite-nyx"),
             smite_git_hash: "deadbeef".to_string(),
             start_time: 1_749_465_600,
+            stop_time: None,
             tmux_session: "lnd-encrypted_bytes-1_749_465_600".to_string(),
             runners: vec![
                 RunnerState {
@@ -271,5 +299,55 @@ sharedir = "/tmp/nyx"
             serde_json::to_string(&Status::Failed).unwrap(),
             "\"failed\""
         );
+        assert_eq!(
+            serde_json::to_string(&Status::Stopped).unwrap(),
+            "\"stopped\""
+        );
+    }
+
+    #[test]
+    fn load_reads_saved_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = sample_state();
+        state.status = Status::Stopped;
+        state.stop_time = Some(1_749_469_200);
+        state.save(&path).unwrap();
+
+        let loaded = CampaignState::load(&path).unwrap();
+
+        assert_eq!(loaded.id, state.id);
+        assert_eq!(loaded.status, Status::Stopped);
+        assert_eq!(loaded.stop_time, Some(1_749_469_200));
+    }
+
+    #[test]
+    fn load_reports_missing_file() {
+        let err = CampaignState::load(Path::new("/no/such/state.json")).unwrap_err();
+        assert!(matches!(err, StateError::Read { .. }));
+    }
+
+    #[test]
+    fn load_reports_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, "{ not json").unwrap();
+
+        let err = CampaignState::load(&path).unwrap_err();
+        assert!(matches!(err, StateError::Parse { .. }));
+    }
+
+    #[test]
+    fn load_defaults_stop_time_when_absent() {
+        // state.json files written before stop_time existed must still load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let json = serde_json::to_string(&sample_state()).unwrap();
+        let without = json.replace(r#""stop_time":null,"#, "");
+        assert!(!without.contains("stop_time"));
+        fs::write(&path, without).unwrap();
+
+        let loaded = CampaignState::load(&path).unwrap();
+        assert_eq!(loaded.stop_time, None);
     }
 }
