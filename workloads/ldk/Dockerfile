@@ -2,7 +2,7 @@ FROM debian:bookworm AS builder
 
 # Build arguments
 ARG LLVM_V=19
-ARG BITCOIN_VERSION=29.2
+ARG BITCOIN_VERSION=30.3
 
 ENV LLVM_V=${LLVM_V}
 

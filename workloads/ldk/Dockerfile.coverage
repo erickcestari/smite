@@ -1,7 +1,7 @@
 FROM debian:bookworm AS builder
 
 # Build arguments
-ARG BITCOIN_VERSION=29.2
+ARG BITCOIN_VERSION=30.3
 ARG SCENARIO
 
 # Install build dependencies
