@@ -87,3 +87,76 @@ pub fn ping_pong(conn: &mut NoiseConnection) -> Result<(), ScenarioError> {
         // Ignore other messages (warnings, errors, etc.)
     }
 }
+
+/// Default number of pre-snapshot warmup iterations. Chosen to comfortably
+/// exceed the JVM's C1 tiered-compilation invocation threshold so Eclair's hot
+/// message-handling methods are JIT compiled into the snapshot rather than
+/// interpreted on every restore.
+const DEFAULT_WARMUP_ITERS: usize = 2000;
+
+/// Number of pre-snapshot warmup iterations, overridable via the
+/// `SMITE_WARMUP_ITERS` environment variable.
+///
+/// Exposed as a knob so a campaign can sweep for the knee where more warmup
+/// stops improving `execs_per_sec` (visible in AFL++'s `fuzzer_stats`). Setting
+/// it to `0` disables warmup entirely.
+#[must_use]
+pub fn warmup_iters() -> usize {
+    std::env::var("SMITE_WARMUP_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WARMUP_ITERS)
+}
+
+/// Warm up the target's message decode + handler path before the Nyx snapshot.
+///
+/// A single message does not push the JVM past its JIT thresholds, so warming
+/// with just one message leaves Eclair running the hot path interpreted on
+/// every snapshot restore. This drives `iters` messages through the same
+/// Noise-decrypt + framing + message-dispatch + response-encode path the fuzzer
+/// exercises on every input, pushing method invocation counters past the C1
+/// tiered-compilation threshold and forcing class loading, so the compiled hot
+/// path is captured in the snapshot. Non-JVM targets (LND/LDK/CLN) pay only a
+/// one-time startup cost.
+///
+/// Each iteration sends a `Ping` (varying the requested pong length and padding
+/// so the length-handling code is warmed across sizes rather than a single
+/// cached shape) and drains until the matching `Pong`, which also keeps the
+/// connection synchronized.
+///
+/// # Errors
+///
+/// Returns an error if the connection closes or times out mid-warmup.
+pub fn warmup(conn: &mut NoiseConnection, iters: usize) -> Result<(), ScenarioError> {
+    if iters == 0 {
+        return Ok(());
+    }
+
+    log::info!("Warming up target message handling ({iters} iterations)...");
+    // Rotating counter used to vary message sizes. A wrapping `u16` avoids
+    // casting from the `usize` loop index.
+    let mut tick: u16 = 0;
+    for _ in 0..iters {
+        // Vary request/padding sizes to warm the length-handling paths. Kept
+        // small to stay well under the BOLT 1 rule that ignores pings
+        // requesting >= 65532 pong bytes (which would leave us waiting for a
+        // pong that never arrives).
+        let num_pong_bytes = tick % 16;
+        let padding_len = tick % 32;
+        tick = tick.wrapping_add(1);
+        conn.send_message(
+            &Message::Ping(Ping::with_padding(num_pong_bytes, padding_len)).encode(),
+        )?;
+
+        // Drain until the matching pong to keep the connection in sync.
+        loop {
+            let msg_bytes = conn.recv_message()?;
+            if matches!(Message::decode(&msg_bytes)?, Message::Pong(_)) {
+                break;
+            }
+        }
+    }
+    log::info!("Warmup complete");
+
+    Ok(())
+}

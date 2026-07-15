@@ -6,7 +6,7 @@ use smite::bolt::{Init, InitTlvs, Message};
 use smite::noise::NoiseConnection;
 use smite::scenarios::ScenarioError;
 
-use super::{handshake_with_target, ping_pong};
+use super::{handshake_with_target, warmup, warmup_iters};
 use crate::executor::ProgramContext;
 use crate::targets::{INITIAL_BLOCKS, Target};
 
@@ -91,8 +91,10 @@ impl<T: Target> SnapshotSetup<T> for PostInitSetup {
         conn.send_message(&Message::Init(our_init).encode())?;
 
         // Drain any remaining post-init noise so the snapshot starts with a
-        // clean connection.
-        ping_pong(&mut conn)?;
+        // clean connection, and warm the target's message handling path so JVM
+        // targets (Eclair) JIT compile the hot path into the snapshot instead
+        // of interpreting it on every restore.
+        warmup(&mut conn, warmup_iters())?;
 
         let context = ProgramContext {
             target_pubkey: *target.pubkey(),

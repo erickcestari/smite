@@ -6,7 +6,7 @@ use smite::bolt::{Init, Message};
 use smite::noise::NoiseConnection;
 use smite::scenarios::{Scenario, ScenarioError, ScenarioResult};
 
-use super::{handshake_with_target, ping_pong};
+use super::{handshake_with_target, ping_pong, warmup, warmup_iters};
 use crate::targets::Target;
 
 /// A scenario that sends raw fuzz input as Lightning messages.
@@ -28,10 +28,10 @@ impl<T: Target> Scenario for EncryptedBytesScenario<T> {
         conn.send_message(&echo)?;
 
         // Warm up the target's message handling path before the Nyx snapshot.
-        // For JVM-based targets (i.e. Eclair), this  causes the necessary
-        // classes to load and be JIT compiled before we take the snapshot,
-        // speeding up every subsequent iteration.
-        ping_pong(&mut conn)?;
+        // For JVM-based targets (i.e. Eclair), driving many iterations pushes
+        // the hot decode/dispatch methods past the JIT threshold so they are
+        // compiled into the snapshot instead of interpreted on every restore.
+        warmup(&mut conn, warmup_iters())?;
 
         Ok(Self { target, conn })
     }

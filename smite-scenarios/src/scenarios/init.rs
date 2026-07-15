@@ -7,7 +7,7 @@ use smite::bolt::{Init, Message};
 use smite::noise::{MAX_MESSAGE_SIZE, NoiseConnection};
 use smite::scenarios::{Scenario, ScenarioError, ScenarioResult};
 
-use super::{handshake_with_target, ping_pong};
+use super::{handshake_with_target, ping_pong, warmup, warmup_iters};
 use crate::targets::Target;
 
 /// Timeout for connection and message operations.
@@ -33,13 +33,14 @@ impl<T: Target> Scenario for InitScenario<T> {
         let config = T::Config::default();
         let target = T::start(config)?;
 
-        // Establish a warmup connection for ping-pong. This warms up the
-        // target's message handling code paths before the Nyx snapshot
-        // (important for JVM targets like Eclair).
+        // Establish a warmup connection and drive many iterations through the
+        // target's message handling code paths before the Nyx snapshot. This
+        // JIT compiles the hot path into the snapshot for JVM targets (Eclair)
+        // instead of leaving it interpreted on every restore.
         let (mut warmup_conn, target_init) = handshake_with_target(&target, TIMEOUT)?;
         let echo = Message::Init(Init::echo(&target_init)).encode();
         warmup_conn.send_message(&echo)?;
-        ping_pong(&mut warmup_conn)?;
+        warmup(&mut warmup_conn, warmup_iters())?;
         drop(warmup_conn);
 
         // Establish the fuzz connection, complete the handshake, and receive

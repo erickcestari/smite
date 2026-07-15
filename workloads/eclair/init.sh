@@ -20,8 +20,18 @@ export SMITE_CRASH_HANDLER=/nyx-jvm-crash-handler.so
 #   entirely. C2 runs expensive optimizations in background threads which get
 #   repeated every time we restore the VM snapshot, reducing fuzzing speed.
 #
+# -XX:-BackgroundCompilation: Compile on the invoking thread instead of a
+#   background compiler thread. The pre-snapshot warmup loop (see the scenario
+#   `warmup` helper) then blocks until the hot methods are actually compiled, so
+#   the compiled code is guaranteed to be in the snapshot rather than depending
+#   on a background thread having run before the snapshot is taken.
+#
+# -XX:CompileThresholdScaling=0.1: Lower the JIT invocation threshold ~10x so
+#   the warmup loop needs far fewer iterations to trigger compilation of the hot
+#   message-handling path.
+#
 # -javaagent: Coverage agent that instruments bytecode and writes edge counters
 #   to AFL shared memory via JNI.
-export JAVA_OPTS="-XX:TieredStopAtLevel=1 -javaagent:/eclair-sancov.jar -Djava.library.path=/usr/local/lib"
+export JAVA_OPTS="-XX:TieredStopAtLevel=1 -XX:-BackgroundCompilation -XX:CompileThresholdScaling=0.1 -javaagent:/eclair-sancov.jar -Djava.library.path=/usr/local/lib"
 
 /eclair-scenario > /init.log 2>&1
