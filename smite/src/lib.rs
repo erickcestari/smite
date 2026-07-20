@@ -15,6 +15,7 @@
 //! - [`process`] - Managed subprocess utilities.
 //! - [`runners`] - Fuzz input delivery (Nyx and local modes).
 //! - [`scenarios`] - Scenario trait and the [`scenarios::smite_run`] entry point.
+//! - [`violation`] - Target-misbehavior findings that make a test case fail.
 
 pub mod bitcoin;
 pub mod bolt;
@@ -27,3 +28,4 @@ pub mod pending_channel;
 pub mod process;
 pub mod runners;
 pub mod scenarios;
+pub mod violation;

@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use smite::bitcoin::BitcoinCli;
 use smite::noise::NoiseConnection;
 use smite::scenarios::{Scenario, ScenarioError, ScenarioResult};
+use smite::violation::Violation;
 use smite_ir::Program;
 
 use super::{SnapshotSetup, ping_pong};
@@ -91,34 +92,9 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
                 // bug in the target.
                 log::debug!("[{:?}] invalid commitment: {e}", start.elapsed());
             }
-            Err(ExecuteError::UnknownChannel(id)) => {
-                // The target referenced a channel we have no record of (a
-                // funding_signed channel_id or an accept_channel temporary id
-                // we never opened). This is a protocol violation by the target.
-                return ScenarioResult::Fail(format!("unknown channel: {id:?}"));
-            }
-            Err(ExecuteError::TempChannelIdReuse(id)) => {
-                // The target sent a second accept_channel for a
-                // temporary_channel_id whose negotiation already has one and has
-                // not yet reached funding_created. This is a protocol violation
-                // by the target.
-                return ScenarioResult::Fail(format!("temporary channel id reuse: {id:?}"));
-            }
-            Err(ExecuteError::OpenerCannotAffordFee(id)) => {
-                // The opener cannot afford the commitment feerate. This is a
-                // protocol violation by the target (it should not have sent
-                // funding_signed if the opener cannot afford the fee).
-                return ScenarioResult::Fail(format!(
-                    "opener cannot afford fee for channel {id:?}"
-                ));
-            }
-            Err(ExecuteError::InvalidCounterpartySignature(id)) => {
-                // The target's funding_signed signature did not verify against
-                // the holder's commitment transaction. This is a protocol
-                // violation by the target.
-                return ScenarioResult::Fail(format!(
-                    "invalid counterparty signature for channel {id:?}"
-                ));
+            Err(ExecuteError::Violation(v)) => {
+                // The target broke a protocol invariant.
+                return ScenarioResult::Fail(v.to_string());
             }
         }
 
@@ -127,7 +103,7 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
         if let Err(e) = ping_pong(self.executor.conn_mut()) {
             log::debug!("[{:?}] ping_pong: {e}", start.elapsed());
             if e.is_timeout() {
-                return ScenarioResult::Fail("target hung (ping timeout)".into());
+                return ScenarioResult::Fail(Violation::Hung.to_string());
             }
         } else {
             log::debug!("[{:?}] Target responded with pong", start.elapsed());
@@ -135,7 +111,7 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
 
         if let Err(e) = self.target.check_alive() {
             log::debug!("[{:?}] check_alive: {e}", start.elapsed());
-            return ScenarioResult::Fail("target crashed".into());
+            return ScenarioResult::Fail(Violation::Crashed.to_string());
         }
 
         ScenarioResult::Ok
