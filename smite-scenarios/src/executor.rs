@@ -9,9 +9,9 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 use smite::bitcoin::{BitcoinCli, TxBlockPosition, Utxo};
 use smite::bolt::{
     AcceptChannel, AnnouncementSignatures, ChannelAnnouncement, ChannelId, ChannelReady,
-    ChannelReadyTlvs, ChannelUpdate, Features, FundingCreated, FundingSigned, Message, MessageType,
-    NodeAnnouncement, OpenChannel, OpenChannelTlvs, Pong, ShortChannelId, Shutdown,
-    TemporaryChannelId,
+    ChannelReadyTlvs, ChannelUpdate, Features, FundingCreated, FundingCreatedTlvs, FundingSigned,
+    Message, MessageType, NodeAnnouncement, OpenChannel, OpenChannelTlvs, Pong, ShortChannelId,
+    Shutdown, TemporaryChannelId,
 };
 use smite::channel_tx::{
     ChannelConfig, ChannelPartyConfig, ChannelState, FundingTransaction, HolderIdentity, Side,
@@ -863,6 +863,7 @@ fn build_open_channel(variables: &[Option<Variable>], inputs: &[usize]) -> OpenC
             // not negotiated is not.
             upfront_shutdown_script: Some(resolve_bytes(variables, inputs[18]).to_vec()),
             channel_type: nonempty_or_none(resolve_features(variables, inputs[19])),
+            next_local_nonce: None,
         },
     }
 }
@@ -904,6 +905,7 @@ fn build_funding_created(
             funding_output_index,
             signature: Signature::from_compact(&[0u8; 64])
                 .expect("zero bytes parse as a signature"),
+            tlvs: FundingCreatedTlvs::default(),
         });
     };
     let open_channel = &pending.open_channel;
@@ -914,6 +916,7 @@ fn build_funding_created(
             funding_output_index,
             signature: Signature::from_compact(&[0u8; 64])
                 .expect("zero bytes parse as a signature"),
+            tlvs: FundingCreatedTlvs::default(),
         });
     };
 
@@ -1001,6 +1004,7 @@ fn build_funding_created(
         funding_txid: funding_outpoint.txid,
         funding_output_index,
         signature,
+        tlvs: FundingCreatedTlvs::default(),
     })
 }
 
@@ -1033,7 +1037,10 @@ fn build_channel_ready(
     ChannelReady {
         channel_id,
         second_per_commitment_point,
-        tlvs: ChannelReadyTlvs { short_channel_id },
+        tlvs: ChannelReadyTlvs {
+            short_channel_id,
+            next_local_nonce: None,
+        },
     }
 }
 

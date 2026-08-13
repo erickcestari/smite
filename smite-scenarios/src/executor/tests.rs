@@ -8,7 +8,7 @@ use bitcoin::Amount;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use harness::*;
 use programs::*;
-use smite::bolt::{AcceptChannelTlvs, GossipTimestampFilter, Init, Ping};
+use smite::bolt::{AcceptChannelTlvs, FundingSignedTlvs, GossipTimestampFilter, Init, Ping};
 use smite_ir::Instruction;
 use smite_ir::operation::ShutdownScriptVariant;
 
@@ -1496,6 +1496,7 @@ fn execute_send_funding_created_and_recv_funding_signed() {
     let fs_bytes = Message::FundingSigned(FundingSigned {
         channel_id,
         signature: "304402203dbf3dbf337b042a72576488c1fb019086089d8d790a47f652346cff2511b6e70220395fdf700cb82b0abfcfe8e0b7c822181f2ee72409c82c3ff8e04e36593662c7".parse().unwrap(),
+        tlvs: FundingSignedTlvs::default(),
     })
     .encode();
 
@@ -1571,6 +1572,7 @@ fn execute_send_funding_created_uses_wire_funding_pubkey() {
     let fs_bytes = Message::FundingSigned(FundingSigned {
         channel_id,
         signature: "304402203dbf3dbf337b042a72576488c1fb019086089d8d790a47f652346cff2511b6e70220395fdf700cb82b0abfcfe8e0b7c822181f2ee72409c82c3ff8e04e36593662c7".parse().unwrap(),
+        tlvs: FundingSignedTlvs::default(),
     })
     .encode();
 
@@ -1829,6 +1831,7 @@ fn execute_recv_funding_signed_unknown_channel() {
     let fs_bytes = Message::FundingSigned(FundingSigned {
         channel_id,
         signature: "304402203dbf3dbf337b042a72576488c1fb019086089d8d790a47f652346cff2511b6e70220395fdf700cb82b0abfcfe8e0b7c822181f2ee72409c82c3ff8e04e36593662c7".parse().unwrap(),
+        tlvs: FundingSignedTlvs::default(),
     })
     .encode();
 
@@ -1869,6 +1872,7 @@ fn execute_recv_funding_signed_invalid_signature() {
     let fs_bytes = Message::FundingSigned(FundingSigned {
         channel_id,
         signature: Signature::from_compact(&[0u8; 64]).expect("zero bytes parse as a signature"),
+        tlvs: FundingSignedTlvs::default(),
     })
     .encode();
 
@@ -1938,6 +1942,7 @@ fn execute_send_channel_ready() {
     let fs_bytes = Message::FundingSigned(FundingSigned {
         channel_id,
         signature: "304402203dbf3dbf337b042a72576488c1fb019086089d8d790a47f652346cff2511b6e70220395fdf700cb82b0abfcfe8e0b7c822181f2ee72409c82c3ff8e04e36593662c7".parse().unwrap(),
+        tlvs: FundingSignedTlvs::default(),
     })
     .encode();
     let mut executor = Executor::new(MockConnection::new(), mock_cli, sample_context());
@@ -2091,6 +2096,7 @@ fn recv_channel_ready_executor() -> (
     let fs_bytes = Message::FundingSigned(FundingSigned {
         channel_id,
         signature: "304402203dbf3dbf337b042a72576488c1fb019086089d8d790a47f652346cff2511b6e70220395fdf700cb82b0abfcfe8e0b7c822181f2ee72409c82c3ff8e04e36593662c7".parse().unwrap(),
+        tlvs: FundingSignedTlvs::default(),
     })
     .encode();
 
