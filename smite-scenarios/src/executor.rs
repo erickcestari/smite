@@ -978,6 +978,7 @@ fn build_funding_created(
             state,
             is_funding_outpoint_valid,
             mined_txids.contains(&funding_outpoint.txid),
+            None,
         )
     });
 
