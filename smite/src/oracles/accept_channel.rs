@@ -296,8 +296,8 @@ mod tests {
             first_per_commitment_point: key,
             channel_flags: 1,
             tlvs: OpenChannelTlvs {
-                upfront_shutdown_script: None,
                 channel_type: Some(vec![0x10, 0x00]),
+                ..Default::default()
             },
         }
     }
@@ -321,6 +321,7 @@ mod tests {
             htlc_basepoint: key,
             first_per_commitment_point: key,
             tlvs: AcceptChannelTlvs {
+                next_local_nonce: None,
                 upfront_shutdown_script: None,
                 channel_type: Some(vec![0x10, 0x00]),
             },
