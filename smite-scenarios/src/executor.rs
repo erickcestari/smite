@@ -799,6 +799,7 @@ fn create_funding_transaction(
     let acceptor_pubkey = resolve_pubkey(variables, inputs[1]);
     let funding_satoshis = resolve_amount(variables, inputs[2]);
     let feerate_per_kw = resolve_feerate(variables, inputs[3]);
+    let channel_type = Features::from(resolve_features(variables, inputs[4]));
 
     // Query wallet state from bitcoind for coin selection and change.
     let utxos = cli.get_utxos();
@@ -810,9 +811,7 @@ fn create_funding_transaction(
         &acceptor_pubkey,
         funding_satoshis,
         feerate_per_kw,
-        // The IR does not carry the channel type into this operation yet, so
-        // the funding output is always the 2-of-2 P2WSH form.
-        &[],
+        &channel_type,
         utxos,
         change_spk,
     )?;
@@ -1448,7 +1447,7 @@ mod tests {
     use bitcoin::{Amount, Transaction};
     use smite::bolt::{AcceptChannelTlvs, FundingSignedTlvs, GossipTimestampFilter, Init, Ping};
     use smite_ir::Instruction;
-    use smite_ir::operation::ShutdownScriptVariant;
+    use smite_ir::operation::{ChannelTypeVariant, ShutdownScriptVariant};
 
     // -- MockConnection --
 
@@ -1743,12 +1742,16 @@ mod tests {
                 inputs: vec![],
             },
             Instruction {
+                operation: Operation::LoadChannelType(ChannelTypeVariant::StaticRemoteKey),
+                inputs: vec![],
+            },
+            Instruction {
                 operation: Operation::CreateFundingTransaction,
-                inputs: vec![1, 3, 4, 5],
+                inputs: vec![1, 3, 4, 5, 6],
             },
             Instruction {
                 operation: Operation::BroadcastTransaction,
-                inputs: vec![6],
+                inputs: vec![7],
             },
         ]
     }
@@ -3115,13 +3118,16 @@ mod tests {
         });
         instrs.push(Instruction {
             // Feed the FundingTransaction produced by
-            // CreateFundingTransaction (instruction 6) into the lookup. The
-            // resulting ShortChannelId is variable 9.
+            // CreateFundingTransaction (instruction 7) into the lookup. The
+            // resulting ShortChannelId is variable 10.
             operation: Operation::LookupShortChannelId,
-            inputs: vec![6],
+            inputs: vec![7],
         });
         // Build and send a channel_announcement carrying the looked-up SCID.
-        instrs.extend(channel_announcement_from_scid_instructions(instrs.len(), 9));
+        instrs.extend(channel_announcement_from_scid_instructions(
+            instrs.len(),
+            10,
+        ));
 
         let mut executor = Executor::new(MockConnection::new(), mock_cli, sample_context());
         executor
@@ -3188,16 +3194,20 @@ mod tests {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::CreateFundingTransaction,
-                inputs: vec![1, 3, 4, 5],
+                operation: Operation::LoadChannelType(ChannelTypeVariant::StaticRemoteKey),
+                inputs: vec![],
             },
-            // The looked-up SCID is variable 7.
+            Instruction {
+                operation: Operation::CreateFundingTransaction,
+                inputs: vec![1, 3, 4, 5, 6],
+            },
+            // The looked-up SCID is variable 8.
             Instruction {
                 operation: Operation::LookupShortChannelId,
-                inputs: vec![6],
+                inputs: vec![7],
             },
         ];
-        instrs.extend(channel_announcement_from_scid_instructions(instrs.len(), 7));
+        instrs.extend(channel_announcement_from_scid_instructions(instrs.len(), 8));
 
         let mut executor = Executor::new(MockConnection::new(), mock_cli, sample_context());
         executor
@@ -3360,11 +3370,11 @@ mod tests {
             },
             Instruction {
                 operation: Operation::SendFundingCreated,
-                inputs: vec![6, 0, 8],
+                inputs: vec![7, 0, 9],
             },
             Instruction {
                 operation: Operation::RecvFundingSigned,
-                inputs: vec![9],
+                inputs: vec![10],
             },
         ]);
         instrs
@@ -3687,13 +3697,13 @@ mod tests {
                 operation: Operation::SendChannelReady {
                     include_alias: false,
                 },
-                inputs: vec![10, 1, 11],
+                inputs: vec![11, 1, 12],
             },
             Instruction {
                 operation: Operation::SendChannelReady {
                     include_alias: true,
                 },
-                inputs: vec![10, 3, 11],
+                inputs: vec![11, 3, 12],
             },
         ]);
 
@@ -4025,11 +4035,11 @@ mod tests {
             },
             Instruction {
                 operation: Operation::SendFundingCreated,
-                inputs: vec![6, 0, 9],
+                inputs: vec![7, 0, 10],
             },
             Instruction {
                 operation: Operation::RecvFundingSigned,
-                inputs: vec![10],
+                inputs: vec![11],
             },
             Instruction {
                 operation: Operation::RecvChannelReady,

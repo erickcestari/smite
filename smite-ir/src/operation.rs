@@ -75,11 +75,18 @@ pub enum Operation {
     ExtractAcceptChannel(AcceptChannelField),
     /// Create a BOLT 3 funding transaction for the channel funding flow.
     ///
-    /// Inputs (4):
+    /// The `channel_type` selects the funding output format: simple taproot
+    /// channels pay to a single P2TR key aggregated from both funding pubkeys,
+    /// every other type to a 2-of-2 P2WSH. It must match the `channel_type`
+    /// given to `BuildOpenChannel`, or the target will never see the funding
+    /// output it negotiated.
+    ///
+    /// Inputs (5):
     ///   0: `opener_funding_pubkey` (`Point`)
     ///   1: `acceptor_funding_pubkey` (`Point`)
     ///   2: `funding_satoshis` (`Amount`)
     ///   3: `feerate_per_kw` (`FeeratePerKw`)
+    ///   4: `channel_type` (`Features`, empty = 2-of-2 P2WSH)
     CreateFundingTransaction,
 
     // -- Build: construct a BOLT message from inputs --
@@ -517,7 +524,6 @@ impl ChannelTypeVariant {
         Self::ScriptEnforcedLeaseZeroConf,
         Self::ScriptEnforcedLeaseScidAliasZeroConf,
     ];
-
     /// The feature bits (even/required) contained in this channel type.
     #[must_use]
     pub fn bits(self) -> &'static [FeatureBit] {
@@ -828,6 +834,7 @@ impl Operation {
                 VariableType::Point,        // acceptor_funding_pubkey
                 VariableType::Amount,       // funding_satoshis
                 VariableType::FeeratePerKw, // feerate_per_kw
+                VariableType::Features,     // channel_type
             ],
             Self::SendMessage => vec![VariableType::Message],
             Self::SendOpenChannel => vec![VariableType::OpenChannelMessage],
