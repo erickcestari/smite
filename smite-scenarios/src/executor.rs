@@ -807,6 +807,7 @@ fn create_funding_transaction(
     let acceptor_pubkey = resolve_pubkey(variables, inputs[1]);
     let funding_satoshis = resolve_amount(variables, inputs[2]);
     let feerate_per_kw = resolve_feerate(variables, inputs[3]);
+    let channel_type = Features::from(resolve_features(variables, inputs[4]));
 
     // Query wallet state from bitcoind for coin selection and change.
     let utxos = cli.get_utxos();
@@ -818,9 +819,7 @@ fn create_funding_transaction(
         &acceptor_pubkey,
         funding_satoshis,
         feerate_per_kw,
-        // The IR does not carry the channel type into this operation yet, so
-        // the funding output is always the 2-of-2 P2WSH form.
-        &Features::new(),
+        &channel_type,
         utxos,
         change_spk,
     )?;

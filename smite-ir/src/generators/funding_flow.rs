@@ -42,7 +42,6 @@ impl Generator for FundingFlowGenerator {
         let feerate_per_kw = builder.pick_variable(VariableType::FeeratePerKw, rng);
         let to_self_delay = builder.pick_variable(VariableType::U16, rng);
         let max_accepted_htlcs = builder.pick_variable(VariableType::U16, rng);
-        let channel_flags = builder.pick_variable(VariableType::U8, rng);
         let shutdown_script_variant = ShutdownScriptVariant::random(rng);
         let upfront_shutdown_script =
             builder.append(Operation::LoadShutdownScript(shutdown_script_variant), &[]);
@@ -50,6 +49,8 @@ impl Generator for FundingFlowGenerator {
             .choose(rng)
             .expect("ChannelTypeVariant::ALL is non-empty");
         let channel_type = builder.append(Operation::LoadChannelType(variant), &[]);
+
+        let channel_flags = builder.pick_variable(VariableType::U8, rng);
 
         // Build and send open_channel.
         let open_channel_msg = builder.append(
@@ -94,6 +95,9 @@ impl Generator for FundingFlowGenerator {
                 acceptor_funding_pubkey,
                 funding_satoshis,
                 feerate_per_kw,
+                // Must match the type sent in open_channel, or the funding
+                // output will not be the one the target negotiated.
+                channel_type,
             ],
         );
 

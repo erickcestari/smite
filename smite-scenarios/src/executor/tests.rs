@@ -10,7 +10,7 @@ use harness::*;
 use programs::*;
 use smite::bolt::{AcceptChannelTlvs, FundingSignedTlvs, GossipTimestampFilter, Init, Ping};
 use smite_ir::Instruction;
-use smite_ir::operation::ShutdownScriptVariant;
+use smite_ir::operation::{ChannelTypeVariant, ShutdownScriptVariant};
 
 /// Decodes a sent message expected to be a `channel_announcement`.
 fn decode_sent_channel_announcement(bytes: &[u8]) -> ChannelAnnouncement {
@@ -1295,13 +1295,16 @@ fn execute_lookup_short_channel_id_confirmed() {
     });
     instrs.push(Instruction {
         // Feed the FundingTransaction produced by
-        // CreateFundingTransaction (instruction 6) into the lookup. The
-        // resulting ShortChannelId is variable 9.
+        // CreateFundingTransaction (instruction 7) into the lookup. The
+        // resulting ShortChannelId is variable 10.
         operation: Operation::LookupShortChannelId,
-        inputs: vec![6],
+        inputs: vec![7],
     });
     // Build and send a channel_announcement carrying the looked-up SCID.
-    instrs.extend(channel_announcement_from_scid_instructions(instrs.len(), 9));
+    instrs.extend(channel_announcement_from_scid_instructions(
+        instrs.len(),
+        10,
+    ));
 
     let mut executor = Executor::new(MockConnection::new(), mock_cli, sample_context());
     executor
@@ -1368,16 +1371,20 @@ fn execute_lookup_short_channel_id_unconfirmed_returns_sentinel() {
             inputs: vec![],
         },
         Instruction {
-            operation: Operation::CreateFundingTransaction,
-            inputs: vec![1, 3, 4, 5],
+            operation: Operation::LoadChannelType(ChannelTypeVariant::StaticRemoteKey),
+            inputs: vec![],
         },
-        // The looked-up SCID is variable 7.
+        Instruction {
+            operation: Operation::CreateFundingTransaction,
+            inputs: vec![1, 3, 4, 5, 6],
+        },
+        // The looked-up SCID is variable 8.
         Instruction {
             operation: Operation::LookupShortChannelId,
-            inputs: vec![6],
+            inputs: vec![7],
         },
     ];
-    instrs.extend(channel_announcement_from_scid_instructions(instrs.len(), 7));
+    instrs.extend(channel_announcement_from_scid_instructions(instrs.len(), 8));
 
     let mut executor = Executor::new(MockConnection::new(), mock_cli, sample_context());
     executor
@@ -1581,7 +1588,7 @@ fn execute_send_funding_created_uses_wire_funding_pubkey() {
     // constructed channel config, which uses the negotiated pubkeys. It
     // should only change the signature sent to the target.
     let mut instrs = send_funding_created_and_recv_funding_signed_instructions();
-    instrs[9].inputs[1] = 2;
+    instrs[10].inputs[1] = 2;
 
     let mut executor = Executor::new(MockConnection::new(), mock_cli, sample_context());
     executor.conn.queue_recv(fs_bytes);
@@ -1652,11 +1659,11 @@ fn execute_send_funding_created_after_funding_built_does_not_track_channel() {
         // Different funding spk, hence a different outpoint.
         Instruction {
             operation: Operation::CreateFundingTransaction,
-            inputs: vec![1, 1, 4, 5],
+            inputs: vec![1, 1, 4, 5, 6],
         },
         Instruction {
             operation: Operation::SendFundingCreated,
-            inputs: vec![10, 0, 8],
+            inputs: vec![11, 0, 9],
         },
     ]);
 
@@ -1922,13 +1929,13 @@ fn execute_send_channel_ready() {
             operation: Operation::SendChannelReady {
                 include_alias: false,
             },
-            inputs: vec![10, 1, 11],
+            inputs: vec![11, 1, 12],
         },
         Instruction {
             operation: Operation::SendChannelReady {
                 include_alias: true,
             },
-            inputs: vec![10, 3, 11],
+            inputs: vec![11, 3, 12],
         },
     ]);
 
@@ -2247,11 +2254,11 @@ fn execute_recv_channel_ready_funding_mined_prematurely_is_noop() {
         },
         Instruction {
             operation: Operation::SendFundingCreated,
-            inputs: vec![6, 0, 9],
+            inputs: vec![7, 0, 10],
         },
         Instruction {
             operation: Operation::RecvFundingSigned,
-            inputs: vec![10],
+            inputs: vec![11],
         },
         Instruction {
             operation: Operation::RecvChannelReady,
