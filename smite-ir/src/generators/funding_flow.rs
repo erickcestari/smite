@@ -50,7 +50,15 @@ impl Generator for FundingFlowGenerator {
             .expect("ChannelTypeVariant::ALL is non-empty");
         let channel_type = builder.append(Operation::LoadChannelType(variant), &[]);
 
-        let channel_flags = builder.pick_variable(VariableType::U8, rng);
+        // Taproot channels cannot be announced, so a random `channel_flags`
+        // would leave the happy path unreachable for a third of the channel
+        // types. Mutators can still flip the bit afterwards to exercise how
+        // targets reject a public taproot channel.
+        let channel_flags = if variant.requires_unannounced_channel() {
+            builder.append(Operation::LoadU8(0), &[])
+        } else {
+            builder.pick_variable(VariableType::U8, rng)
+        };
 
         // Build and send open_channel.
         let open_channel_msg = builder.append(
