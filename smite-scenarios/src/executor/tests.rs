@@ -508,6 +508,52 @@ fn execute_build_open_channel_with_tlvs() {
     assert_eq!(oc.tlvs.channel_type, Some(vec![0x01, 0x02]));
 }
 
+/// A simple taproot `channel_type` makes `open_channel` carry a `MuSig2`
+/// verification nonce, which every other channel type must omit.
+#[test]
+fn execute_build_open_channel_adds_taproot_nonce() {
+    let taproot_nonce = |channel_type: ChannelTypeVariant| {
+        let mut instrs = open_channel_instructions();
+        instrs[19] = Instruction {
+            operation: Operation::LoadChannelType(channel_type),
+            inputs: vec![],
+        };
+        instrs.push(Instruction {
+            operation: Operation::BuildOpenChannel,
+            inputs: (0..20).collect(),
+        });
+        instrs.push(Instruction {
+            operation: Operation::SendOpenChannel,
+            inputs: vec![20],
+        });
+
+        let mut executor = Executor::new(
+            MockConnection::new(),
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        executor
+            .execute(
+                &Program {
+                    instructions: instrs,
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+
+        decode_open_channel(&executor.conn.sent[0])
+            .tlvs
+            .next_local_nonce
+    };
+
+    let nonce = taproot_nonce(ChannelTypeVariant::SimpleTaproot)
+        .expect("taproot channels must publish a verification nonce");
+    assert!(smite::musig::is_valid_public_nonce(&nonce));
+
+    assert_eq!(taproot_nonce(ChannelTypeVariant::Anchors), None);
+    assert_eq!(taproot_nonce(ChannelTypeVariant::StaticRemoteKey), None);
+}
+
 #[test]
 fn execute_derive_point() {
     let mut instrs = vec![
