@@ -1467,7 +1467,8 @@ fn execute_create_funding_transaction_insufficient_funds() {
             std::time::Instant::now(),
         )
         .unwrap_err();
-    let ExecuteError::InsufficientFunds(funds_err) = err else {
+    let ExecuteError::Funding(smite::channel_tx::FundingError::InsufficientFunds(funds_err)) = err
+    else {
         panic!("expected InsufficientFunds, got {err:?}");
     };
     assert_eq!(funds_err.available, Amount::from_sat(1_000));
