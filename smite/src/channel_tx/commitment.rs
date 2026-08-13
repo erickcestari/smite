@@ -226,6 +226,14 @@ impl ChannelState {
 }
 
 impl ChannelConfig {
+    /// Returns whether this is a simple taproot channel, which funds a P2TR
+    /// output and commits with `MuSig2` rather than a 2-of-2 P2WSH.
+    #[must_use]
+    pub fn is_simple_taproot(&self) -> bool {
+        self.channel_type
+            .supports_feature(Features::OPTION_SIMPLE_TAPROOT)
+    }
+
     /// Returns the config for the given channel side.
     fn party(&self, side: &Side) -> &ChannelPartyConfig {
         match side {
@@ -483,6 +491,15 @@ impl CommitmentCost {
     }
 }
 
+/// Returns whether the commitment carries anchor outputs.
+///
+/// Simple taproot channels inherit anchor semantics without setting the anchor
+/// bits, so the taproot bit implies them.
+fn has_anchor_outputs(channel_type: &Features) -> bool {
+    channel_type.supports_feature(Features::OPTION_ANCHORS)
+        || channel_type.supports_feature(Features::OPTION_SIMPLE_TAPROOT)
+}
+
 /// Get the fee cost of a commitment tx in satoshis.
 fn commit_tx_fee_sat(feerate_per_kw: u32, channel_type: &Features) -> u64 {
     let commitment_weight = if channel_type.supports_feature(Features::OPTION_ANCHORS) {
@@ -495,8 +512,11 @@ fn commit_tx_fee_sat(feerate_per_kw: u32, channel_type: &Features) -> u64 {
 }
 
 /// Get the anchor cost of a commitment tx in satoshis.
+///
+/// This must follow [`has_anchor_outputs`]: whenever the commitment carries
+/// anchors, the opener pays for them.
 fn total_anchors_sat(channel_type: &Features) -> u64 {
-    if channel_type.supports_feature(Features::OPTION_ANCHORS) {
+    if has_anchor_outputs(channel_type) {
         ANCHOR_OUTPUT_VALUE * 2
     } else {
         0
@@ -673,7 +693,7 @@ mod tests {
         to_opener_msat: u64,
         to_acceptor_msat: u64,
         dust_limit_satoshis: u64,
-        channel_type: Vec<u8>,
+        channel_type: Features,
     ) -> (
         ChannelConfig,
         CommitmentState,
@@ -688,7 +708,7 @@ mod tests {
                 vout: 0,
             },
             funding_satoshis: 10_000_000,
-            channel_type: Features::from(channel_type),
+            channel_type,
             opener: ChannelPartyConfig {
                 funding_pubkey: pubkey(
                     "023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb",
@@ -761,7 +781,7 @@ mod tests {
     #[test]
     fn simple_commitment_tx_with_no_htlcs_legacy() {
         let (chan_config, commitment_params, opener_holder, acceptor_holder) =
-            bolt3_commitment_params(15_000, 7_000_000_000, 3_000_000_000, 546, vec![]);
+            bolt3_commitment_params(15_000, 7_000_000_000, 3_000_000_000, 546, Features::new());
 
         // Opener signs own commitment.
         assert_eq!(
@@ -797,7 +817,7 @@ mod tests {
     #[test]
     fn commitment_tx_with_two_outputs_untrimmed_minimum_feerate_legacy() {
         let (chan_config, commitment_params, opener_holder, acceptor_holder) =
-            bolt3_commitment_params(4_915, 6_988_000_000, 3_000_000_000, 546, vec![]);
+            bolt3_commitment_params(4_915, 6_988_000_000, 3_000_000_000, 546, Features::new());
 
         // Opener signs own commitment.
         assert_eq!(
@@ -833,7 +853,13 @@ mod tests {
     #[test]
     fn commitment_tx_with_two_outputs_untrimmed_maximum_feerate_legacy() {
         let (chan_config, commitment_params, opener_holder, acceptor_holder) =
-            bolt3_commitment_params(9_651_180, 6_988_000_000, 3_000_000_000, 546, vec![]);
+            bolt3_commitment_params(
+                9_651_180,
+                6_988_000_000,
+                3_000_000_000,
+                546,
+                Features::new(),
+            );
 
         // Opener signs own commitment.
         assert_eq!(
@@ -869,7 +895,13 @@ mod tests {
     #[test]
     fn commitment_tx_with_one_output_untrimmed_minimum_feerate_legacy() {
         let (chan_config, commitment_params, opener_holder, acceptor_holder) =
-            bolt3_commitment_params(9_651_181, 6_988_000_000, 3_000_000_000, 546, vec![]);
+            bolt3_commitment_params(
+                9_651_181,
+                6_988_000_000,
+                3_000_000_000,
+                546,
+                Features::new(),
+            );
 
         // Opener signs own commitment.
         assert_eq!(
@@ -905,7 +937,13 @@ mod tests {
     #[test]
     fn commitment_tx_with_fee_greater_than_funder_amount_legacy() {
         let (chan_config, commitment_params, opener_holder, acceptor_holder) =
-            bolt3_commitment_params(9_651_936, 6_988_000_000, 3_000_000_000, 546, vec![]);
+            bolt3_commitment_params(
+                9_651_936,
+                6_988_000_000,
+                3_000_000_000,
+                546,
+                Features::new(),
+            );
 
         // Opener signs own commitment.
         assert_eq!(
@@ -943,7 +981,7 @@ mod tests {
     #[test]
     fn commitment_tx_with_balance_msat_not_multiple_of_1000_legacy() {
         let (chan_config, commitment_params, opener_holder, acceptor_holder) =
-            bolt3_commitment_params(15_000, 6_999_999_000, 3_000_000_123, 546, vec![]);
+            bolt3_commitment_params(15_000, 6_999_999_000, 3_000_000_123, 546, Features::new());
 
         // Opener signs own commitment.
         assert_eq!(
@@ -981,7 +1019,7 @@ mod tests {
     #[test]
     fn commitment_tx_with_equal_output_values_orders_by_script_pubkey_legacy() {
         let (chan_config, commitment_params, opener_holder, acceptor_holder) =
-            bolt3_commitment_params(15_000, 5_005_430_000, 4_994_570_000, 546, vec![]);
+            bolt3_commitment_params(15_000, 5_005_430_000, 4_994_570_000, 546, Features::new());
 
         // Opener signs own commitment.
         assert_eq!(
@@ -1025,7 +1063,7 @@ mod tests {
                 7_000_000_000,
                 3_000_000_000,
                 546,
-                vec![0x40, 0x00, 0x00],
+                Features::from_bits(&[Features::OPTION_ANCHORS]),
             );
 
         // Opener signs own commitment.
@@ -1062,7 +1100,13 @@ mod tests {
     #[test]
     fn simple_commitment_tx_with_no_htlc_and_single_anchor() {
         let (chan_config, commitment_params, opener_holder, acceptor_holder) =
-            bolt3_commitment_params(15_000, 10_000_000_000, 0, 546, vec![0x40, 0x00, 0x00]);
+            bolt3_commitment_params(
+                15_000,
+                10_000_000_000,
+                0,
+                546,
+                Features::from_bits(&[Features::OPTION_ANCHORS]),
+            );
 
         // Opener signs own commitment.
         assert_eq!(
@@ -1103,7 +1147,7 @@ mod tests {
                 6_988_000_000,
                 3_000_000_000,
                 4_001,
-                vec![0x40, 0x00, 0x00],
+                Features::from_bits(&[Features::OPTION_ANCHORS]),
             );
 
         // Opener signs own commitment.
@@ -1145,7 +1189,7 @@ mod tests {
                 6_988_000_000,
                 3_000_000_000,
                 4_001,
-                vec![0x40, 0x00, 0x00],
+                Features::from_bits(&[Features::OPTION_ANCHORS]),
             );
 
         // Opener signs own commitment.
@@ -1189,7 +1233,7 @@ mod tests {
                 6_999_999_000,
                 3_000_000_123,
                 546,
-                vec![0x40, 0x00, 0x00],
+                Features::from_bits(&[Features::OPTION_ANCHORS]),
             );
 
         // Opener signs own commitment.
@@ -1233,7 +1277,7 @@ mod tests {
                 5_008_760_000,
                 4_991_240_000,
                 546,
-                vec![0x40, 0x00, 0x00],
+                Features::from_bits(&[Features::OPTION_ANCHORS]),
             );
 
         // Opener signs own commitment.
@@ -1296,7 +1340,7 @@ mod tests {
         );
     }
 
-    fn sample_chan_config(funding_satoshis: u64, channel_type: Vec<u8>) -> ChannelConfig {
+    fn sample_chan_config(funding_satoshis: u64, channel_type: Features) -> ChannelConfig {
         let sample_key =
             pubkey("03b28f7c5a9d1e4f8c6a7b2d3e9f1048576a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e");
         let sample_party = || ChannelPartyConfig {
@@ -1316,7 +1360,7 @@ mod tests {
                 vout: 0,
             },
             funding_satoshis,
-            channel_type: Features::from(channel_type),
+            channel_type,
             opener: sample_party(),
             acceptor: sample_party(),
             minimum_depth: 8,
@@ -1327,7 +1371,7 @@ mod tests {
     fn new_initial_from_funding_msat_overflow() {
         let sample_key =
             pubkey("03b28f7c5a9d1e4f8c6a7b2d3e9f1048576a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e");
-        let chan_config = sample_chan_config(u64::MAX, vec![]);
+        let chan_config = sample_chan_config(u64::MAX, Features::new());
         let result = chan_config.new_initial_commitment(0, 15_000, sample_key, sample_key);
         assert!(matches!(result, Err(CommitmentError::FundingMsatOverflow)));
     }
@@ -1336,7 +1380,7 @@ mod tests {
     fn new_initial_from_funding_push_exceeds_funding() {
         let sample_key =
             pubkey("03b28f7c5a9d1e4f8c6a7b2d3e9f1048576a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e");
-        let chan_config = sample_chan_config(1_000, vec![]);
+        let chan_config = sample_chan_config(1_000, Features::new());
         let result = chan_config.new_initial_commitment(2_000_000, 15_000, sample_key, sample_key);
         assert!(matches!(result, Err(CommitmentError::PushExceedsFunding)));
     }
