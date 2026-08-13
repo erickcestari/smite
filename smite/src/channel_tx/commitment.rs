@@ -226,6 +226,14 @@ impl ChannelState {
 }
 
 impl ChannelConfig {
+    /// Returns whether this is a simple taproot channel, which funds a P2TR
+    /// output and commits with `MuSig2` rather than a 2-of-2 P2WSH.
+    #[must_use]
+    pub fn is_simple_taproot(&self) -> bool {
+        self.channel_type
+            .supports_feature(Features::OPTION_SIMPLE_TAPROOT)
+    }
+
     /// Returns the config for the given channel side.
     fn party(&self, side: &Side) -> &ChannelPartyConfig {
         match side {
@@ -483,6 +491,15 @@ impl CommitmentCost {
     }
 }
 
+/// Returns whether the commitment carries anchor outputs.
+///
+/// Simple taproot channels inherit anchor semantics without setting the anchor
+/// bits, so the taproot bit implies them.
+fn has_anchor_outputs(channel_type: &Features) -> bool {
+    channel_type.supports_feature(Features::OPTION_ANCHORS)
+        || channel_type.supports_feature(Features::OPTION_SIMPLE_TAPROOT)
+}
+
 /// Get the fee cost of a commitment tx in satoshis.
 fn commit_tx_fee_sat(feerate_per_kw: u32, channel_type: &Features) -> u64 {
     let commitment_weight = if channel_type.supports_feature(Features::OPTION_ANCHORS) {
@@ -495,8 +512,11 @@ fn commit_tx_fee_sat(feerate_per_kw: u32, channel_type: &Features) -> u64 {
 }
 
 /// Get the anchor cost of a commitment tx in satoshis.
+///
+/// This must follow [`has_anchor_outputs`]: whenever the commitment carries
+/// anchors, the opener pays for them.
 fn total_anchors_sat(channel_type: &Features) -> u64 {
-    if channel_type.supports_feature(Features::OPTION_ANCHORS) {
+    if has_anchor_outputs(channel_type) {
         ANCHOR_OUTPUT_VALUE * 2
     } else {
         0
