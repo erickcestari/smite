@@ -8,15 +8,16 @@ use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bitcoin::{OutPoint, ScriptBuf, Txid};
 use smite::bitcoin::{BitcoinCli, TxBlockPosition, Utxo};
 use smite::bolt::{
-    AcceptChannel, AnnouncementSignatures, ChannelAnnouncement, ChannelId, ChannelReady,
-    ChannelReadyTlvs, ChannelUpdate, Features, FundingCreated, FundingCreatedTlvs, FundingSigned,
-    Message, NodeAnnouncement, OpenChannel, OpenChannelTlvs, Pong, ShortChannelId, Shutdown,
-    msg_type,
+    AcceptChannel, AnnouncementSignatures, COMPACT_SIGNATURE_SIZE, ChannelAnnouncement, ChannelId,
+    ChannelReady, ChannelReadyTlvs, ChannelUpdate, Features, FundingCreated, FundingCreatedTlvs,
+    FundingSigned, Message, NodeAnnouncement, OpenChannel, OpenChannelTlvs,
+    PartialSignatureWithNonce, Pong, PublicNonce, ShortChannelId, Shutdown, msg_type,
 };
 use smite::channel_tx::{
-    ChannelConfig, ChannelPartyConfig, ChannelState, FundingTransaction, HolderIdentity, Side,
-    build_funding_transaction,
+    ChannelConfig, ChannelPartyConfig, ChannelState, CommitmentState, FundingTransaction,
+    HolderIdentity, Side, build_funding_transaction,
 };
+use smite::musig::{PartialSignature, derive_nonce};
 use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{AcceptChannelContext, AcceptChannelOracle, Oracle};
 use smite::pending_channel::PendingChannel;
@@ -214,6 +215,10 @@ pub enum ExecuteError {
     /// The funding transaction could not be built.
     #[error("funding: {0}")]
     Funding(#[from] smite::channel_tx::FundingError),
+
+    /// A `MuSig2` partial signature could not be produced or checked.
+    #[error("musig2: {0}")]
+    Musig(#[from] smite::musig::MusigError),
 
     /// Failed to construct the initial commitment state.
     #[error("commitment: {0}")]
@@ -829,11 +834,41 @@ fn create_funding_transaction(
     Ok(funding)
 }
 
+/// Returns the holder's own `funding_pubkey`, which is the key its `MuSig2`
+/// nonces are bound to. smite always opens channels today, but reading the side
+/// keeps this correct if it ever accepts one.
+fn holder_funding_pubkey(state: &ChannelState) -> PublicKey {
+    match state.holder.side {
+        Side::Opener => state.config.opener.funding_pubkey,
+        Side::Acceptor => state.config.acceptor.funding_pubkey,
+    }
+}
+
 /// Builds an `OpenChannel` from 20 input variables (wire order).
+///
+/// Simple taproot channels additionally carry a `MuSig2` verification nonce,
+/// which the peer signs our first commitment against. `channel_flags` is left
+/// exactly as the program specifies, including the `announce_channel` bit that
+/// taproot channels must not set, so mutators can still exercise how targets
+/// reject a public taproot channel.
 fn build_open_channel(variables: &[Option<Variable>], inputs: &[usize]) -> OpenChannel {
+    let channel_type = Features::from(resolve_features(variables, inputs[19]));
+    let funding_pubkey = resolve_pubkey(variables, inputs[11]);
+    let temporary_channel_id = resolve_channel_id(variables, inputs[1]);
+
+    let next_local_nonce = channel_type
+        .supports_feature(Features::OPTION_SIMPLE_TAPROOT)
+        .then(|| {
+            derive_nonce(
+                &[b"verification", temporary_channel_id.as_bytes()],
+                &funding_pubkey,
+            )
+            .public_nonce()
+        });
+
     OpenChannel {
         chain_hash: resolve_chain_hash(variables, inputs[0]),
-        temporary_channel_id: resolve_channel_id(variables, inputs[1]),
+        temporary_channel_id,
         funding_satoshis: resolve_amount(variables, inputs[2]),
         push_msat: resolve_amount(variables, inputs[3]),
         dust_limit_satoshis: resolve_amount(variables, inputs[4]),
@@ -843,7 +878,7 @@ fn build_open_channel(variables: &[Option<Variable>], inputs: &[usize]) -> OpenC
         feerate_per_kw: resolve_feerate(variables, inputs[8]),
         to_self_delay: resolve_u16(variables, inputs[9]),
         max_accepted_htlcs: resolve_u16(variables, inputs[10]),
-        funding_pubkey: resolve_pubkey(variables, inputs[11]),
+        funding_pubkey,
         revocation_basepoint: resolve_pubkey(variables, inputs[12]),
         payment_basepoint: resolve_pubkey(variables, inputs[13]),
         delayed_payment_basepoint: resolve_pubkey(variables, inputs[14]),
@@ -856,8 +891,8 @@ fn build_open_channel(variables: &[Option<Variable>], inputs: &[usize]) -> OpenC
             // Omitting it is a protocol violation in that case. Including if
             // not negotiated is not.
             upfront_shutdown_script: Some(resolve_bytes(variables, inputs[18]).to_vec()),
-            channel_type: nonempty_or_none(resolve_features(variables, inputs[19])),
-            next_local_nonce: None,
+            channel_type: nonempty_or_none(&channel_type.into_bytes()),
+            next_local_nonce,
         },
     }
 }
@@ -919,30 +954,12 @@ fn build_funding_created(
     let secp = Secp256k1::new();
     let opener_funding_pubkey = PublicKey::from_secret_key(&secp, &opener_funding_privkey);
 
-    let opener = ChannelPartyConfig {
-        funding_pubkey: opener_funding_pubkey,
-        payment_basepoint: open_channel.payment_basepoint,
-        revocation_basepoint: open_channel.revocation_basepoint,
-        delayed_payment_basepoint: open_channel.delayed_payment_basepoint,
-        dust_limit_satoshis: open_channel.dust_limit_satoshis,
-        to_self_delay: open_channel.to_self_delay,
-    };
-    let acceptor = ChannelPartyConfig {
-        funding_pubkey: accept_channel.funding_pubkey,
-        payment_basepoint: accept_channel.payment_basepoint,
-        revocation_basepoint: accept_channel.revocation_basepoint,
-        delayed_payment_basepoint: accept_channel.delayed_payment_basepoint,
-        dust_limit_satoshis: accept_channel.dust_limit_satoshis,
-        to_self_delay: accept_channel.to_self_delay,
-    };
-    let config = ChannelConfig {
+    let config = negotiated_channel_config(
+        open_channel,
+        accept_channel,
         funding_outpoint,
-        funding_satoshis: open_channel.funding_satoshis,
-        channel_type: Features::from(open_channel.tlvs.channel_type.clone().unwrap_or_default()),
-        opener,
-        acceptor,
-        minimum_depth: accept_channel.minimum_depth,
-    };
+        opener_funding_pubkey,
+    );
 
     let state = config.new_initial_commitment(
         open_channel.push_msat,
@@ -954,7 +971,15 @@ fn build_funding_created(
         side: Side::Opener,
         funding_privkey: opener_funding_privkey,
     };
-    let signature = config.sign_counterparty_commitment(&state, &holder);
+
+    let (signature, tlvs) = sign_initial_commitment(
+        &config,
+        &state,
+        &holder,
+        &temporary_channel_id,
+        &opener_funding_pubkey,
+        accept_channel.tlvs.next_local_nonce,
+    )?;
 
     let channel_id = ChannelId::v1_from_funding_outpoint(config.funding_outpoint);
 
@@ -968,6 +993,10 @@ fn build_funding_created(
         &config.channel_type,
     );
 
+    // The nonce we published in `open_channel` is what the acceptor signs our
+    // commitment against, so keep it to verify the incoming `funding_signed`.
+    let holder_verification_nonce = open_channel.tlvs.next_local_nonce;
+
     // Building the same message again must not clobber a channel whose state
     // has already been established (and possibly advanced).
     channel_states.entry(channel_id).or_insert_with(|| {
@@ -977,7 +1006,7 @@ fn build_funding_created(
             state,
             is_funding_outpoint_valid,
             mined_txids.contains(&funding_outpoint.txid),
-            None,
+            holder_verification_nonce,
         )
     });
 
@@ -994,8 +1023,106 @@ fn build_funding_created(
         funding_txid: funding_outpoint.txid,
         funding_output_index,
         signature,
-        tlvs: FundingCreatedTlvs::default(),
+        tlvs,
     })
+}
+
+/// Builds the channel configuration from the values actually exchanged in
+/// `open_channel` and `accept_channel`.
+///
+/// The opener's funding pubkey comes from the private key the program supplied
+/// to `SendFundingCreated` rather than from `open_channel`, since that is the
+/// key we can actually sign with. A mutator can make the two disagree, which
+/// then shows up as a funding output the target does not recognize.
+fn negotiated_channel_config(
+    open_channel: &OpenChannel,
+    accept_channel: &AcceptChannel,
+    funding_outpoint: OutPoint,
+    opener_funding_pubkey: PublicKey,
+) -> ChannelConfig {
+    ChannelConfig {
+        funding_outpoint,
+        funding_satoshis: open_channel.funding_satoshis,
+        channel_type: Features::from(open_channel.tlvs.channel_type.clone().unwrap_or_default()),
+        opener: ChannelPartyConfig {
+            funding_pubkey: opener_funding_pubkey,
+            payment_basepoint: open_channel.payment_basepoint,
+            revocation_basepoint: open_channel.revocation_basepoint,
+            delayed_payment_basepoint: open_channel.delayed_payment_basepoint,
+            dust_limit_satoshis: open_channel.dust_limit_satoshis,
+            to_self_delay: open_channel.to_self_delay,
+        },
+        acceptor: ChannelPartyConfig {
+            funding_pubkey: accept_channel.funding_pubkey,
+            payment_basepoint: accept_channel.payment_basepoint,
+            revocation_basepoint: accept_channel.revocation_basepoint,
+            delayed_payment_basepoint: accept_channel.delayed_payment_basepoint,
+            dust_limit_satoshis: accept_channel.dust_limit_satoshis,
+            to_self_delay: accept_channel.to_self_delay,
+        },
+        minimum_depth: accept_channel.minimum_depth,
+    }
+}
+
+/// Signs the acceptor's first commitment transaction.
+///
+/// Simple taproot channels zero the fixed `signature` field and carry a
+/// `MuSig2` partial signature in TLV 2 instead. Signing needs the acceptor's
+/// verification nonce from `accept_channel`; without it we can only send the
+/// unsigned form and let the target fail the channel, which is what the spec
+/// tells it to do.
+///
+/// # Errors
+///
+/// Returns [`ExecuteError::Musig`] if the acceptor's nonce is malformed or the
+/// funding keys cannot be aggregated.
+fn sign_initial_commitment(
+    config: &ChannelConfig,
+    state: &CommitmentState,
+    holder: &HolderIdentity,
+    temporary_channel_id: &ChannelId,
+    opener_funding_pubkey: &PublicKey,
+    acceptor_verification_nonce: Option<PublicNonce>,
+) -> Result<(Signature, FundingCreatedTlvs), ExecuteError> {
+    if !config.is_simple_taproot() {
+        return Ok((
+            config.sign_counterparty_commitment(state, holder),
+            FundingCreatedTlvs::default(),
+        ));
+    }
+
+    let Some(acceptor_nonce) = acceptor_verification_nonce else {
+        return Ok((zero_signature(), FundingCreatedTlvs::default()));
+    };
+
+    let signing_nonce = derive_nonce(
+        &[b"signing", temporary_channel_id.as_bytes()],
+        opener_funding_pubkey,
+    );
+    let public_nonce = signing_nonce.public_nonce();
+    let partial = config.partial_sign_counterparty_commitment(
+        state,
+        holder,
+        signing_nonce,
+        &acceptor_nonce,
+    )?;
+
+    Ok((
+        zero_signature(),
+        FundingCreatedTlvs {
+            partial_signature_with_nonce: Some(PartialSignatureWithNonce {
+                partial_signature: partial.0,
+                public_nonce,
+            }),
+        },
+    ))
+}
+
+/// The all-zero signature the taproot channel spec requires in the fixed
+/// `signature` field of `funding_created` and `funding_signed`.
+fn zero_signature() -> Signature {
+    Signature::from_compact(&[0u8; COMPACT_SIGNATURE_SIZE])
+        .expect("zero bytes parse as a signature")
 }
 
 /// Builds a `ChannelReady` from 3 input variables (wire order).
@@ -1024,12 +1151,25 @@ fn build_channel_ready(
         }
     }
 
+    // Simple taproot channels must publish a fresh verification nonce here,
+    // replacing the one the funding flow consumed.
+    let next_local_nonce = channel_states
+        .get(&channel_id)
+        .filter(|state| state.config.is_simple_taproot())
+        .map(|state| {
+            derive_nonce(
+                &[b"channel-ready", channel_id.as_bytes()],
+                &holder_funding_pubkey(state),
+            )
+            .public_nonce()
+        });
+
     ChannelReady {
         channel_id,
         second_per_commitment_point,
         tlvs: ChannelReadyTlvs {
             short_channel_id,
-            next_local_nonce: None,
+            next_local_nonce,
         },
     }
 }
@@ -1344,11 +1484,43 @@ fn verify_funding_signed(
         .get(&fs.channel_id)
         .ok_or(Violation::UnknownChannel(fs.channel_id))?;
 
-    state
-        .config
-        .verify_counterparty_signature(&state.commitment, &state.holder, &fs.signature)
+    let valid = if state.config.is_simple_taproot() {
+        verify_taproot_funding_signed(fs, state)
+    } else {
+        state
+            .config
+            .verify_counterparty_signature(&state.commitment, &state.holder, &fs.signature)
+    };
+
+    valid
         .then_some(())
         .ok_or(Violation::InvalidCounterpartySignature(fs.channel_id))
+}
+
+/// Returns whether the peer's `MuSig2` partial signature over our first
+/// commitment is valid.
+///
+/// A missing TLV, a malformed nonce, or a nonce we never published all mean the
+/// peer did not sign what we asked it to, so all of them read as invalid rather
+/// than as an executor error.
+fn verify_taproot_funding_signed(fs: &FundingSigned, state: &ChannelState) -> bool {
+    let (Some(partial), Some(holder_nonce)) = (
+        fs.tlvs.partial_signature_with_nonce,
+        state.holder_verification_nonce,
+    ) else {
+        return false;
+    };
+
+    state
+        .config
+        .verify_counterparty_partial_signature(
+            &state.commitment,
+            &state.holder,
+            &PartialSignature(partial.partial_signature),
+            &partial.public_nonce,
+            &holder_nonce,
+        )
+        .unwrap_or(false)
 }
 
 /// Records a sent `open_channel`, keyed by `temporary_channel_id`, so the
@@ -2332,6 +2504,52 @@ mod tests {
             Some(vec![0x00, 0x14, 0xab])
         );
         assert_eq!(oc.tlvs.channel_type, Some(vec![0x01, 0x02]));
+    }
+
+    /// A simple taproot `channel_type` makes `open_channel` carry a `MuSig2`
+    /// verification nonce, which every other channel type must omit.
+    #[test]
+    fn execute_build_open_channel_adds_taproot_nonce() {
+        let taproot_nonce = |channel_type: ChannelTypeVariant| {
+            let mut instrs = open_channel_instructions();
+            instrs[19] = Instruction {
+                operation: Operation::LoadChannelType(channel_type),
+                inputs: vec![],
+            };
+            instrs.push(Instruction {
+                operation: Operation::BuildOpenChannel,
+                inputs: (0..20).collect(),
+            });
+            instrs.push(Instruction {
+                operation: Operation::SendOpenChannel,
+                inputs: vec![20],
+            });
+
+            let mut executor = Executor::new(
+                MockConnection::new(),
+                MockBitcoinCli::default(),
+                sample_context(),
+            );
+            executor
+                .execute(
+                    &Program {
+                        instructions: instrs,
+                    },
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+
+            decode_open_channel(&executor.conn.sent[0])
+                .tlvs
+                .next_local_nonce
+        };
+
+        let nonce = taproot_nonce(ChannelTypeVariant::SimpleTaproot)
+            .expect("taproot channels must publish a verification nonce");
+        assert!(smite::musig::is_valid_public_nonce(&nonce));
+
+        assert_eq!(taproot_nonce(ChannelTypeVariant::Anchors), None);
+        assert_eq!(taproot_nonce(ChannelTypeVariant::StaticRemoteKey), None);
     }
 
     #[test]
