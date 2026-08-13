@@ -94,10 +94,10 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
                 // the spec doesn't allow.
                 return ScenarioResult::Fail(format!("decode error: {e}"));
             }
-            Err(ExecuteError::InsufficientFunds(e)) => {
+            Err(ExecuteError::Funding(e)) => {
                 // The mutator generated a funding amount/feerate combination
                 // the available UTXOs can't cover. Not a bug in the target.
-                log::debug!("[{:?}] insufficient funds: {e}", start.elapsed());
+                log::debug!("[{:?}] funding transaction: {e}", start.elapsed());
             }
             Err(ExecuteError::Commitment(e)) => {
                 // The mutator generated a funding amount/push_msat combination

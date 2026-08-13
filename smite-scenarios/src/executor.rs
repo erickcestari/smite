@@ -211,9 +211,9 @@ pub enum ExecuteError {
     #[error("peer error on {:?}: {}", .0.channel_id, .0.message().unwrap_or("<non-utf8>"))]
     PeerError(smite::bolt::Error),
 
-    /// Wallet UTXOs could not cover the funding amount and fees.
+    /// The funding transaction could not be built.
     #[error("funding: {0}")]
-    InsufficientFunds(#[from] smite::channel_tx::InsufficientFunds),
+    Funding(#[from] smite::channel_tx::FundingError),
 
     /// Failed to construct the initial commitment state.
     #[error("commitment: {0}")]
@@ -810,6 +810,9 @@ fn create_funding_transaction(
         &acceptor_pubkey,
         funding_satoshis,
         feerate_per_kw,
+        // The IR does not carry the channel type into this operation yet, so
+        // the funding output is always the 2-of-2 P2WSH form.
+        &[],
         utxos,
         change_spk,
     )?;
@@ -963,6 +966,7 @@ fn build_funding_created(
         &open_channel.funding_pubkey,
         &accept_channel.funding_pubkey,
         open_channel.funding_satoshis,
+        &config.channel_type,
     );
 
     // Building the same message again must not clobber a channel whose state
@@ -3282,7 +3286,9 @@ mod tests {
                 std::time::Instant::now(),
             )
             .unwrap_err();
-        let ExecuteError::InsufficientFunds(funds_err) = err else {
+        let ExecuteError::Funding(smite::channel_tx::FundingError::InsufficientFunds(funds_err)) =
+            err
+        else {
             panic!("expected InsufficientFunds, got {err:?}");
         };
         assert_eq!(funds_err.available, Amount::from_sat(1_000));
