@@ -524,6 +524,19 @@ impl ChannelTypeVariant {
         Self::ScriptEnforcedLeaseZeroConf,
         Self::ScriptEnforcedLeaseScidAliasZeroConf,
     ];
+
+    /// Returns whether this type requires the channel to be unannounced.
+    ///
+    /// Taproot channels cannot be gossiped, so both lnd and eclair reject an
+    /// `open_channel` that sets the `announce_channel` bit alongside one of
+    /// these types.
+    #[must_use]
+    pub fn requires_unannounced_channel(self) -> bool {
+        self.bits().iter().any(|&bit| {
+            bit == Features::OPTION_SIMPLE_TAPROOT || bit == Features::OPTION_SIMPLE_TAPROOT_STAGING
+        })
+    }
+
     /// The feature bits (even/required) contained in this channel type.
     #[must_use]
     pub fn bits(self) -> &'static [FeatureBit] {
