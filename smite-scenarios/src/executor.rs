@@ -676,6 +676,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                         &mut self.bitcoin_cli,
                         &mut self.negotiations_v2,
                     );
+                    let channel_id = msg.channel_id;
                     let encoded = Message::TxAddInput(msg).encode();
                     log::debug!(
                         "[{:?}] SendTxAddInput: serial_id={serial_id}, {} bytes",
@@ -683,7 +684,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                         encoded.len(),
                     );
                     self.conn.send_message(&encoded)?;
-                    Some(Variable::SentInteractiveTx)
+                    Some(Variable::SentInteractiveTx(channel_id))
                 }
 
                 Operation::SendTxAddOutput { serial_id, role } => {
@@ -695,6 +696,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                         &mut self.bitcoin_cli,
                         &mut self.negotiations_v2,
                     );
+                    let channel_id = msg.channel_id;
                     let encoded = Message::TxAddOutput(msg).encode();
                     log::debug!(
                         "[{:?}] SendTxAddOutput: serial_id={serial_id}, role={role}, {} bytes",
@@ -702,7 +704,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                         encoded.len(),
                     );
                     self.conn.send_message(&encoded)?;
-                    Some(Variable::SentInteractiveTx)
+                    Some(Variable::SentInteractiveTx(channel_id))
                 }
 
                 Operation::SendTxRemoveInput { serial_id } => {
@@ -730,7 +732,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                         start.elapsed(),
                     );
                     self.conn.send_message(&encoded)?;
-                    Some(Variable::SentInteractiveTx)
+                    Some(Variable::SentInteractiveTx(channel_id))
                 }
 
                 Operation::SendTxRemoveOutput { serial_id } => {
@@ -755,7 +757,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                         start.elapsed(),
                     );
                     self.conn.send_message(&encoded)?;
-                    Some(Variable::SentInteractiveTx)
+                    Some(Variable::SentInteractiveTx(channel_id))
                 }
 
                 Operation::SendTxComplete => {
@@ -766,15 +768,22 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                     let encoded = Message::TxComplete(TxComplete { channel_id }).encode();
                     log::debug!("[{:?}] SendTxComplete", start.elapsed());
                     self.conn.send_message(&encoded)?;
-                    Some(Variable::SentInteractiveTx)
+                    Some(Variable::SentInteractiveTx(channel_id))
                 }
 
                 Operation::RecvInteractiveTx => {
-                    consume_sent_interactive_tx(&mut variables, instr.inputs[0]);
-                    log::debug!("[{:?}] RecvInteractiveTx: waiting", start.elapsed());
-                    let msg = recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)?;
-                    log::debug!("[{:?}] RecvInteractiveTx: got {msg}", start.elapsed());
-                    apply_interactive_tx(&mut self.negotiations_v2, msg)?;
+                    let channel_id = consume_sent_interactive_tx(&mut variables, instr.inputs[0]);
+                    if is_interactive_tx_expected(&self.negotiations_v2, channel_id) {
+                        log::debug!("[{:?}] RecvInteractiveTx: waiting", start.elapsed());
+                        let msg = recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)?;
+                        log::debug!("[{:?}] RecvInteractiveTx: got {msg}", start.elapsed());
+                        apply_interactive_tx(&mut self.negotiations_v2, msg)?;
+                    } else {
+                        log::debug!(
+                            "[{:?}] RecvInteractiveTx: negotiation concluded, nothing to receive",
+                            start.elapsed(),
+                        );
+                    }
                     None
                 }
 
@@ -1108,11 +1117,15 @@ fn consume_sent_open_channel2(variables: &mut [Option<Variable>], index: usize) 
     }
 }
 
-fn consume_sent_interactive_tx(variables: &mut [Option<Variable>], index: usize) {
+/// Consumes the affine `SentInteractiveTx`, returning the `channel_id` the
+/// message it stands for was sent on.
+fn consume_sent_interactive_tx(variables: &mut [Option<Variable>], index: usize) -> ChannelId {
     match resolve(variables, index) {
-        Variable::SentInteractiveTx => {
+        Variable::SentInteractiveTx(channel_id) => {
+            let channel_id = *channel_id;
             // Consume the affine `SentInteractiveTx`.
             variables[index] = None;
+            channel_id
         }
         other => panic!(
             "variable {index}: expected SentInteractiveTx, got {:?}",
@@ -1743,6 +1756,23 @@ fn verify_commitment_signed(
     }
 
     Ok(())
+}
+
+/// Returns whether the peer owes us a reply in the interactive transaction
+/// exchange.
+///
+/// The exchange is turn-based, so a reply is owed for every message we send
+/// until it concludes on two consecutive `tx_complete`s. Once it has, the peer
+/// moves straight on to `commitment_signed`; reading here would consume that
+/// message and leave every later operation reading one message behind.
+///
+/// A negotiation we do not track still reads. A mutated program may have sent
+/// on a channel we never opened, and the peer's rejection of it is worth
+/// surfacing.
+fn is_interactive_tx_expected(negotiations: &V2Negotiations, channel_id: ChannelId) -> bool {
+    negotiations
+        .get(channel_id)
+        .is_none_or(|pending| !pending.tx_negotiation_complete() && !pending.tx_negotiation.aborted)
 }
 
 /// Returns whether the peer owes us a `tx_signatures` for this negotiation.
