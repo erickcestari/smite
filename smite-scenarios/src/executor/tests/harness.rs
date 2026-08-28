@@ -58,6 +58,10 @@ pub struct MockBitcoinCli {
     pub utxos: Vec<Utxo>,
     pub change_spk: ScriptBuf,
     pub confirmations: u32,
+    /// Serialized transactions the node knows about, keyed by txid, as
+    /// `getrawtransaction` would return them.
+    pub raw_transactions: HashMap<Txid, Vec<u8>>,
+    pub locked_outpoints: Vec<OutPoint>,
 }
 
 impl BitcoinRpc for MockBitcoinCli {
@@ -73,6 +77,10 @@ impl BitcoinRpc for MockBitcoinCli {
 
     fn get_new_address_script_pubkey(&mut self) -> ScriptBuf {
         self.change_spk.clone()
+    }
+
+    fn get_raw_transaction(&mut self, txid: Txid) -> Option<Vec<u8>> {
+        self.raw_transactions.get(&txid).cloned()
     }
 
     fn sign_and_broadcast_tx(&mut self, tx: &bitcoin::Transaction) -> Option<String> {
@@ -93,6 +101,7 @@ impl BitcoinRpc for MockBitcoinCli {
     }
 
     fn lock_utxos(&mut self, outpoints: &[OutPoint]) {
+        self.locked_outpoints.extend_from_slice(outpoints);
         self.utxos.retain(|u| !outpoints.contains(&u.outpoint));
     }
 
@@ -270,4 +279,39 @@ pub fn sample_v2_revocation_basepoint() -> PublicKey {
 
 pub fn sample_v2_temporary_channel_id() -> TemporaryChannelId {
     ChannelId::v2_temporary_from_revocation_basepoint(&sample_v2_revocation_basepoint())
+}
+
+// -- Interactive transaction construction --
+
+/// A minimal previous transaction paying one 1 BTC P2WPKH output, used as
+/// the `prevtx` a `tx_add_input` carries.
+pub fn sample_prevtx() -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn::default()],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000_000),
+            script_pubkey: sample_change_spk(),
+        }],
+    }
+}
+
+/// A wallet holding a single spendable output of `sample_prevtx`, with that
+/// transaction available to `getrawtransaction`.
+pub fn sample_v2_wallet() -> MockBitcoinCli {
+    let prevtx = sample_prevtx();
+    let txid = prevtx.compute_txid();
+    let mut cli = MockBitcoinCli {
+        change_spk: sample_change_spk(),
+        ..MockBitcoinCli::default()
+    };
+    cli.utxos.push(Utxo {
+        amount: prevtx.output[0].value,
+        outpoint: OutPoint { txid, vout: 0 },
+        script_pubkey: prevtx.output[0].script_pubkey.clone(),
+    });
+    cli.raw_transactions
+        .insert(txid, bitcoin::consensus::encode::serialize(&prevtx));
+    cli
 }
