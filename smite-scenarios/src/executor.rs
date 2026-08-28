@@ -720,7 +720,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                         {
                             pending.shared_tx.remove_input(*serial_id);
                         }
-                        pending.tx_negotiation.sent_tx_complete = false;
+                        pending.tx_negotiation.expect_reply();
                     }
                     let encoded = Message::TxRemoveInput(TxRemoveInput {
                         channel_id,
@@ -745,7 +745,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                         {
                             pending.shared_tx.remove_output(*serial_id);
                         }
-                        pending.tx_negotiation.sent_tx_complete = false;
+                        pending.tx_negotiation.expect_reply();
                     }
                     let encoded = Message::TxRemoveOutput(TxRemoveOutput {
                         channel_id,
@@ -763,7 +763,12 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                 Operation::SendTxComplete => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
                     if let Some(pending) = self.negotiations_v2.get_mut(channel_id) {
-                        pending.tx_negotiation.sent_tx_complete = true;
+                        // Two consecutive `tx_complete`s conclude the exchange.
+                        // If the peer's last message was one, ours ends it and
+                        // earns no reply; otherwise the peer still answers.
+                        if !pending.tx_negotiation.peer_sent_tx_complete {
+                            pending.tx_negotiation.expect_reply();
+                        }
                     }
                     let encoded = Message::TxComplete(TxComplete { channel_id }).encode();
                     log::debug!("[{:?}] SendTxComplete", start.elapsed());
@@ -1339,8 +1344,12 @@ fn build_tx_add_input(
                 script_pubkey: utxo.script_pubkey.clone(),
             });
         }
-        pending.shared_tx.add_input(serial_id, input);
-        pending.tx_negotiation.sent_tx_complete = false;
+        log_dropped_contribution(
+            pending.shared_tx.add_input(serial_id, input),
+            "input",
+            serial_id,
+        );
+        pending.tx_negotiation.expect_reply();
     }
 
     TxAddInput {
@@ -1419,7 +1428,7 @@ fn build_tx_add_output(
             "output",
             serial_id,
         );
-        pending.tx_negotiation.sent_tx_complete = false;
+        pending.tx_negotiation.expect_reply();
     }
 
     TxAddOutput {
@@ -1461,6 +1470,7 @@ fn apply_interactive_tx(
         return Ok(());
     };
 
+    pending.tx_negotiation.reply_received();
     // Only two consecutive `tx_complete`s conclude the negotiation, so any
     // other message from the peer clears its half of that pair.
     pending.tx_negotiation.peer_sent_tx_complete = matches!(msg, Message::TxComplete(_));
@@ -1761,18 +1771,23 @@ fn verify_commitment_signed(
 /// Returns whether the peer owes us a reply in the interactive transaction
 /// exchange.
 ///
-/// The exchange is turn-based, so a reply is owed for every message we send
-/// until it concludes on two consecutive `tx_complete`s. Once it has, the peer
-/// moves straight on to `commitment_signed`; reading here would consume that
-/// message and leave every later operation reading one message behind.
+/// The exchange is turn-based, so the peer answers every message we send until
+/// the one that concludes it on two consecutive `tx_complete`s. Reading when
+/// nothing is owed would consume whatever the peer moved on to, usually its
+/// `commitment_signed`, and leave every later operation a message behind.
+///
+/// This counts what is owed rather than asking whether the exchange concluded.
+/// A mutator that drops one receive leaves the program permanently short of a
+/// reply, and the count lets the next receive settle the backlog instead of
+/// stranding it.
 ///
 /// A negotiation we do not track still reads. A mutated program may have sent
 /// on a channel we never opened, and the peer's rejection of it is worth
 /// surfacing.
 fn is_interactive_tx_expected(negotiations: &V2Negotiations, channel_id: ChannelId) -> bool {
-    negotiations
-        .get(channel_id)
-        .is_none_or(|pending| !pending.tx_negotiation_complete() && !pending.tx_negotiation.aborted)
+    negotiations.get(channel_id).is_none_or(|pending| {
+        !pending.tx_negotiation.aborted && pending.tx_negotiation.outstanding_replies > 0
+    })
 }
 
 /// Returns whether the peer owes us a `tx_signatures` for this negotiation.
