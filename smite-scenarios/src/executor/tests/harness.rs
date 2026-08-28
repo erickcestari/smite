@@ -2,7 +2,7 @@
 
 use crate::executor::*;
 use bitcoin::{Amount, Transaction};
-use smite::bolt::AcceptChannelTlvs;
+use smite::bolt::{AcceptChannel2Tlvs, AcceptChannelTlvs};
 use std::collections::VecDeque;
 use std::str::FromStr;
 
@@ -229,4 +229,45 @@ pub fn sample_funding_negotiation() -> PendingChannel {
         }),
         funding_built: false,
     }
+}
+
+// -- Channel establishment v2 --
+
+pub fn sample_accept_channel2(temporary_channel_id: TemporaryChannelId) -> AcceptChannel2 {
+    AcceptChannel2 {
+        temporary_channel_id,
+        // The acceptor contributes nothing, the common case for CLN and
+        // Eclair when they are not configured to provide liquidity.
+        funding_satoshis: 0,
+        dust_limit_satoshis: 546,
+        max_htlc_value_in_flight_msat: 100_000_000,
+        htlc_minimum_msat: 1_000,
+        minimum_depth: 6,
+        to_self_delay: 144,
+        max_accepted_htlcs: 483,
+        funding_pubkey: sample_pubkey(11),
+        revocation_basepoint: sample_pubkey(12),
+        payment_basepoint: sample_pubkey(13),
+        delayed_payment_basepoint: sample_pubkey(14),
+        htlc_basepoint: sample_pubkey(15),
+        first_per_commitment_point: sample_pubkey(16),
+        second_per_commitment_point: sample_pubkey(17),
+        tlvs: AcceptChannel2Tlvs {
+            upfront_shutdown_script: Some(vec![0xde, 0xad]),
+            channel_type: Some(vec![0x00, 0x40, 0x10, 0x00]),
+            require_confirmed_inputs: false,
+        },
+    }
+}
+
+/// Our `revocation_basepoint`, and hence the `temporary_channel_id` that
+/// `open_channel2_instructions` derives from it.
+pub fn sample_v2_revocation_basepoint() -> PublicKey {
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[0x22; 32]).expect("valid secret key");
+    PublicKey::from_secret_key(&secp, &sk)
+}
+
+pub fn sample_v2_temporary_channel_id() -> TemporaryChannelId {
+    ChannelId::v2_temporary_from_revocation_basepoint(&sample_v2_revocation_basepoint())
 }

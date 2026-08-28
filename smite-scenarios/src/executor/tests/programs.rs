@@ -4,6 +4,7 @@
 
 use crate::executor::*;
 use smite_ir::Instruction;
+use smite_ir::operation::ChannelTypeVariant;
 use std::str::FromStr;
 
 /// Builds the 20 `open_channel` input instructions in wire order.
@@ -241,4 +242,174 @@ pub fn recv_channel_ready_instructions(confirmations: u8) -> Vec<Instruction> {
         },
     ]);
     instrs
+}
+
+// -- Channel establishment v2 --
+
+/// Builds the `open_channel2` inputs, deriving the `temporary_channel_id`
+/// from our revocation basepoint (the `[0x22; 32]` key) as BOLT 2 requires.
+/// [`OPEN_CHANNEL2_INPUTS`] maps each wire field to its variable index.
+#[allow(clippy::too_many_lines)]
+pub fn open_channel2_instructions() -> Vec<Instruction> {
+    vec![
+        Instruction {
+            operation: Operation::LoadChainHashFromContext,
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadFeeratePerKw(253),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadFeeratePerKw(2500),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadAmount(200_000),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadAmount(546),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadAmount(100_000_000),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadAmount(1_000),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadU16(144),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadU16(483),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadBlockHeight(120),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x11; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![10],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x22; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![12],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x33; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![14],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x44; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![16],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x55; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![18],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x66; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![20],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x77; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![22],
+        },
+        Instruction {
+            operation: Operation::LoadU8(0),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadBytes(vec![]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadChannelType(ChannelTypeVariant::Anchors),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DeriveTemporaryChannelIdV2,
+            inputs: vec![13],
+        },
+    ]
+}
+
+/// Indices into [`open_channel2_instructions`], in `BuildOpenChannel2`
+/// wire order.
+pub const OPEN_CHANNEL2_INPUTS: [usize; 21] = [
+    0,  // chain_hash
+    27, // temporary_channel_id
+    1,  // funding_feerate_perkw
+    2,  // commitment_feerate_perkw
+    3,  // funding_satoshis
+    4,  // dust_limit_satoshis
+    5,  // max_htlc_value_in_flight_msat
+    6,  // htlc_minimum_msat
+    7,  // to_self_delay
+    8,  // max_accepted_htlcs
+    9,  // locktime
+    11, // funding_pubkey
+    13, // revocation_basepoint
+    15, // payment_basepoint
+    17, // delayed_payment_basepoint
+    19, // htlc_basepoint
+    21, // first_per_commitment_point
+    23, // second_per_commitment_point
+    24, // channel_flags
+    25, // upfront_shutdown_script
+    26, // channel_type
+];
+
+/// Emits the full `open_channel2` / `accept_channel2` exchange. The
+/// `AcceptChannel2` compound lands at the returned instruction index.
+pub fn send_open_channel2_instructions() -> (Vec<Instruction>, usize) {
+    let mut instructions = open_channel2_instructions();
+    instructions.push(Instruction {
+        operation: Operation::BuildOpenChannel2 {
+            require_confirmed_inputs: false,
+        },
+        inputs: OPEN_CHANNEL2_INPUTS.to_vec(),
+    }); // v28
+    instructions.push(Instruction {
+        operation: Operation::SendOpenChannel2,
+        inputs: vec![28],
+    }); // v29
+    instructions.push(Instruction {
+        operation: Operation::RecvAcceptChannel2,
+        inputs: vec![29],
+    }); // v30
+    (instructions, 30)
 }

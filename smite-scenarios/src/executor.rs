@@ -8,10 +8,10 @@ use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bitcoin::{OutPoint, ScriptBuf, Txid};
 use smite::bitcoin::{BitcoinCli, TxBlockPosition, Utxo};
 use smite::bolt::{
-    AcceptChannel, AnnouncementSignatures, ChannelAnnouncement, ChannelId, ChannelReady,
-    ChannelReadyTlvs, ChannelUpdate, Features, FundingCreated, FundingSigned, Message, MessageType,
-    NodeAnnouncement, OpenChannel, OpenChannelTlvs, Pong, ShortChannelId, Shutdown,
-    TemporaryChannelId,
+    AcceptChannel, AcceptChannel2, AnnouncementSignatures, ChannelAnnouncement, ChannelId,
+    ChannelReady, ChannelReadyTlvs, ChannelUpdate, Features, FundingCreated, FundingSigned,
+    Message, MessageType, NodeAnnouncement, OpenChannel, OpenChannel2, OpenChannel2Tlvs,
+    OpenChannelTlvs, Pong, ShortChannelId, Shutdown, TemporaryChannelId,
 };
 use smite::channel_tx::{
     ChannelConfig, ChannelPartyConfig, ChannelState, FundingTransaction, HolderIdentity, Side,
@@ -19,9 +19,9 @@ use smite::channel_tx::{
 };
 use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{AcceptChannelContext, AcceptChannelOracle, Oracle};
-use smite::pending_channel::PendingChannel;
+use smite::pending_channel::{PendingChannel, V2Negotiations};
 use smite::violation::Violation;
-use smite_ir::operation::AcceptChannelField;
+use smite_ir::operation::{AcceptChannel2Field, AcceptChannelField};
 use smite_ir::{Operation, Program, Variable};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -245,6 +245,9 @@ pub struct Executor<C, B> {
     /// `temporary_channel_id`, so the funding flow can build commitments from
     /// the parameters actually sent on the wire.
     negotiations: HashMap<TemporaryChannelId, PendingChannel>,
+    /// Channel establishment v2 negotiation state, addressable by either the
+    /// `temporary_channel_id` or the derived `channel_id` a message carries.
+    negotiations_v2: V2Negotiations,
     /// Transactions stored outside Bitcoin Core's mempool, typically because they
     /// were rejected by mempool policy, to be included in the next `MineBlocks`
     /// operation. Each is stored as `(txid, raw_hex)`: re-signing the same
@@ -269,6 +272,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
             context,
             channel_states: HashMap::new(),
             negotiations: HashMap::new(),
+            negotiations_v2: V2Negotiations::default(),
             private_mempool: Vec::new(),
             unmined_txids: HashSet::new(),
             mined_txids: HashSet::new(),
@@ -576,6 +580,57 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                     );
                     Some(Variable::ShortChannelId(scid))
                 }
+
+                // -- Channel establishment v2 --
+                Operation::DeriveTemporaryChannelIdV2 => {
+                    let revocation_basepoint = resolve_pubkey(&variables, instr.inputs[0]);
+                    Some(Variable::ChannelId(
+                        ChannelId::v2_temporary_from_revocation_basepoint(&revocation_basepoint),
+                    ))
+                }
+
+                Operation::DeriveChannelIdV2 => {
+                    let ours = resolve_pubkey(&variables, instr.inputs[0]);
+                    let theirs = resolve_pubkey(&variables, instr.inputs[1]);
+                    Some(Variable::ChannelId(
+                        ChannelId::v2_from_revocation_basepoints(&ours, &theirs),
+                    ))
+                }
+
+                Operation::ExtractAcceptChannel2(field) => {
+                    let ac = resolve_accept_channel2(&variables, instr.inputs[0]);
+                    Some(extract_field_v2(ac, *field))
+                }
+
+                Operation::BuildOpenChannel2 {
+                    require_confirmed_inputs,
+                } => {
+                    let oc =
+                        build_open_channel2(&variables, &instr.inputs, *require_confirmed_inputs);
+                    Some(Variable::OpenChannel2Message(oc))
+                }
+
+                Operation::SendOpenChannel2 => {
+                    let oc = resolve_open_channel2_message(&variables, instr.inputs[0]);
+                    self.negotiations_v2.record_open(oc);
+                    let encoded = Message::OpenChannel2(oc.clone()).encode();
+                    log::debug!(
+                        "[{:?}] SendOpenChannel2: {} bytes",
+                        start.elapsed(),
+                        encoded.len(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentOpenChannel2)
+                }
+
+                Operation::RecvAcceptChannel2 => {
+                    consume_sent_open_channel2(&mut variables, instr.inputs[0]);
+                    log::debug!("[{:?}] RecvAcceptChannel2: waiting", start.elapsed());
+                    let ac = recv_accept_channel2(&mut self.conn)?;
+                    log::debug!("[{:?}] RecvAcceptChannel2: received", start.elapsed());
+                    self.negotiations_v2.record_accept(&ac);
+                    Some(Variable::AcceptChannel2(ac))
+                }
             };
 
             variables.push(result);
@@ -635,6 +690,16 @@ fn resolve_timestamp(variables: &[Option<Variable>], index: usize) -> u32 {
         Variable::Timestamp(v) => *v,
         other => panic!(
             "variable {index}: expected Timestamp, got {:?}",
+            other.var_type(),
+        ),
+    }
+}
+
+fn resolve_block_height(variables: &[Option<Variable>], index: usize) -> u32 {
+    match resolve(variables, index) {
+        Variable::BlockHeight(v) => *v,
+        other => panic!(
+            "variable {index}: expected BlockHeight, got {:?}",
             other.var_type(),
         ),
     }
@@ -754,6 +819,26 @@ fn resolve_accept_channel(variables: &[Option<Variable>], index: usize) -> &Acce
     }
 }
 
+fn resolve_open_channel2_message(variables: &[Option<Variable>], index: usize) -> &OpenChannel2 {
+    match resolve(variables, index) {
+        Variable::OpenChannel2Message(v) => v,
+        other => panic!(
+            "variable {index}: expected OpenChannel2Message, got {:?}",
+            other.var_type(),
+        ),
+    }
+}
+
+fn resolve_accept_channel2(variables: &[Option<Variable>], index: usize) -> &AcceptChannel2 {
+    match resolve(variables, index) {
+        Variable::AcceptChannel2(v) => v,
+        other => panic!(
+            "variable {index}: expected AcceptChannel2, got {:?}",
+            other.var_type(),
+        ),
+    }
+}
+
 fn resolve_funding_transaction(
     variables: &[Option<Variable>],
     index: usize,
@@ -775,6 +860,19 @@ fn consume_sent_open_channel(variables: &mut [Option<Variable>], index: usize) {
         }
         other => panic!(
             "variable {index}: expected SentOpenChannel, got {:?}",
+            other.var_type(),
+        ),
+    }
+}
+
+fn consume_sent_open_channel2(variables: &mut [Option<Variable>], index: usize) {
+    match resolve(variables, index) {
+        Variable::SentOpenChannel2 => {
+            // Consume the affine `SentOpenChannel2`.
+            variables[index] = None;
+        }
+        other => panic!(
+            "variable {index}: expected SentOpenChannel2, got {:?}",
             other.var_type(),
         ),
     }
@@ -863,6 +961,46 @@ fn build_open_channel(variables: &[Option<Variable>], inputs: &[usize]) -> OpenC
             // not negotiated is not.
             upfront_shutdown_script: Some(resolve_bytes(variables, inputs[18]).to_vec()),
             channel_type: nonempty_or_none(resolve_features(variables, inputs[19])),
+        },
+    }
+}
+
+/// Builds an `OpenChannel2` from 21 input variables (wire order).
+fn build_open_channel2(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+    require_confirmed_inputs: bool,
+) -> OpenChannel2 {
+    OpenChannel2 {
+        chain_hash: resolve_chain_hash(variables, inputs[0]),
+        temporary_channel_id: resolve_channel_id(variables, inputs[1]),
+        funding_feerate_perkw: resolve_feerate(variables, inputs[2]),
+        commitment_feerate_perkw: resolve_feerate(variables, inputs[3]),
+        funding_satoshis: resolve_amount(variables, inputs[4]),
+        dust_limit_satoshis: resolve_amount(variables, inputs[5]),
+        max_htlc_value_in_flight_msat: resolve_amount(variables, inputs[6]),
+        htlc_minimum_msat: resolve_amount(variables, inputs[7]),
+        to_self_delay: resolve_u16(variables, inputs[8]),
+        max_accepted_htlcs: resolve_u16(variables, inputs[9]),
+        locktime: resolve_block_height(variables, inputs[10]),
+        funding_pubkey: resolve_pubkey(variables, inputs[11]),
+        revocation_basepoint: resolve_pubkey(variables, inputs[12]),
+        payment_basepoint: resolve_pubkey(variables, inputs[13]),
+        delayed_payment_basepoint: resolve_pubkey(variables, inputs[14]),
+        htlc_basepoint: resolve_pubkey(variables, inputs[15]),
+        first_per_commitment_point: resolve_pubkey(variables, inputs[16]),
+        second_per_commitment_point: resolve_pubkey(variables, inputs[17]),
+        channel_flags: resolve_u8(variables, inputs[18]),
+        tlvs: OpenChannel2Tlvs {
+            // Always send the TLV: a zero-length value is the BOLT 2 opt-out
+            // signal when option_upfront_shutdown_script is negotiated, so
+            // omitting it would be a protocol violation in that case.
+            upfront_shutdown_script: Some(resolve_bytes(variables, inputs[19]).to_vec()),
+            // BOLT 2 requires `open_channel2` to set `channel_type`, but an
+            // empty `Features` still omits the TLV so the receiver's "MUST fail
+            // if channel_type is not set" path stays reachable.
+            channel_type: nonempty_or_none(resolve_features(variables, inputs[20])),
+            require_confirmed_inputs,
         },
     }
 }
@@ -1284,6 +1422,17 @@ fn recv_accept_channel(conn: &mut impl Connection) -> Result<AcceptChannel, Exec
     }
 }
 
+/// Receives and decodes an `accept_channel2` message.
+fn recv_accept_channel2(conn: &mut impl Connection) -> Result<AcceptChannel2, ExecuteError> {
+    match recv_non_ping(conn, RECV_IDLE_TIMEOUT)? {
+        Message::AcceptChannel2(ac) => Ok(ac),
+        other => Err(ExecuteError::UnexpectedMessage {
+            expected: MessageType::ACCEPT_CHANNEL2,
+            got: other.msg_type(),
+        }),
+    }
+}
+
 /// Receives and decodes a `funding_signed` message.
 fn recv_funding_signed(conn: &mut impl Connection) -> Result<FundingSigned, ExecuteError> {
     match recv_non_ping(conn, RECV_IDLE_TIMEOUT)? {
@@ -1415,6 +1564,41 @@ fn record_recv_accept_channel(
         .get_mut(&accept_channel.temporary_channel_id)
         .expect("AcceptChannelOracle guaranteed this temporary_channel_id exists")
         .accept_channel = Some(accept_channel.clone());
+}
+
+/// Extracts a field from a parsed `accept_channel2` message.
+fn extract_field_v2(ac: &AcceptChannel2, field: AcceptChannel2Field) -> Variable {
+    match field {
+        AcceptChannel2Field::TemporaryChannelId => Variable::ChannelId(ac.temporary_channel_id),
+        AcceptChannel2Field::FundingSatoshis => Variable::Amount(ac.funding_satoshis),
+        AcceptChannel2Field::DustLimitSatoshis => Variable::Amount(ac.dust_limit_satoshis),
+        AcceptChannel2Field::MaxHtlcValueInFlightMsat => {
+            Variable::Amount(ac.max_htlc_value_in_flight_msat)
+        }
+        AcceptChannel2Field::HtlcMinimumMsat => Variable::Amount(ac.htlc_minimum_msat),
+        AcceptChannel2Field::MinimumDepth => Variable::BlockHeight(ac.minimum_depth),
+        AcceptChannel2Field::ToSelfDelay => Variable::U16(ac.to_self_delay),
+        AcceptChannel2Field::MaxAcceptedHtlcs => Variable::U16(ac.max_accepted_htlcs),
+        AcceptChannel2Field::FundingPubkey => Variable::Point(ac.funding_pubkey),
+        AcceptChannel2Field::RevocationBasepoint => Variable::Point(ac.revocation_basepoint),
+        AcceptChannel2Field::PaymentBasepoint => Variable::Point(ac.payment_basepoint),
+        AcceptChannel2Field::DelayedPaymentBasepoint => {
+            Variable::Point(ac.delayed_payment_basepoint)
+        }
+        AcceptChannel2Field::HtlcBasepoint => Variable::Point(ac.htlc_basepoint),
+        AcceptChannel2Field::FirstPerCommitmentPoint => {
+            Variable::Point(ac.first_per_commitment_point)
+        }
+        AcceptChannel2Field::SecondPerCommitmentPoint => {
+            Variable::Point(ac.second_per_commitment_point)
+        }
+        AcceptChannel2Field::UpfrontShutdownScript => {
+            Variable::Bytes(ac.tlvs.upfront_shutdown_script.clone().unwrap_or_default())
+        }
+        AcceptChannel2Field::ChannelType => {
+            Variable::Features(ac.tlvs.channel_type.clone().unwrap_or_default())
+        }
+    }
 }
 
 /// Extracts a field from a parsed `accept_channel` message.
