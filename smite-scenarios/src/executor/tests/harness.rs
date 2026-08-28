@@ -3,6 +3,7 @@
 use crate::executor::*;
 use bitcoin::{Amount, Transaction};
 use smite::bolt::{AcceptChannel2Tlvs, AcceptChannelTlvs};
+use smite_ir::operation::ChannelTypeVariant;
 use std::collections::VecDeque;
 use std::str::FromStr;
 
@@ -62,6 +63,11 @@ pub struct MockBitcoinCli {
     /// `getrawtransaction` would return them.
     pub raw_transactions: HashMap<Txid, Vec<u8>>,
     pub locked_outpoints: Vec<OutPoint>,
+    /// Outpoints the wallet can sign. `sign_tx` attaches a witness only to
+    /// these, the way bitcoind signs only what it owns.
+    pub signable_outpoints: Vec<OutPoint>,
+    /// When set, `sign_tx` fails outright.
+    pub signing_fails: bool,
 }
 
 impl BitcoinRpc for MockBitcoinCli {
@@ -81,6 +87,24 @@ impl BitcoinRpc for MockBitcoinCli {
 
     fn get_raw_transaction(&mut self, txid: Txid) -> Option<Vec<u8>> {
         self.raw_transactions.get(&txid).cloned()
+    }
+
+    fn sign_tx(&mut self, tx: &bitcoin::Transaction) -> Option<bitcoin::Transaction> {
+        if self.signing_fails {
+            return None;
+        }
+        let mut signed = tx.clone();
+        for txin in &mut signed.input {
+            if self.signable_outpoints.contains(&txin.previous_output) {
+                // A distinguishable two-element witness, so tests can tell
+                // which input a witness came from.
+                txin.witness = bitcoin::Witness::from_slice(&[
+                    vec![0xaa; 72],
+                    txin.previous_output.txid.to_string().into_bytes(),
+                ]);
+            }
+        }
+        Some(signed)
     }
 
     fn sign_and_broadcast_tx(&mut self, tx: &bitcoin::Transaction) -> Option<String> {
@@ -133,6 +157,7 @@ pub fn sample_pubkey(byte: u8) -> PublicKey {
 pub fn sample_context() -> ProgramContext {
     ProgramContext {
         target_pubkey: sample_pubkey(1),
+        local_pubkey: sample_pubkey(2),
         chain_hash: [0xcc; 32],
         block_height: 800_000,
         target_features: vec![],
@@ -269,6 +294,39 @@ pub fn sample_accept_channel2(temporary_channel_id: TemporaryChannelId) -> Accep
     }
 }
 
+/// The `open_channel2` that `open_channel2_instructions` puts on the
+/// wire.
+pub fn sample_open_channel2() -> OpenChannel2 {
+    let secp = Secp256k1::new();
+    let pk = |b: &[u8; 32]| PublicKey::from_secret_key(&secp, &SecretKey::from_slice(b).unwrap());
+    OpenChannel2 {
+        chain_hash: [0xcc; 32],
+        temporary_channel_id: sample_v2_temporary_channel_id(),
+        funding_feerate_perkw: 253,
+        commitment_feerate_perkw: 2500,
+        funding_satoshis: 200_000,
+        dust_limit_satoshis: 546,
+        max_htlc_value_in_flight_msat: 100_000_000,
+        htlc_minimum_msat: 1_000,
+        to_self_delay: 144,
+        max_accepted_htlcs: 483,
+        locktime: 120,
+        funding_pubkey: pk(&[0x11; 32]),
+        revocation_basepoint: sample_v2_revocation_basepoint(),
+        payment_basepoint: pk(&[0x33; 32]),
+        delayed_payment_basepoint: pk(&[0x44; 32]),
+        htlc_basepoint: pk(&[0x55; 32]),
+        first_per_commitment_point: pk(&[0x66; 32]),
+        second_per_commitment_point: pk(&[0x77; 32]),
+        channel_flags: 0,
+        tlvs: OpenChannel2Tlvs {
+            upfront_shutdown_script: Some(vec![]),
+            channel_type: Some(ChannelTypeVariant::Anchors.encode()),
+            require_confirmed_inputs: false,
+        },
+    }
+}
+
 /// Our `revocation_basepoint`, and hence the `temporary_channel_id` that
 /// `open_channel2_instructions` derives from it.
 pub fn sample_v2_revocation_basepoint() -> PublicKey {
@@ -314,4 +372,40 @@ pub fn sample_v2_wallet() -> MockBitcoinCli {
     cli.raw_transactions
         .insert(txid, bitcoin::consensus::encode::serialize(&prevtx));
     cli
+}
+
+// -- Commitment and signature exchange --
+
+/// A wallet whose single output is also signable, so `tx_signatures` has a
+/// witness to carry.
+pub fn sample_v2_signing_wallet() -> MockBitcoinCli {
+    let mut cli = sample_v2_wallet();
+    cli.signable_outpoints = cli.utxos.iter().map(|u| u.outpoint).collect();
+    cli
+}
+
+pub fn v2_channel_id() -> ChannelId {
+    ChannelId::v2_from_revocation_basepoints(
+        &sample_v2_revocation_basepoint(),
+        &sample_accept_channel2(sample_v2_temporary_channel_id()).revocation_basepoint,
+    )
+}
+
+/// A plausible P2WPKH witness from the peer: signature and pubkey.
+pub fn sample_peer_witness() -> Witness {
+    Witness::from_slice(&[vec![0xbb; 71], vec![0xcc; 33]])
+}
+
+/// [`sample_peer_witness`] encoded the way `tx_signatures` carries
+/// `witness_data`.
+pub fn sample_peer_witness_data() -> Vec<u8> {
+    bitcoin::consensus::encode::serialize(&sample_peer_witness())
+}
+
+/// The private key behind [`sample_accept_channel2`]'s `funding_pubkey`,
+/// which is `sample_pubkey(11)`.
+pub fn sample_acceptor_funding_privkey() -> SecretKey {
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes[31] = 11;
+    SecretKey::from_slice(&sk_bytes).expect("valid secret key")
 }
