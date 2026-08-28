@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use bitcoin::Witness;
+
 use crate::bolt::{
     AcceptChannel, AcceptChannel2, ChannelId, OpenChannel, OpenChannel2, TemporaryChannelId,
 };
@@ -37,6 +39,17 @@ pub struct PendingChannelV2 {
     /// The transaction being built by interactive construction, accumulating
     /// both peers' contributions.
     pub shared_tx: SharedTransaction,
+    /// Progress through the interactive transaction exchange.
+    pub tx_negotiation: TxNegotiation,
+    /// Progress through the commitment and signature exchange that follows it.
+    pub commitment_exchange: CommitmentExchange,
+    /// Witnesses from the peer's `tx_signatures`
+    pub peer_witnesses: Vec<Witness>,
+}
+
+/// How far the interactive transaction exchange has progressed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxNegotiation {
     /// Whether we have sent `tx_complete` since our last contribution.
     pub sent_tx_complete: bool,
     /// Whether the peer's most recent message was `tx_complete`. The
@@ -45,6 +58,29 @@ pub struct PendingChannelV2 {
     pub peer_sent_tx_complete: bool,
     /// Whether either peer has aborted the negotiation.
     pub aborted: bool,
+}
+
+/// Progress through a two-way exchange of one message type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Exchange {
+    /// Whether we have sent ours.
+    pub sent: bool,
+    /// Whether the peer's has arrived.
+    pub received: bool,
+}
+
+/// How far the commitment and signature exchange has progressed.
+///
+/// BOLT 2 gates each half on the other: `tx_signatures` may only be sent once
+/// both peers' `commitment_signed`s have been exchanged, and the peer owes us
+/// its `tx_signatures` once it has received ours.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitmentExchange {
+    /// Progress through the `commitment_signed` exchange for this funding
+    /// transaction. `received` means arrived *and* verified.
+    pub commitment_signed: Exchange,
+    /// Progress through the `tx_signatures` exchange.
+    pub tx_signatures: Exchange,
 }
 
 impl PendingChannelV2 {
@@ -58,9 +94,9 @@ impl PendingChannelV2 {
             accept_channel2: None,
             channel_id: None,
             shared_tx,
-            sent_tx_complete: false,
-            peer_sent_tx_complete: false,
-            aborted: false,
+            tx_negotiation: TxNegotiation::default(),
+            commitment_exchange: CommitmentExchange::default(),
+            peer_witnesses: Vec::new(),
         }
     }
 
@@ -68,7 +104,7 @@ impl PendingChannelV2 {
     /// the negotiation.
     #[must_use]
     pub fn tx_negotiation_complete(&self) -> bool {
-        self.sent_tx_complete && self.peer_sent_tx_complete
+        self.tx_negotiation.sent_tx_complete && self.tx_negotiation.peer_sent_tx_complete
     }
 
     /// Total funding output value: the sum of both peers' contributions, per

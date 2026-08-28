@@ -413,3 +413,49 @@ pub fn send_open_channel2_instructions() -> (Vec<Instruction>, usize) {
     }); // v30
     (instructions, 30)
 }
+
+// -- Commitment and signature exchange --
+
+/// Drives the full v2 flow through `tx_complete`, then appends `extra`.
+///
+/// Variable indices of interest: 32 is the v2 `channel_id`, 36 the funding
+/// transaction, 10 our funding private key.
+pub fn v2_flow_instructions(extra: Vec<Instruction>) -> Vec<Instruction> {
+    let (mut instructions, _) = send_open_channel2_instructions();
+    instructions.push(Instruction {
+        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
+        inputs: vec![30],
+    }); // v31
+    instructions.push(Instruction {
+        operation: Operation::DeriveChannelIdV2,
+        inputs: vec![13, 31],
+    }); // v32 channel_id
+    instructions.push(Instruction {
+        operation: Operation::SendTxAddInput {
+            serial_id: 2,
+            utxo_index: 0,
+            sequence: 0xffff_fffd,
+        },
+        inputs: vec![32],
+    }); // v33
+    instructions.push(Instruction {
+        operation: Operation::SendTxAddOutput {
+            serial_id: 4,
+            role: TxOutputRole::Funding,
+        },
+        inputs: vec![32, 3, 25],
+    }); // v34
+    instructions.push(Instruction {
+        operation: Operation::SendTxAddOutput {
+            serial_id: 6,
+            role: TxOutputRole::Change,
+        },
+        inputs: vec![32, 3, 25],
+    }); // v35
+    instructions.push(Instruction {
+        operation: Operation::BuildFundingTransactionV2,
+        inputs: vec![32],
+    }); // v36 funding transaction
+    instructions.extend(extra);
+    instructions
+}
