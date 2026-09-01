@@ -83,7 +83,7 @@ pub struct PostInitSetup;
 
 impl<T: Target> SnapshotSetup<T> for PostInitSetup {
     fn setup(target: &T) -> Result<(NoiseConnection, ProgramContext), ScenarioError> {
-        let (mut conn, target_init) = handshake_with_target(target, TIMEOUT)?;
+        let (mut conn, target_init) = handshake_with_target(target, 0, TIMEOUT)?;
 
         // Echo features but strip the bits that would take us off the
         // single-funded `open_channel` path this setup is built for.

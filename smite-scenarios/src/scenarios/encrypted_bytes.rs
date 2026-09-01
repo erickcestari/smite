@@ -24,7 +24,7 @@ impl<T: Target> Scenario for EncryptedBytesScenario<T> {
     fn new(_args: &[String]) -> Result<Self, ScenarioError> {
         let config = T::Config::default();
         let target = T::start(config)?;
-        let (mut conn, target_init) = handshake_with_target(&target, Duration::from_secs(5))?;
+        let (mut conn, target_init) = handshake_with_target(&target, 0, Duration::from_secs(5))?;
         let echo = Message::Init(Init::echo(&target_init)).encode();
         conn.send_message(&echo)?;
 

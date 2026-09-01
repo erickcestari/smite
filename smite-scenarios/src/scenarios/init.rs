@@ -37,7 +37,7 @@ impl<T: Target> Scenario for InitScenario<T> {
         // Establish a warmup connection for ping-pong. This warms up the
         // target's message handling code paths before the Nyx snapshot
         // (important for JVM targets like Eclair).
-        let (mut warmup_conn, target_init) = handshake_with_target(&target, TIMEOUT)?;
+        let (mut warmup_conn, target_init) = handshake_with_target(&target, 0, TIMEOUT)?;
         let echo = Message::Init(Init::echo(&target_init)).encode();
         warmup_conn.send_message(&echo)?;
         ping_pong(&mut warmup_conn)?;
@@ -45,7 +45,7 @@ impl<T: Target> Scenario for InitScenario<T> {
 
         // Establish the fuzz connection, complete the handshake, and receive
         // the target's init.
-        let (conn, _) = handshake_with_target(&target, TIMEOUT)?;
+        let (conn, _) = handshake_with_target(&target, 0, TIMEOUT)?;
 
         Ok(Self { target, conn })
     }

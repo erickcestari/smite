@@ -59,7 +59,21 @@ const EPHEMERAL_KEY: [u8; 32] = [
     0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12,
 ];
 
-/// Perform a Noise handshake with a target and receive its `Init` message.
+/// Static key for fuzzer peer `peer`.
+///
+/// Peer 0 uses [`STATIC_KEY`] unchanged so existing findings keep reproducing.
+/// Every further peer bumps the last byte, giving the target a distinct
+/// `node_id`: targets treat a second connection with the same `node_id` as a
+/// reconnect and drop the older one. Must never collide with the noise
+/// scenario's fuzz key (`0x22` repeated).
+fn static_key_for_peer(peer: u8) -> SecretKey {
+    let mut key = STATIC_KEY;
+    key[31] = key[31].wrapping_add(peer);
+    SecretKey::from_slice(&key).expect("valid static key")
+}
+
+/// Perform a Noise handshake with a target as fuzzer peer `peer` and receive
+/// its `Init` message.
 ///
 /// Returns the encrypted connection and the target's `Init`. The caller is
 /// responsible for sending its own `Init` response (e.g., via `Init::echo`).
@@ -70,9 +84,10 @@ const EPHEMERAL_KEY: [u8; 32] = [
 #[allow(clippy::missing_panics_doc)] // Static keys are known-valid constants
 pub fn handshake_with_target<T: Target>(
     target: &T,
+    peer: u8,
     timeout: Duration,
 ) -> Result<(NoiseConnection, Init), ScenarioError> {
-    let local_static = SecretKey::from_slice(&STATIC_KEY).expect("valid static key");
+    let local_static = static_key_for_peer(peer);
     let local_ephemeral = SecretKey::from_slice(&EPHEMERAL_KEY).expect("valid ephemeral key");
 
     let mut conn = NoiseConnection::connect(
@@ -89,7 +104,7 @@ pub fn handshake_with_target<T: Target>(
         return Err(ScenarioError::Protocol("expected init message".into()));
     };
 
-    log::debug!("Handshake complete, received target init");
+    log::debug!("Handshake complete as peer {peer}, received target init");
 
     Ok((conn, init))
 }
@@ -153,8 +168,27 @@ fn ping_pong_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, is_known_parked_error};
+    use super::{Error, STATIC_KEY, is_known_parked_error, static_key_for_peer};
     use smite::bolt::ChannelId;
+
+    #[test]
+    fn peer_zero_static_key_is_unchanged() {
+        assert_eq!(static_key_for_peer(0).secret_bytes(), STATIC_KEY);
+    }
+
+    #[test]
+    fn peers_get_distinct_static_keys() {
+        let keys: Vec<_> = (0..4)
+            .map(|p| static_key_for_peer(p).secret_bytes())
+            .collect();
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+            // The noise scenario's fuzz connection uses this key.
+            assert_ne!(*a, [0x22; 32]);
+        }
+    }
 
     #[test]
     fn known_parked_error_matches_substring() {
