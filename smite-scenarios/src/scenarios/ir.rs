@@ -21,8 +21,8 @@ use crate::targets::Target;
 /// (out-of-bounds variable refs, type mismatches, `MineBlocks(0)`, etc.).
 pub struct IrScenario<T: Target, S: SnapshotSetup<T>> {
     target: T,
-    /// Executes IR programs and owns the connection, bitcoin-cli handle, and
-    /// program context. Created once before the snapshot and reused across
+    /// Executes IR programs and owns the peer connections, bitcoin-cli handle,
+    /// and program context. Created once before the snapshot and reused across
     /// fuzzing runs.
     executor: Executor<NoiseConnection, BitcoinCli>,
     // S is only used for static dispatch on S::setup(), not stored.
@@ -34,7 +34,7 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
         let target = T::start(T::Config::default())?;
         let (conn, context) = S::setup(&target)?;
         let bitcoin_cli = target.bitcoin_cli().clone();
-        let executor = Executor::new(conn, bitcoin_cli, context);
+        let executor = Executor::new(vec![conn], bitcoin_cli, context);
         Ok(Self {
             target,
             executor,
@@ -77,13 +77,13 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
                 // protocol behavior.
                 log::debug!("[{:?}] {e}", start.elapsed());
             }
-            Err(ExecuteError::PeerError(e)) => {
+            Err(ExecuteError::PeerError { peer, error }) => {
                 // Normal protocol behavior: the target rejected our input.
-                parked = is_known_parked_error(&e);
+                parked = is_known_parked_error(&error);
                 log::debug!(
-                    "[{:?}] peer error (parked: {parked}): {}",
+                    "[{:?}] peer {peer} error (parked: {parked}): {}",
                     start.elapsed(),
-                    e.message().unwrap_or("<non-utf8>"),
+                    error.message().unwrap_or("<non-utf8>"),
                 );
             }
             Err(ExecuteError::Decode(e)) => {
@@ -126,7 +126,7 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
                 start.elapsed()
             );
         } else {
-            match ping_pong_checked(self.executor.conn_mut()) {
+            match ping_pong_checked(self.executor.conn_mut(0)) {
                 Ok(PingOutcome::Pong) => {
                     log::debug!("[{:?}] Target responded with pong", start.elapsed());
                 }
