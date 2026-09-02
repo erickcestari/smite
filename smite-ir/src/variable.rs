@@ -53,14 +53,24 @@ pub enum Variable {
     /// Constructed funding transaction with funding output index.
     FundingTransaction(FundingTransaction),
 
-    // Affine (single-use) variables
+    // Affine (single-use) variables. Each records the fuzzer peer the message
+    // went out on, so the matching `Recv*` reads the same connection.
     /// `open_channel` has been sent, so `accept_channel` may now be received.
-    SentOpenChannel,
+    SentOpenChannel {
+        /// Fuzzer peer the message was sent to.
+        peer: u8,
+    },
     /// `funding_created` has been sent, so `funding_signed` may now be received.
-    SentFundingCreated,
+    SentFundingCreated {
+        /// Fuzzer peer the message was sent to.
+        peer: u8,
+    },
     /// `shutdown` has been sent, so the counterparty's `shutdown` may now be
     /// received.
-    SentShutdown,
+    SentShutdown {
+        /// Fuzzer peer the message was sent to.
+        peer: u8,
+    },
 }
 
 impl Variable {
@@ -86,9 +96,9 @@ impl Variable {
             Self::OpenChannelMessage(_) => VariableType::OpenChannelMessage,
             Self::AcceptChannel(_) => VariableType::AcceptChannel,
             Self::FundingTransaction(_) => VariableType::FundingTransaction,
-            Self::SentOpenChannel => VariableType::SentOpenChannel,
-            Self::SentFundingCreated => VariableType::SentFundingCreated,
-            Self::SentShutdown => VariableType::SentShutdown,
+            Self::SentOpenChannel { .. } => VariableType::SentOpenChannel,
+            Self::SentFundingCreated { .. } => VariableType::SentFundingCreated,
+            Self::SentShutdown { .. } => VariableType::SentShutdown,
         }
     }
 }
@@ -124,7 +134,9 @@ impl VariableType {
     #[must_use]
     pub fn is_affine(&self) -> bool {
         match self {
-            Self::SentOpenChannel | Self::SentFundingCreated | Self::SentShutdown => true,
+            Self::SentOpenChannel { .. }
+            | Self::SentFundingCreated { .. }
+            | Self::SentShutdown { .. } => true,
 
             Self::Bytes
             | Self::ChainHash

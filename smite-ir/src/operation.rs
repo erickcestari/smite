@@ -174,22 +174,38 @@ pub enum Operation {
     BuildAnnouncementSignatures,
 
     // -- Act: side effects against the target --
-    /// Send an encoded message over the connection.
+    //
+    // `Send*` operations name the fuzzer peer whose connection carries the
+    // message; `peer` must be below `PEER_COUNT`. `Recv*` operations take no
+    // peer: they read from the peer recorded in the affine `Sent*` token they
+    // consume, so a response is always awaited where the request went out.
+    /// Send an encoded message to fuzzer peer `peer`.
     /// Input: `Message`.
-    SendMessage,
-    /// Send an `open_channel` message over the connection.
+    SendMessage {
+        /// Fuzzer peer whose connection carries the message.
+        peer: u8,
+    },
+    /// Send an `open_channel` message to fuzzer peer `peer`.
     /// Produces a `SentOpenChannel` variable.
     /// Input: `OpenChannelMessage`.
-    SendOpenChannel,
-    /// Build and send a `funding_created` message (BOLT 2, type 34).
+    SendOpenChannel {
+        /// Fuzzer peer whose connection carries the message.
+        peer: u8,
+    },
+    /// Build and send a `funding_created` message (BOLT 2, type 34) to fuzzer
+    /// peer `peer`.
     /// Produces a `SentFundingCreated` variable.
     ///
     /// Inputs (3):
     ///   0: `funding_transaction` (`FundingTransaction`)
     ///   1: `opener_funding_privkey` (`PrivateKey`)
     ///   2: `temporary_channel_id` (`ChannelId`)
-    SendFundingCreated,
-    /// Build and send a `channel_ready` message (BOLT 2, type 36).
+    SendFundingCreated {
+        /// Fuzzer peer whose connection carries the message.
+        peer: u8,
+    },
+    /// Build and send a `channel_ready` message (BOLT 2, type 36) to fuzzer
+    /// peer `peer`.
     ///
     /// The alias TLV is optional in `channel_ready`. Since every `u64` is a
     /// valid `ShortChannelId`, presence is controlled by `include_alias`
@@ -206,27 +222,37 @@ pub enum Operation {
         /// Whether to include the alias `short_channel_id` TLV from input 2.
         /// If `false`, the TLV is omitted and input 2 is ignored.
         include_alias: bool,
+        /// Fuzzer peer whose connection carries the message.
+        peer: u8,
     },
-    /// Build and send a `shutdown` message (BOLT 2, type 38).
+    /// Build and send a `shutdown` message (BOLT 2, type 38) to fuzzer peer
+    /// `peer`.
     /// Produces a `SentShutdown` variable.
     ///
     /// Inputs (2):
     ///   0: `channel_id`   (`ChannelId`)
     ///   1: `scriptpubkey` (`Bytes`)
-    SendShutdown,
-    /// Receive and parse an `accept_channel` response.
+    SendShutdown {
+        /// Fuzzer peer whose connection carries the message.
+        peer: u8,
+    },
+    /// Receive and parse an `accept_channel` response from the peer the
+    /// consumed `SentOpenChannel` was sent to.
     /// Produces an `AcceptChannel` compound variable.
     RecvAcceptChannel,
-    /// Receive and parse a `funding_signed` response.
+    /// Receive and parse a `funding_signed` response from the peer the
+    /// consumed `SentFundingCreated` was sent to.
     /// Produces the `ChannelId` carried in the message.
     /// TODO: Add `ExtractFundingSigned` when implementing force-close scenarios.
     RecvFundingSigned,
-    /// Receive and parse a `channel_ready` response.
+    /// Receive and parse a `channel_ready` response from every peer that owes
+    /// one.
     ///
-    /// This is a no-op unless some tracked channel is awaiting `channel_ready`
-    /// (still at commitment number 0 with the counterparty's next per-commitment
-    /// point unknown) and its funding transaction has enough confirmations for
-    /// the target to have sent `channel_ready`.
+    /// For each peer this is a no-op unless some channel tracked on it is
+    /// awaiting `channel_ready` (still at commitment number 0 with the
+    /// counterparty's next per-commitment point unknown) and its funding
+    /// transaction has enough confirmations for the target to have sent
+    /// `channel_ready`.
     RecvChannelReady,
     /// Mines the given number of blocks on the Bitcoin network.
     MineBlocks(u8),
@@ -703,13 +729,17 @@ impl fmt::Display for Operation {
             ),
             Self::BuildChannelUpdate => write!(f, "BuildChannelUpdate"),
             Self::BuildAnnouncementSignatures => write!(f, "BuildAnnouncementSignatures"),
-            Self::SendMessage => write!(f, "SendMessage"),
-            Self::SendOpenChannel => write!(f, "SendOpenChannel"),
-            Self::SendFundingCreated => write!(f, "SendFundingCreated"),
-            Self::SendChannelReady { include_alias } => {
-                write!(f, "SendChannelReady{{include_alias={include_alias}}}")
-            }
-            Self::SendShutdown => write!(f, "SendShutdown"),
+            Self::SendMessage { peer } => write!(f, "SendMessage{{peer={peer}}}"),
+            Self::SendOpenChannel { peer } => write!(f, "SendOpenChannel{{peer={peer}}}"),
+            Self::SendFundingCreated { peer } => write!(f, "SendFundingCreated{{peer={peer}}}"),
+            Self::SendChannelReady {
+                include_alias,
+                peer,
+            } => write!(
+                f,
+                "SendChannelReady{{include_alias={include_alias}, peer={peer}}}"
+            ),
+            Self::SendShutdown { peer } => write!(f, "SendShutdown{{peer={peer}}}"),
             Self::RecvAcceptChannel => write!(f, "RecvAcceptChannel"),
             Self::RecvFundingSigned => write!(f, "RecvFundingSigned"),
             Self::RecvChannelReady => write!(f, "RecvChannelReady()"),
@@ -749,14 +779,14 @@ impl Operation {
             | Self::BuildNodeAnnouncement { .. }
             | Self::BuildChannelUpdate
             | Self::BuildAnnouncementSignatures => Some(VariableType::Message),
-            Self::SendMessage
+            Self::SendMessage { .. }
             | Self::SendChannelReady { .. }
             | Self::RecvChannelReady
             | Self::MineBlocks(_)
             | Self::BroadcastTransaction => None,
-            Self::SendOpenChannel => Some(VariableType::SentOpenChannel),
-            Self::SendFundingCreated => Some(VariableType::SentFundingCreated),
-            Self::SendShutdown => Some(VariableType::SentShutdown),
+            Self::SendOpenChannel { .. } => Some(VariableType::SentOpenChannel),
+            Self::SendFundingCreated { .. } => Some(VariableType::SentFundingCreated),
+            Self::SendShutdown { .. } => Some(VariableType::SentShutdown),
             Self::RecvAcceptChannel => Some(VariableType::AcceptChannel),
         }
     }
@@ -857,9 +887,9 @@ impl Operation {
                 VariableType::PrivateKey,     // bitcoin_sk_1 (our bitcoin signing key)
                 VariableType::Point,          // bitcoin_key_2 (target's bitcoin public key)
             ],
-            Self::SendMessage => vec![VariableType::Message],
-            Self::SendOpenChannel => vec![VariableType::OpenChannelMessage],
-            Self::SendFundingCreated => vec![
+            Self::SendMessage { .. } => vec![VariableType::Message],
+            Self::SendOpenChannel { .. } => vec![VariableType::OpenChannelMessage],
+            Self::SendFundingCreated { .. } => vec![
                 VariableType::FundingTransaction, // funding_transaction
                 VariableType::PrivateKey,         // opener_funding_privkey
                 VariableType::ChannelId,          // temporary_channel_id
@@ -869,7 +899,7 @@ impl Operation {
                 VariableType::Point,          // second_per_commitment_point
                 VariableType::ShortChannelId, // short_channel_id (alias)
             ],
-            Self::SendShutdown => vec![
+            Self::SendShutdown { .. } => vec![
                 VariableType::ChannelId, // channel_id
                 VariableType::Bytes,     // scriptpubkey
             ],
@@ -913,11 +943,11 @@ impl Operation {
             | Self::BuildNodeAnnouncement { .. }
             | Self::BuildChannelUpdate
             | Self::BuildAnnouncementSignatures
-            | Self::SendMessage
-            | Self::SendOpenChannel
-            | Self::SendFundingCreated
+            | Self::SendMessage { .. }
+            | Self::SendOpenChannel { .. }
+            | Self::SendFundingCreated { .. }
             | Self::SendChannelReady { .. }
-            | Self::SendShutdown
+            | Self::SendShutdown { .. }
             | Self::RecvFundingSigned
             | Self::RecvChannelReady
             | Self::MineBlocks(_)
@@ -961,11 +991,11 @@ impl Operation {
             | Self::BuildAnnouncementSignatures
             | Self::LookupShortChannelId => false,
             Self::CreateFundingTransaction
-            | Self::SendMessage
-            | Self::SendOpenChannel
-            | Self::SendFundingCreated
+            | Self::SendMessage { .. }
+            | Self::SendOpenChannel { .. }
+            | Self::SendFundingCreated { .. }
             | Self::SendChannelReady { .. }
-            | Self::SendShutdown
+            | Self::SendShutdown { .. }
             | Self::RecvAcceptChannel
             | Self::RecvFundingSigned
             | Self::RecvChannelReady
@@ -1007,10 +1037,10 @@ impl Operation {
             | Self::BuildNodeAnnouncement { .. }
             | Self::BuildChannelUpdate
             | Self::BuildAnnouncementSignatures
-            | Self::SendMessage
-            | Self::SendOpenChannel
+            | Self::SendMessage { .. }
+            | Self::SendOpenChannel { .. }
             | Self::SendChannelReady { .. }
-            | Self::SendShutdown => true,
+            | Self::SendShutdown { .. } => true,
             // `CreateFundingTransaction` selects coins from the wallet, whose
             // contents change as transactions are created and broadcast.
             // `SendFundingCreated` builds its message from the recorded
@@ -1019,7 +1049,7 @@ impl Operation {
             // the private mempool holds, `BroadcastTransaction` dedups against
             // it, and `LookupShortChannelId` reads chain state.
             Self::CreateFundingTransaction
-            | Self::SendFundingCreated
+            | Self::SendFundingCreated { .. }
             | Self::RecvAcceptChannel
             | Self::RecvFundingSigned
             | Self::RecvChannelReady
@@ -1058,7 +1088,11 @@ impl Operation {
             | Self::LoadChannelType(_)
             | Self::ExtractAcceptChannel(_)
             | Self::BuildNodeAnnouncement { .. }
+            | Self::SendMessage { .. }
+            | Self::SendOpenChannel { .. }
+            | Self::SendFundingCreated { .. }
             | Self::SendChannelReady { .. }
+            | Self::SendShutdown { .. }
             | Self::MineBlocks(_) => true,
 
             Self::LoadTargetPubkeyFromContext
@@ -1069,15 +1103,55 @@ impl Operation {
             | Self::BuildChannelAnnouncement
             | Self::BuildChannelUpdate
             | Self::BuildAnnouncementSignatures
-            | Self::SendMessage
-            | Self::SendOpenChannel
-            | Self::SendFundingCreated
-            | Self::SendShutdown
             | Self::RecvAcceptChannel
             | Self::RecvFundingSigned
             | Self::RecvChannelReady
             | Self::BroadcastTransaction
             | Self::LookupShortChannelId => false,
+        }
+    }
+
+    /// Fuzzer peer a `Send*` operation transmits on; `None` for operations
+    /// that do not touch a connection.
+    #[must_use]
+    pub fn peer(&self) -> Option<u8> {
+        match self {
+            Self::SendMessage { peer }
+            | Self::SendOpenChannel { peer }
+            | Self::SendFundingCreated { peer }
+            | Self::SendChannelReady { peer, .. }
+            | Self::SendShutdown { peer } => Some(*peer),
+
+            Self::LoadAmount(_)
+            | Self::LoadShortChannelId(_)
+            | Self::LoadFeeratePerKw(_)
+            | Self::LoadBlockHeight(_)
+            | Self::LoadTimestamp(_)
+            | Self::LoadForwardingFee(_)
+            | Self::LoadU16(_)
+            | Self::LoadU8(_)
+            | Self::LoadBytes(_)
+            | Self::LoadFeatures(_)
+            | Self::LoadPrivateKey(_)
+            | Self::LoadChannelId(_)
+            | Self::LoadShutdownScript(_)
+            | Self::LoadChannelType(_)
+            | Self::LoadTargetPubkeyFromContext
+            | Self::LoadChainHashFromContext
+            | Self::DerivePoint
+            | Self::ExtractAcceptChannel(_)
+            | Self::CreateFundingTransaction
+            | Self::BuildOpenChannel
+            | Self::BuildChannelAnnouncement
+            | Self::BuildNodeAnnouncement { .. }
+            | Self::BuildChannelUpdate
+            | Self::BuildAnnouncementSignatures
+            | Self::RecvAcceptChannel
+            | Self::RecvFundingSigned
+            | Self::RecvChannelReady
+            | Self::MineBlocks(_)
+            | Self::BroadcastTransaction
+            | Self::LookupShortChannelId => None,
         }
     }
 }

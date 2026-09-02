@@ -17,6 +17,7 @@ pub struct ChannelReadyGenerator;
 
 impl Generator for ChannelReadyGenerator {
     fn generate(&self, builder: &mut ProgramBuilder, rng: &mut impl Rng) {
+        let peer = builder.pick_peer(rng);
         // Mine blocks to confirm the funding transaction.
         builder.append(Operation::MineBlocks(rng.random_range(1..=16)), &[]);
 
@@ -28,7 +29,10 @@ impl Generator for ChannelReadyGenerator {
 
         // Build and send channel_ready.
         builder.append(
-            Operation::SendChannelReady { include_alias },
+            Operation::SendChannelReady {
+                include_alias,
+                peer,
+            },
             &[channel_id, second_per_commitment_point, short_channel_id],
         );
 

@@ -12,6 +12,7 @@ pub struct NodeAnnouncementGenerator;
 
 impl Generator for NodeAnnouncementGenerator {
     fn generate(&self, builder: &mut ProgramBuilder, rng: &mut impl Rng) {
+        let peer = builder.pick_peer(rng);
         let node_sk = builder.pick_variable(VariableType::PrivateKey, rng);
         let features = builder.pick_variable(VariableType::Features, rng);
         let timestamp = builder.pick_variable(VariableType::Timestamp, rng);
@@ -31,6 +32,6 @@ impl Generator for NodeAnnouncementGenerator {
             Operation::BuildNodeAnnouncement { rgb_color, alias },
             &[node_sk, features, timestamp, addresses],
         );
-        builder.append(Operation::SendMessage, &[msg]);
+        builder.append(Operation::SendMessage { peer }, &[msg]);
     }
 }

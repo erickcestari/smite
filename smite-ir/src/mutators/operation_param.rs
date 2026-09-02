@@ -6,7 +6,7 @@ use smite::bolt::{MAX_MESSAGE_SIZE, ShortChannelId};
 
 use super::Mutator;
 use crate::operation::{AcceptChannelField, ChannelTypeVariant, ShutdownScriptVariant};
-use crate::{Operation, Program};
+use crate::{Operation, PEER_COUNT, Program};
 
 /// Mutates the embedded parameter of a randomly chosen `is_param_mutable`
 /// instruction. For numeric loads, applies a random arithmetic tweak. For byte
@@ -93,7 +93,17 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
             }
             true
         }
-        Operation::SendChannelReady { include_alias } => {
+        Operation::SendMessage { peer }
+        | Operation::SendOpenChannel { peer }
+        | Operation::SendFundingCreated { peer }
+        | Operation::SendShutdown { peer } => mutate_peer(peer, rng),
+        Operation::SendChannelReady {
+            include_alias,
+            peer,
+        } => {
+            if PEER_COUNT > 1 && rng.random() {
+                return mutate_peer(peer, rng);
+            }
             // Toggle the SCID alias TLV. Flipping always changes the value;
             // a random bool could repeat it and waste the mutation.
             *include_alias = !*include_alias;
@@ -110,10 +120,6 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
         | Operation::BuildChannelAnnouncement
         | Operation::BuildChannelUpdate
         | Operation::BuildAnnouncementSignatures
-        | Operation::SendMessage
-        | Operation::SendOpenChannel
-        | Operation::SendFundingCreated
-        | Operation::SendShutdown
         | Operation::RecvAcceptChannel
         | Operation::RecvFundingSigned
         | Operation::RecvChannelReady
@@ -122,6 +128,18 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
             unreachable!("is_param_mutable returned true for {op:?}")
         }
     }
+}
+
+/// Moves a send to a different fuzzer peer. Returns `false` when there is
+/// only one peer, since the value could not change.
+fn mutate_peer(peer: &mut u8, rng: &mut impl Rng) -> bool {
+    if PEER_COUNT < 2 {
+        return false;
+    }
+    // Draw from the other peers so the mutation always changes the value.
+    let other = rng.random_range(0..PEER_COUNT - 1);
+    *peer = if other >= *peer { other + 1 } else { other };
+    true
 }
 
 // -- Numeric tweaks --

@@ -18,6 +18,7 @@ pub struct FundingCreatedGenerator;
 
 impl Generator for FundingCreatedGenerator {
     fn generate(&self, builder: &mut ProgramBuilder, rng: &mut impl Rng) {
+        let peer = builder.pick_peer(rng);
         // Funding and commitment transaction keys and parameters.
         let opener_funding_privkey = builder.pick_variable(VariableType::PrivateKey, rng);
         let opener_funding_pubkey =
@@ -40,7 +41,7 @@ impl Generator for FundingCreatedGenerator {
 
         // Build and send funding_created.
         let sent_funding_created = builder.append(
-            Operation::SendFundingCreated,
+            Operation::SendFundingCreated { peer },
             &[
                 funding_transaction,
                 opener_funding_privkey,

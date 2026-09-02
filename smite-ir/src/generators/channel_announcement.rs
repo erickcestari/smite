@@ -12,6 +12,7 @@ pub struct ChannelAnnouncementGenerator;
 
 impl Generator for ChannelAnnouncementGenerator {
     fn generate(&self, builder: &mut ProgramBuilder, rng: &mut impl Rng) {
+        let peer = builder.pick_peer(rng);
         let features = builder.pick_variable(VariableType::Features, rng);
         let chain_hash = builder.pick_variable(VariableType::ChainHash, rng);
         let scid = builder.pick_variable(VariableType::ShortChannelId, rng);
@@ -35,6 +36,6 @@ impl Generator for ChannelAnnouncementGenerator {
                 bitcoin_sk_2,
             ],
         );
-        builder.append(Operation::SendMessage, &[msg]);
+        builder.append(Operation::SendMessage { peer }, &[msg]);
     }
 }

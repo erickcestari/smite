@@ -12,6 +12,14 @@
 //! - [`program`] - Ordered list of instructions.
 //! - [`variable`] - Typed runtime values and lightweight type tags.
 
+/// Number of fuzzer peers the IR snapshot setup connects to the target, and
+/// the exclusive upper bound of every `peer` index in a program.
+///
+/// Read by generators and mutators in the AFL++ process and by the scenario
+/// inside the VM, so both must be built from the same commit. The executor
+/// panics on a `peer` index without a connection.
+pub const PEER_COUNT: u8 = 1;
+
 pub mod builder;
 pub mod generators;
 pub mod instruction;

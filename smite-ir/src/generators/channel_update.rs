@@ -17,6 +17,7 @@ pub struct ChannelUpdateGenerator;
 
 impl Generator for ChannelUpdateGenerator {
     fn generate(&self, builder: &mut ProgramBuilder, rng: &mut impl Rng) {
+        let peer = builder.pick_peer(rng);
         let node_sk = builder.pick_variable(VariableType::PrivateKey, rng);
         let chain_hash = builder.pick_variable(VariableType::ChainHash, rng);
         let short_channel_id = builder.pick_variable(VariableType::ShortChannelId, rng);
@@ -49,6 +50,6 @@ impl Generator for ChannelUpdateGenerator {
                 htlc_maximum_msat,
             ],
         );
-        builder.append(Operation::SendMessage, &[msg]);
+        builder.append(Operation::SendMessage { peer }, &[msg]);
     }
 }

@@ -19,6 +19,7 @@ pub struct OpenChannelGenerator;
 
 impl Generator for OpenChannelGenerator {
     fn generate(&self, builder: &mut ProgramBuilder, rng: &mut impl Rng) {
+        let peer = builder.pick_peer(rng);
         // Public keys are generated fresh to ensure they're distinct.
         let funding_pubkey = builder.generate_fresh(VariableType::Point, rng);
         let revocation_basepoint = builder.generate_fresh(VariableType::Point, rng);
@@ -74,7 +75,8 @@ impl Generator for OpenChannelGenerator {
                 channel_type,
             ],
         );
-        let sent_open_channel = builder.append(Operation::SendOpenChannel, &[open_channel_msg]);
+        let sent_open_channel =
+            builder.append(Operation::SendOpenChannel { peer }, &[open_channel_msg]);
 
         // Receive accept_channel.
         builder.append(Operation::RecvAcceptChannel, &[sent_open_channel]);

@@ -21,6 +21,7 @@ pub struct FundingFlowGenerator;
 
 impl Generator for FundingFlowGenerator {
     fn generate(&self, builder: &mut ProgramBuilder, rng: &mut impl Rng) {
+        let peer = builder.pick_peer(rng);
         // Private/Public keys are generated fresh to ensure they're distinct.
         let funding_privkey = builder.generate_fresh(VariableType::PrivateKey, rng);
         let funding_pubkey = builder.append(Operation::DerivePoint, &[funding_privkey]);
@@ -77,7 +78,8 @@ impl Generator for FundingFlowGenerator {
                 channel_type,
             ],
         );
-        let sent_open_channel = builder.append(Operation::SendOpenChannel, &[open_channel_msg]);
+        let sent_open_channel =
+            builder.append(Operation::SendOpenChannel { peer }, &[open_channel_msg]);
 
         // Receive accept_channel.
         let accept_channel = builder.append(Operation::RecvAcceptChannel, &[sent_open_channel]);
@@ -99,7 +101,7 @@ impl Generator for FundingFlowGenerator {
 
         // Build and send funding_created.
         let sent_funding_created = builder.append(
-            Operation::SendFundingCreated,
+            Operation::SendFundingCreated { peer },
             &[funding_transaction, funding_privkey, temporary_channel_id],
         );
 
@@ -119,7 +121,10 @@ impl Generator for FundingFlowGenerator {
 
         // Build and send channel_ready.
         builder.append(
-            Operation::SendChannelReady { include_alias },
+            Operation::SendChannelReady {
+                include_alias,
+                peer,
+            },
             &[channel_id, second_per_commitment_point, short_channel_id],
         );
 

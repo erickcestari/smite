@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use rand::{Rng, RngExt};
 
-use super::{Instruction, Operation, Program, VariableType};
+use super::{Instruction, Operation, PEER_COUNT, Program, VariableType};
 
 /// A candidate variable that can satisfy a type request.
 #[derive(Debug, Clone)]
@@ -30,6 +30,9 @@ pub struct ProgramBuilder {
     instructions: Vec<Instruction>,
     /// Candidate variables indexed by output type.
     candidates: HashMap<VariableType, Vec<Candidate>>,
+    /// Peer of the most recently appended `Send*` operation, so generated
+    /// flows tend to stay on one connection.
+    last_peer: Option<u8>,
 }
 
 impl ProgramBuilder {
@@ -39,6 +42,7 @@ impl ProgramBuilder {
         Self {
             instructions: Vec::new(),
             candidates: HashMap::new(),
+            last_peer: None,
         }
     }
 
@@ -117,6 +121,10 @@ impl ProgramBuilder {
                 .entry(out_type)
                 .or_default()
                 .push(Candidate::Direct(idx));
+        }
+
+        if let Some(peer) = operation.peer() {
+            self.last_peer = Some(peer);
         }
 
         self.instructions.push(Instruction {
@@ -234,6 +242,17 @@ impl ProgramBuilder {
             VariableType::SentShutdown => {
                 panic!("cannot generate fresh SentShutdown: affine type")
             }
+        }
+    }
+
+    /// Selects the fuzzer peer for a `Send*` operation: 75% the peer of the
+    /// most recently appended send, so a generated flow stays on one
+    /// connection; otherwise uniform over `0..PEER_COUNT`, which also lets an
+    /// inserted flow occasionally cross peers.
+    pub fn pick_peer(&mut self, rng: &mut impl Rng) -> u8 {
+        match self.last_peer {
+            Some(last) if rng.random_range(0..4) != 0 => last,
+            _ => rng.random_range(0..PEER_COUNT),
         }
     }
 

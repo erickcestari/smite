@@ -152,7 +152,7 @@ fn display_open_channel_program() {
             ],
         },
         Instruction {
-            operation: Operation::SendOpenChannel,
+            operation: Operation::SendOpenChannel { peer: 0 },
             inputs: vec![26],
         },
         // Receive accept_channel and extract fields.
@@ -206,7 +206,7 @@ fn display_open_channel_program() {
         "v24 = LoadShutdownScript(Empty)".into(),
         "v25 = LoadFeatures()".into(),
         "v26 = BuildOpenChannel(v13, v12, v14, v15, v16, v17, v18, v19, v20, v21, v22, v1, v3, v5, v7, v9, v11, v23, v24, v25)".into(),
-        "v27 = SendOpenChannel(v26)".into(),
+        "v27 = SendOpenChannel{peer=0}(v26)".into(),
         "v28 = RecvAcceptChannel(v27)".into(),
         "v29 = ExtractFundingPubkey(v28)".into(),
         "v30 = ExtractFirstPerCommitmentPoint(v28)".into(),
@@ -255,7 +255,7 @@ fn display_build_channel_announcement_program() {
             inputs: vec![0, 1, 2, 3, 4, 5, 6],
         },
         Instruction {
-            operation: Operation::SendMessage,
+            operation: Operation::SendMessage { peer: 0 },
             inputs: vec![7],
         },
     ];
@@ -274,7 +274,7 @@ fn display_build_channel_announcement_program() {
         format!("v5 = LoadPrivateKey(0x{z31}03)"),
         format!("v6 = LoadPrivateKey(0x{z31}04)"),
         "v7 = BuildChannelAnnouncement(v0, v1, v2, v3, v4, v5, v6)".into(),
-        "SendMessage(v7)".into(),
+        "SendMessage{peer=0}(v7)".into(),
     ];
     assert_eq!(lines.len(), expected.len(), "line count mismatch");
     for (i, (got, want)) in lines.iter().zip(expected.iter()).enumerate() {
@@ -311,7 +311,7 @@ fn display_build_node_announcement_program() {
             inputs: vec![0, 1, 2, 3],
         },
         Instruction {
-            operation: Operation::SendMessage,
+            operation: Operation::SendMessage { peer: 0 },
             inputs: vec![4],
         },
     ];
@@ -328,7 +328,7 @@ fn display_build_node_announcement_program() {
         "v2 = LoadTimestamp(1700000000)".into(),
         "v3 = LoadBytes()".into(),
         format!("v4 = BuildNodeAnnouncement{{rgb=0x112233, alias={alias_hex}}}(v0, v1, v2, v3)"),
-        "SendMessage(v4)".into(),
+        "SendMessage{peer=0}(v4)".into(),
     ];
     assert_eq!(lines.len(), expected.len(), "line count mismatch");
     for (i, (got, want)) in lines.iter().zip(expected.iter()).enumerate() {
@@ -389,7 +389,7 @@ fn display_build_channel_update_program() {
             inputs: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         },
         Instruction {
-            operation: Operation::SendMessage,
+            operation: Operation::SendMessage { peer: 0 },
             inputs: vec![11],
         },
     ];
@@ -412,7 +412,7 @@ fn display_build_channel_update_program() {
         "v9 = LoadForwardingFee(100)".into(),
         "v10 = LoadAmount(99000000)".into(),
         "v11 = BuildChannelUpdate(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10)".into(),
-        "SendMessage(v11)".into(),
+        "SendMessage{peer=0}(v11)".into(),
     ];
     assert_eq!(lines.len(), expected.len(), "line count mismatch");
     for (i, (got, want)) in lines.iter().zip(expected.iter()).enumerate() {
@@ -466,7 +466,7 @@ fn display_build_announcement_signatures_program() {
             inputs: vec![0, 1, 2, 3, 4, 5, 6, 7],
         },
         Instruction {
-            operation: Operation::SendMessage,
+            operation: Operation::SendMessage { peer: 0 },
             inputs: vec![8],
         },
     ];
@@ -487,7 +487,7 @@ fn display_build_announcement_signatures_program() {
         format!("v6 = LoadPrivateKey(0x{z31}02)"),
         "v7 = LoadTargetPubkeyFromContext()".into(),
         "v8 = BuildAnnouncementSignatures(v0, v1, v2, v3, v4, v5, v6, v7)".into(),
-        "SendMessage(v8)".into(),
+        "SendMessage{peer=0}(v8)".into(),
     ];
     assert_eq!(lines.len(), expected.len(), "line count mismatch");
     for (i, (got, want)) in lines.iter().zip(expected.iter()).enumerate() {
@@ -523,6 +523,7 @@ fn display_send_and_recv_channel_ready_program() {
         Instruction {
             operation: Operation::SendChannelReady {
                 include_alias: true,
+                peer: 0,
             },
             inputs: vec![0, 2, 3],
         },
@@ -543,7 +544,7 @@ fn display_send_and_recv_channel_ready_program() {
         format!("v1 = LoadPrivateKey(0x{z31}01)"),
         "v2 = DerivePoint(v1)".into(),
         format!("v3 = LoadShortChannelId({scid})"),
-        "SendChannelReady{include_alias=true}(v0, v2, v3)".into(),
+        "SendChannelReady{include_alias=true, peer=0}(v0, v2, v3)".into(),
         "RecvChannelReady()".into(),
     ];
     assert_eq!(lines.len(), expected.len(), "line count mismatch");
@@ -564,7 +565,7 @@ fn display_send_shutdown_program() {
             inputs: vec![],
         },
         Instruction {
-            operation: Operation::SendShutdown,
+            operation: Operation::SendShutdown { peer: 0 },
             inputs: vec![0, 1],
         },
     ];
@@ -578,7 +579,7 @@ fn display_send_shutdown_program() {
     let expected: Vec<String> = vec![
         format!("v0 = LoadChannelId(0x{cid_hex})"),
         format!("v1 = LoadShutdownScript(P2wpkh(0x{spk_hex}))"),
-        "v2 = SendShutdown(v0, v1)".into(),
+        "v2 = SendShutdown{peer=0}(v0, v1)".into(),
     ];
     assert_eq!(lines.len(), expected.len(), "line count mismatch");
     for (i, (got, want)) in lines.iter().zip(expected.iter()).enumerate() {
@@ -649,7 +650,7 @@ fn postcard_roundtrip() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendFundingCreated,
+                operation: Operation::SendFundingCreated { peer: 0 },
                 inputs: vec![11, 0, 3],
             },
         ],
@@ -818,7 +819,7 @@ fn displays_send_funding_created_recv_funding_signed_program() {
         },
         // Build and send funding_created.
         Instruction {
-            operation: Operation::SendFundingCreated,
+            operation: Operation::SendFundingCreated { peer: 0 },
             inputs: vec![4, 0, 5],
         },
         // receive funding_signed.
@@ -842,7 +843,7 @@ fn displays_send_funding_created_recv_funding_signed_program() {
         "v3 = LoadFeeratePerKw(15000)".into(),
         "v4 = CreateFundingTransaction(v1, v1, v2, v3)".into(),
         format!("v5 = LoadChannelId(0x{b32})"),
-        "v6 = SendFundingCreated(v4, v0, v5)".into(),
+        "v6 = SendFundingCreated{peer=0}(v4, v0, v5)".into(),
         "v7 = RecvFundingSigned(v6)".into(),
     ];
 
@@ -1162,7 +1163,7 @@ fn generated_open_channel_program_structure() {
 
     // Must end with SendOpenChannel, RecvAcceptChannel.
     assert!(
-        matches!(ops[ops.len() - 2], Operation::SendOpenChannel),
+        matches!(ops[ops.len() - 2], Operation::SendOpenChannel { peer: 0 }),
         "second-to-last instruction should be SendOpenChannel",
     );
     assert!(
@@ -1212,7 +1213,10 @@ fn generated_funding_created_program_structure() {
 
     // Must end with SendFundingCreated, RecvFundingSigned, BroadcastTransaction.
     assert!(
-        matches!(ops[ops.len() - 3], Operation::SendFundingCreated),
+        matches!(
+            ops[ops.len() - 3],
+            Operation::SendFundingCreated { peer: 0 }
+        ),
         "third-to-last instruction should be SendFundingCreated",
     );
     assert!(
@@ -1328,7 +1332,8 @@ fn generated_funding_flow_program_structure() {
     };
 
     let recv_accept_channel = position(|op| matches!(op, Operation::RecvAcceptChannel));
-    let send_funding_created = position(|op| matches!(op, Operation::SendFundingCreated));
+    let send_funding_created =
+        position(|op| matches!(op, Operation::SendFundingCreated { peer: 0 }));
     let recv_funding_signed = position(|op| matches!(op, Operation::RecvFundingSigned));
     let broadcast_transaction = position(|op| matches!(op, Operation::BroadcastTransaction));
     let send_channel_ready = position(|op| matches!(op, Operation::SendChannelReady { .. }));
@@ -1385,7 +1390,7 @@ fn generated_channel_announcement_program_structure() {
     let ops: Vec<_> = program.instructions.iter().map(|i| &i.operation).collect();
 
     assert!(
-        matches!(ops[ops.len() - 1], Operation::SendMessage),
+        matches!(ops[ops.len() - 1], Operation::SendMessage { peer: 0 }),
         "last instruction should be SendMessage",
     );
     let build_count = ops
@@ -1420,7 +1425,7 @@ fn generated_node_announcement_program_structure() {
     let ops: Vec<_> = program.instructions.iter().map(|i| &i.operation).collect();
 
     assert!(
-        matches!(ops[ops.len() - 1], Operation::SendMessage),
+        matches!(ops[ops.len() - 1], Operation::SendMessage { peer: 0 }),
         "last instruction should be SendMessage",
     );
     let build_count = ops
@@ -1468,7 +1473,7 @@ fn generated_channel_update_program_structure() {
     let ops: Vec<_> = program.instructions.iter().map(|i| &i.operation).collect();
 
     assert!(
-        matches!(ops[ops.len() - 1], Operation::SendMessage),
+        matches!(ops[ops.len() - 1], Operation::SendMessage { peer: 0 }),
         "last instruction should be SendMessage",
     );
     let build_count = ops
@@ -1586,7 +1591,8 @@ fn pick_variable_uses_unspent_affine() {
     OpenChannelGenerator.generate(&mut builder, &mut rng);
 
     let msg_idx = builder.pick_variable(VariableType::OpenChannelMessage, &mut rng);
-    let unspent_sent_open_channel = builder.append(Operation::SendOpenChannel, &[msg_idx]);
+    let unspent_sent_open_channel =
+        builder.append(Operation::SendOpenChannel { peer: 0 }, &[msg_idx]);
 
     // pick_variable should prefer an unspent affine variable.
     let idx = builder.pick_variable(VariableType::SentOpenChannel, &mut rng);
@@ -1678,7 +1684,7 @@ fn append_void_reference_panics() {
     let mut rng = SmallRng::seed_from_u64(0);
     let mut builder = ProgramBuilder::new();
     NodeAnnouncementGenerator.generate(&mut builder, &mut rng);
-    builder.append(Operation::SendMessage, &[send_idx]);
+    builder.append(Operation::SendMessage { peer: 0 }, &[send_idx]);
 }
 
 #[test]
@@ -1698,7 +1704,7 @@ fn append_rejects_affine_overuse() {
     OpenChannelGenerator.generate(&mut builder, &mut rng);
 
     let msg_idx = builder.pick_variable(VariableType::OpenChannelMessage, &mut rng);
-    let sent_open_channel = builder.append(Operation::SendOpenChannel, &[msg_idx]);
+    let sent_open_channel = builder.append(Operation::SendOpenChannel { peer: 0 }, &[msg_idx]);
     // Add consecutive `RecvAcceptChannel`s.
     builder.append(Operation::RecvAcceptChannel, &[sent_open_channel]);
     builder.append(Operation::RecvAcceptChannel, &[sent_open_channel]);
@@ -2030,7 +2036,7 @@ fn input_swap_preserves_affine() {
 
     program.instructions.extend([
         Instruction {
-            operation: Operation::SendOpenChannel,
+            operation: Operation::SendOpenChannel { peer: 0 },
             inputs: vec![open_channel_msg],
         },
         Instruction {
@@ -2168,7 +2174,7 @@ fn instr_delete_preserves_affine_producers() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
@@ -2176,7 +2182,7 @@ fn instr_delete_preserves_affine_producers() {
                 inputs: vec![1],
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
@@ -2219,7 +2225,7 @@ fn instr_delete_redirects_affine_consumer() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
@@ -2227,7 +2233,7 @@ fn instr_delete_redirects_affine_consumer() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
@@ -2314,7 +2320,7 @@ fn instr_reorder_returns_false_if_act2_is_past_usage_boundary() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
@@ -2326,7 +2332,7 @@ fn instr_reorder_returns_false_if_act2_is_past_usage_boundary() {
                 inputs: vec![2],
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![0],
             },
         ],
@@ -2348,7 +2354,7 @@ fn instr_reorder_swaps_and_heals() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
@@ -2360,7 +2366,7 @@ fn instr_reorder_swaps_and_heals() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
@@ -2384,7 +2390,10 @@ fn instr_reorder_swaps_and_heals() {
     );
 
     // RecvAcceptChannel and SendMessage should've been swapped.
-    assert_eq!(program.instructions[2].operation, Operation::SendMessage);
+    assert_eq!(
+        program.instructions[2].operation,
+        Operation::SendMessage { peer: 0 }
+    );
     assert_eq!(
         program.instructions[4].operation,
         Operation::RecvAcceptChannel
@@ -2410,7 +2419,7 @@ fn instr_reorder_preserves_well_formedness() {
             inputs: vec![],
         },
         Instruction {
-            operation: Operation::SendOpenChannel,
+            operation: Operation::SendOpenChannel { peer: 0 },
             inputs: vec![open_channel_msg],
         },
         Instruction {
@@ -2663,7 +2672,7 @@ fn dead_code_keeps_send_open_channel() {
     let has_send = program
         .instructions
         .iter()
-        .any(|i| matches!(i.operation, Operation::SendOpenChannel));
+        .any(|i| matches!(i.operation, Operation::SendOpenChannel { peer: 0 }));
     assert!(
         has_send,
         "DeadCodeEliminator must not remove SendOpenChannel"
@@ -2711,7 +2720,7 @@ fn dead_code_reindexes_remaining_inputs() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![2],
             },
         ],
@@ -2724,7 +2733,7 @@ fn dead_code_reindexes_remaining_inputs() {
     ));
     assert!(matches!(
         program.instructions[1].operation,
-        Operation::SendMessage
+        Operation::SendMessage { .. }
     ));
     assert_eq!(program.instructions[1].inputs, vec![0]);
 }
@@ -2753,7 +2762,7 @@ fn dead_code_chains_collapse() {
                 inputs: vec![0],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![1],
             },
         ],
@@ -2769,7 +2778,7 @@ fn dead_code_chains_collapse() {
                 inputs: vec![0],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![1],
             },
         ],
@@ -2845,6 +2854,7 @@ fn dead_code_keeps_referenced_lookup_short_channel_id() {
     instrs.push(Instruction {
         operation: Operation::SendChannelReady {
             include_alias: true,
+            peer: 0,
         },
         inputs: vec![channel_id, point, scid],
     });
@@ -3022,7 +3032,7 @@ fn cse_does_not_merge_send_message() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
@@ -3030,7 +3040,7 @@ fn cse_does_not_merge_send_message() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![2], // canonicalizes to 0
             },
         ],
@@ -3042,15 +3052,80 @@ fn cse_does_not_merge_send_message() {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![0],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![0],
             },
         ],
     };
     assert!(CommonSubexpressionEliminator.minimize(&mut program));
     assert_eq!(program, expected, "SendMessage must not be deduplicated");
+}
+
+#[test]
+fn operation_peer_is_set_for_sends_only() {
+    assert_eq!(Operation::SendMessage { peer: 1 }.peer(), Some(1));
+    assert_eq!(Operation::SendOpenChannel { peer: 0 }.peer(), Some(0));
+    assert_eq!(Operation::SendFundingCreated { peer: 1 }.peer(), Some(1));
+    assert_eq!(
+        Operation::SendChannelReady {
+            include_alias: false,
+            peer: 1,
+        }
+        .peer(),
+        Some(1)
+    );
+    assert_eq!(Operation::SendShutdown { peer: 0 }.peer(), Some(0));
+    assert_eq!(Operation::RecvAcceptChannel.peer(), None);
+    assert_eq!(Operation::MineBlocks(1).peer(), None);
+}
+
+#[test]
+fn generators_only_address_connected_peers() {
+    for seed in 0..100 {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        for generator in AnyGenerator::ALL {
+            let mut builder = ProgramBuilder::new();
+            generator.generate(&mut builder, &mut rng);
+            for instr in &builder.build().instructions {
+                if let Some(peer) = instr.operation.peer() {
+                    assert!(
+                        peer < PEER_COUNT,
+                        "{:?} addresses unconnected peer {peer}",
+                        instr.operation
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pick_peer_stays_in_range() {
+    let mut rng = SmallRng::seed_from_u64(7);
+    let mut builder = ProgramBuilder::new();
+    for _ in 0..100 {
+        assert!(builder.pick_peer(&mut rng) < PEER_COUNT);
+    }
+}
+
+#[test]
+fn postcard_roundtrip_preserves_peer() {
+    let program = Program {
+        instructions: vec![
+            Instruction {
+                operation: Operation::LoadBytes(vec![0x00, 0x10]),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::SendMessage { peer: 1 },
+                inputs: vec![0],
+            },
+        ],
+    };
+    let bytes = postcard::to_allocvec(&program).unwrap();
+    assert_eq!(postcard::from_bytes::<Program>(&bytes).unwrap(), program);
 }

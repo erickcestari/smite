@@ -227,9 +227,6 @@ pub enum ExecuteError {
     Violation(#[from] Violation),
 }
 
-/// Peer every operation runs on until IR operations carry a peer index.
-const SINGLE_PEER: u8 = 0;
-
 /// State of one fuzzer peer: its connection and the channels negotiated on it.
 ///
 /// Channel bookkeeping lives here rather than on the executor because the
@@ -368,6 +365,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
     ///   inside the encoder)
     /// - `LoadPrivateKey` whose bytes are all-zero or >= the secp256k1 curve
     ///   order (probability ~2^-128 for uniform random input)
+    /// - a `Send*` operation addressing a peer with no connection
     #[allow(clippy::too_many_lines)]
     pub fn execute(
         &mut self,
@@ -465,7 +463,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                 }
 
                 // -- Act operations --
-                Operation::SendMessage => {
+                Operation::SendMessage { peer } => {
                     let bytes = resolve_message(&variables, instr.inputs[0]);
                     let ty = u16::from_be_bytes(
                         *bytes
@@ -473,33 +471,31 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                             .expect("encoded message has a 2-byte type prefix"),
                     );
                     log::debug!(
-                        "[{:?}] SendMessage: {}, {} bytes",
+                        "[{:?}] SendMessage(peer {peer}): {}, {} bytes",
                         start.elapsed(),
                         MessageType::from_u16(ty),
                         bytes.len(),
                     );
-                    peer_mut(&mut self.peers, SINGLE_PEER)
-                        .conn
-                        .send_message(bytes)?;
+                    peer_mut(&mut self.peers, *peer).conn.send_message(bytes)?;
                     None
                 }
 
-                Operation::SendOpenChannel => {
+                Operation::SendOpenChannel { peer } => {
                     let oc = resolve_open_channel_message(&variables, instr.inputs[0]);
-                    let p = peer_mut(&mut self.peers, SINGLE_PEER);
+                    let p = peer_mut(&mut self.peers, *peer);
                     record_send_open_channel(&mut p.negotiations, oc);
                     let encoded = Message::OpenChannel(oc.clone()).encode();
                     log::debug!(
-                        "[{:?}] SendOpenChannel: {} bytes",
+                        "[{:?}] SendOpenChannel(peer {peer}): {} bytes",
                         start.elapsed(),
                         encoded.len(),
                     );
                     p.conn.send_message(&encoded)?;
-                    Some(Variable::SentOpenChannel)
+                    Some(Variable::SentOpenChannel { peer: *peer })
                 }
 
-                Operation::SendFundingCreated => {
-                    let p = peer_mut(&mut self.peers, SINGLE_PEER);
+                Operation::SendFundingCreated { peer } => {
+                    let p = peer_mut(&mut self.peers, *peer);
                     let fc = build_funding_created(
                         &variables,
                         &instr.inputs,
@@ -509,16 +505,19 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                     )?;
                     let encoded = Message::FundingCreated(fc).encode();
                     log::debug!(
-                        "[{:?}] SendFundingCreated: {} bytes",
+                        "[{:?}] SendFundingCreated(peer {peer}): {} bytes",
                         start.elapsed(),
                         encoded.len(),
                     );
                     p.conn.send_message(&encoded)?;
-                    Some(Variable::SentFundingCreated)
+                    Some(Variable::SentFundingCreated { peer: *peer })
                 }
 
-                Operation::SendChannelReady { include_alias } => {
-                    let p = peer_mut(&mut self.peers, SINGLE_PEER);
+                Operation::SendChannelReady {
+                    include_alias,
+                    peer,
+                } => {
+                    let p = peer_mut(&mut self.peers, *peer);
                     let cr = build_channel_ready(
                         &variables,
                         &instr.inputs,
@@ -527,7 +526,7 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                     );
                     let encoded = Message::ChannelReady(cr).encode();
                     log::debug!(
-                        "[{:?}] SendChannelReady: {} bytes",
+                        "[{:?}] SendChannelReady(peer {peer}): {} bytes",
                         start.elapsed(),
                         encoded.len(),
                     );
@@ -535,26 +534,32 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                     None
                 }
 
-                Operation::SendShutdown => {
+                Operation::SendShutdown { peer } => {
                     let sd = build_shutdown(&variables, &instr.inputs);
                     let encoded = Message::Shutdown(sd).encode();
                     log::debug!(
-                        "[{:?}] SendShutdown: {} bytes",
+                        "[{:?}] SendShutdown(peer {peer}): {} bytes",
                         start.elapsed(),
                         encoded.len()
                     );
-                    peer_mut(&mut self.peers, SINGLE_PEER)
+                    peer_mut(&mut self.peers, *peer)
                         .conn
                         .send_message(&encoded)?;
-                    Some(Variable::SentShutdown)
+                    Some(Variable::SentShutdown { peer: *peer })
                 }
 
                 Operation::RecvAcceptChannel => {
-                    consume_sent_open_channel(&mut variables, instr.inputs[0]);
-                    let p = peer_mut(&mut self.peers, SINGLE_PEER);
-                    log::debug!("[{:?}] RecvAcceptChannel: waiting", start.elapsed());
-                    let ac = recv_accept_channel(&mut p.conn, SINGLE_PEER)?;
-                    log::debug!("[{:?}] RecvAcceptChannel: received", start.elapsed());
+                    let peer = consume_sent_open_channel(&mut variables, instr.inputs[0]);
+                    let p = peer_mut(&mut self.peers, peer);
+                    log::debug!(
+                        "[{:?}] RecvAcceptChannel(peer {peer}): waiting",
+                        start.elapsed()
+                    );
+                    let ac = recv_accept_channel(&mut p.conn, peer)?;
+                    log::debug!(
+                        "[{:?}] RecvAcceptChannel(peer {peer}): received",
+                        start.elapsed()
+                    );
                     AcceptChannelOracle.evaluate(&AcceptChannelContext {
                         accept_channel: &ac,
                         negotiation: p.negotiations.get(&ac.temporary_channel_id),
@@ -564,11 +569,17 @@ impl<C: Connection, B: BitcoinRpc> Executor<C, B> {
                 }
 
                 Operation::RecvFundingSigned => {
-                    consume_sent_funding_created(&mut variables, instr.inputs[0]);
-                    let p = peer_mut(&mut self.peers, SINGLE_PEER);
-                    log::debug!("[{:?}] RecvFundingSigned: waiting", start.elapsed());
-                    let fs = recv_funding_signed(&mut p.conn, SINGLE_PEER)?;
-                    log::debug!("[{:?}] RecvFundingSigned: received", start.elapsed());
+                    let peer = consume_sent_funding_created(&mut variables, instr.inputs[0]);
+                    let p = peer_mut(&mut self.peers, peer);
+                    log::debug!(
+                        "[{:?}] RecvFundingSigned(peer {peer}): waiting",
+                        start.elapsed()
+                    );
+                    let fs = recv_funding_signed(&mut p.conn, peer)?;
+                    log::debug!(
+                        "[{:?}] RecvFundingSigned(peer {peer}): received",
+                        start.elapsed()
+                    );
                     verify_funding_signed(&fs, &p.channel_states)?;
                     Some(Variable::ChannelId(fs.channel_id))
                 }
@@ -846,11 +857,14 @@ fn resolve_funding_transaction(
     }
 }
 
-fn consume_sent_open_channel(variables: &mut [Option<Variable>], index: usize) {
+/// Consumes the affine `SentOpenChannel` at `index`, returning the fuzzer
+/// peer the `open_channel` was sent to.
+fn consume_sent_open_channel(variables: &mut [Option<Variable>], index: usize) -> u8 {
     match resolve(variables, index) {
-        Variable::SentOpenChannel => {
-            // Consume the affine `SentOpenChannel`.
+        Variable::SentOpenChannel { peer } => {
+            let peer = *peer;
             variables[index] = None;
+            peer
         }
         other => panic!(
             "variable {index}: expected SentOpenChannel, got {:?}",
@@ -859,11 +873,14 @@ fn consume_sent_open_channel(variables: &mut [Option<Variable>], index: usize) {
     }
 }
 
-fn consume_sent_funding_created(variables: &mut [Option<Variable>], index: usize) {
+/// Consumes the affine `SentFundingCreated` at `index`, returning the fuzzer
+/// peer the `funding_created` was sent to.
+fn consume_sent_funding_created(variables: &mut [Option<Variable>], index: usize) -> u8 {
     match resolve(variables, index) {
-        Variable::SentFundingCreated => {
-            // Consume the affine `SentFundingCreated`.
+        Variable::SentFundingCreated { peer } => {
+            let peer = *peer;
             variables[index] = None;
+            peer
         }
         other => panic!(
             "variable {index}: expected SentFundingCreated, got {:?}",
@@ -1894,7 +1911,7 @@ mod tests {
                 ],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![base + 6],
             },
         ]
@@ -1923,7 +1940,7 @@ mod tests {
                 inputs: (0..20).collect(),
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![20],
             },
         ]);
@@ -1941,7 +1958,7 @@ mod tests {
             inputs: (0..20).collect(),
         });
         instrs.push(Instruction {
-            operation: Operation::SendOpenChannel,
+            operation: Operation::SendOpenChannel { peer: 0 },
             inputs: vec![20],
         });
 
@@ -2024,7 +2041,7 @@ mod tests {
                 inputs: vec![0, 1, 2, 3, 4, 5, 6],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![7],
             },
         ];
@@ -2092,7 +2109,7 @@ mod tests {
                 inputs: vec![0, 1, 2, 3],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![4],
             },
         ];
@@ -2184,7 +2201,7 @@ mod tests {
                 inputs: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![11],
             },
         ];
@@ -2295,7 +2312,7 @@ mod tests {
                 inputs: vec![0, 1, 2, 3, 4, 6, 7, 9],
             },
             Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![10],
             },
         ];
@@ -2390,7 +2407,7 @@ mod tests {
             inputs: (0..20).collect(),
         });
         instrs.push(Instruction {
-            operation: Operation::SendOpenChannel,
+            operation: Operation::SendOpenChannel { peer: 0 },
             inputs: vec![20],
         });
 
@@ -2439,7 +2456,7 @@ mod tests {
             inputs: build_inputs,
         });
         instrs.push(Instruction {
-            operation: Operation::SendOpenChannel,
+            operation: Operation::SendOpenChannel { peer: 0 },
             inputs: vec![base + 20],
         });
 
@@ -2576,6 +2593,158 @@ mod tests {
             .execute(&program, std::time::Instant::now())
             .unwrap_err();
         assert!(matches!(err, ExecuteError::PeerError { peer: 0, error } if error == peer_error));
+    }
+
+    fn two_peer_executor() -> Executor<MockConnection, MockBitcoinCli> {
+        Executor::new(
+            vec![MockConnection::new(), MockConnection::new()],
+            MockBitcoinCli::default(),
+            sample_context(),
+        )
+    }
+
+    /// `open_channel` inputs, `BuildOpenChannel`, and `SendOpenChannel` on
+    /// `peer`. Returns the instructions and the index of the sent token.
+    fn send_open_channel_on_peer_instructions(peer: u8) -> (Vec<Instruction>, usize) {
+        let mut instrs = open_channel_instructions();
+        instrs.push(Instruction {
+            operation: Operation::BuildOpenChannel,
+            inputs: (0..20).collect(),
+        });
+        let sent = instrs.len();
+        instrs.push(Instruction {
+            operation: Operation::SendOpenChannel { peer },
+            inputs: vec![20],
+        });
+        (instrs, sent)
+    }
+
+    #[test]
+    fn execute_send_open_channel_uses_addressed_peer() {
+        let (instrs, _) = send_open_channel_on_peer_instructions(1);
+        let mut executor = two_peer_executor();
+        executor
+            .execute(
+                &Program {
+                    instructions: instrs,
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+
+        assert!(executor.peers[0].conn.sent.is_empty());
+        assert_eq!(executor.peers[1].conn.sent.len(), 1);
+        assert!(executor.peers[0].negotiations.is_empty());
+        assert!(
+            executor.peers[1]
+                .negotiations
+                .contains_key(&ChannelId::new([0xbb; 32]))
+        );
+    }
+
+    #[test]
+    fn execute_recv_accept_channel_reads_from_sending_peer() {
+        let ac_bytes = Message::AcceptChannel(sample_accept_channel()).encode();
+        let (mut instrs, sent) = send_open_channel_on_peer_instructions(1);
+        instrs.push(Instruction {
+            operation: Operation::RecvAcceptChannel,
+            inputs: vec![sent],
+        });
+        let mut executor = two_peer_executor();
+        // Only peer 1 has a message queued: reading from peer 0 would fail.
+        executor.peers[1].conn.queue_recv(ac_bytes);
+        executor
+            .execute(
+                &Program {
+                    instructions: instrs,
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+
+        let pending = executor.peers[1]
+            .negotiations
+            .get(&ChannelId::new([0xbb; 32]))
+            .unwrap();
+        assert!(pending.accept_channel.is_some());
+        assert!(executor.peers[0].negotiations.is_empty());
+    }
+
+    #[test]
+    fn execute_scopes_negotiations_per_peer() {
+        // The same temporary_channel_id opened on two peers is two unrelated
+        // channels for the target, so it is not a reuse violation.
+        let ac_bytes = Message::AcceptChannel(sample_accept_channel()).encode();
+        let (mut instrs, sent_on_0) = send_open_channel_on_peer_instructions(0);
+        instrs.push(Instruction {
+            operation: Operation::RecvAcceptChannel,
+            inputs: vec![sent_on_0],
+        });
+        let sent_on_1 = instrs.len();
+        instrs.push(Instruction {
+            operation: Operation::SendOpenChannel { peer: 1 },
+            inputs: vec![20],
+        });
+        instrs.push(Instruction {
+            operation: Operation::RecvAcceptChannel,
+            inputs: vec![sent_on_1],
+        });
+        let mut executor = two_peer_executor();
+        executor.peers[0].conn.queue_recv(ac_bytes.clone());
+        executor.peers[1].conn.queue_recv(ac_bytes);
+        executor
+            .execute(
+                &Program {
+                    instructions: instrs,
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+
+        for peer in &executor.peers {
+            let pending = peer.negotiations.get(&ChannelId::new([0xbb; 32])).unwrap();
+            assert!(pending.accept_channel.is_some());
+        }
+    }
+
+    #[test]
+    fn execute_peer_error_names_the_peer() {
+        let peer_error = smite::bolt::Error::all_channels("no thanks");
+        let (mut instrs, sent) = send_open_channel_on_peer_instructions(1);
+        instrs.push(Instruction {
+            operation: Operation::RecvAcceptChannel,
+            inputs: vec![sent],
+        });
+        let mut executor = two_peer_executor();
+        executor.peers[1]
+            .conn
+            .queue_recv(Message::Error(peer_error.clone()).encode());
+        let err = executor
+            .execute(
+                &Program {
+                    instructions: instrs,
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ExecuteError::PeerError { peer: 1, error } if error == peer_error));
+    }
+
+    #[test]
+    #[should_panic(expected = "peer 1 out of range (have 1)")]
+    fn execute_send_to_unconnected_peer_panics() {
+        let (instrs, _) = send_open_channel_on_peer_instructions(1);
+        let mut executor = Executor::new(
+            vec![MockConnection::new()],
+            MockBitcoinCli::default(),
+            sample_context(),
+        );
+        let _ = executor.execute(
+            &Program {
+                instructions: instrs,
+            },
+            std::time::Instant::now(),
+        );
     }
 
     #[test]
@@ -2808,7 +2977,7 @@ mod tests {
         });
         let resent_open_channel = instrs.len();
         instrs.push(Instruction {
-            operation: Operation::SendOpenChannel,
+            operation: Operation::SendOpenChannel { peer: 0 },
             inputs: vec![built_open_channel],
         });
         instrs.push(Instruction {
@@ -2864,7 +3033,7 @@ mod tests {
             inputs: build_inputs,
         });
         instrs.push(Instruction {
-            operation: Operation::SendOpenChannel,
+            operation: Operation::SendOpenChannel { peer: 0 },
             inputs: vec![built],
         });
 
@@ -2992,7 +3161,7 @@ mod tests {
     fn execute_variable_out_of_bounds_panics() {
         let program = Program {
             instructions: vec![Instruction {
-                operation: Operation::SendMessage,
+                operation: Operation::SendMessage { peer: 0 },
                 inputs: vec![99],
             }],
         };
@@ -3038,7 +3207,7 @@ mod tests {
                 },
                 // Try to use the void variable.
                 Instruction {
-                    operation: Operation::SendMessage,
+                    operation: Operation::SendMessage { peer: 0 },
                     inputs: vec![0],
                 },
             ],
@@ -3083,7 +3252,7 @@ mod tests {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendOpenChannel,
+                operation: Operation::SendOpenChannel { peer: 0 },
                 inputs: vec![0],
             },
         ];
@@ -3460,7 +3629,7 @@ mod tests {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendFundingCreated,
+                operation: Operation::SendFundingCreated { peer: 0 },
                 inputs: vec![6, 0, 8],
             },
             Instruction {
@@ -3649,7 +3818,7 @@ mod tests {
                 inputs: vec![1, 1, 4, 5],
             },
             Instruction {
-                operation: Operation::SendFundingCreated,
+                operation: Operation::SendFundingCreated { peer: 0 },
                 inputs: vec![10, 0, 8],
             },
         ]);
@@ -3911,12 +4080,14 @@ mod tests {
             Instruction {
                 operation: Operation::SendChannelReady {
                     include_alias: false,
+                    peer: 0,
                 },
                 inputs: vec![10, 1, 11],
             },
             Instruction {
                 operation: Operation::SendChannelReady {
                     include_alias: true,
+                    peer: 0,
                 },
                 inputs: vec![10, 3, 11],
             },
@@ -4002,7 +4173,7 @@ mod tests {
                     inputs: vec![],
                 },
                 Instruction {
-                    operation: Operation::SendShutdown,
+                    operation: Operation::SendShutdown { peer: 0 },
                     inputs: vec![0, 1],
                 },
             ],
@@ -4042,7 +4213,7 @@ mod tests {
                     inputs: vec![],
                 },
                 Instruction {
-                    operation: Operation::SendShutdown,
+                    operation: Operation::SendShutdown { peer: 0 },
                     inputs: vec![0, 1],
                 },
             ],
@@ -4109,6 +4280,79 @@ mod tests {
             .insert(ChannelId::new([0xbb; 32]), sample_funding_negotiation());
 
         (executor, channel_id, target_pcp)
+    }
+
+    #[test]
+    fn execute_recv_channel_ready_polls_the_peer_that_owes_one() {
+        // Same fixture as `recv_channel_ready_executor`, but the channel is
+        // negotiated on peer 1 while peer 0 has nothing queued.
+        let channel_id = ChannelId::v1_from_funding_outpoint(OutPoint {
+            txid: "09b0549b35f14ee862f63bd75811c6c27963c4dea6766ec6836952ec78df1e7e"
+                .parse()
+                .unwrap(),
+            vout: 0,
+        });
+        let mock_cli = MockBitcoinCli {
+            utxos: vec![sample_utxo()],
+            change_spk: sample_change_spk(),
+            ..Default::default()
+        };
+        let fs_bytes = Message::FundingSigned(FundingSigned {
+            channel_id,
+            signature: "304402203dbf3dbf337b042a72576488c1fb019086089d8d790a47f652346cff2511b6e70220395fdf700cb82b0abfcfe8e0b7c822181f2ee72409c82c3ff8e04e36593662c7".parse().unwrap(),
+        })
+        .encode();
+        let target_pcp = sample_pubkey(1);
+        let cr_bytes = Message::ChannelReady(ChannelReady {
+            channel_id,
+            second_per_commitment_point: target_pcp,
+            tlvs: ChannelReadyTlvs::default(),
+        })
+        .encode();
+
+        let mut executor = Executor::new(
+            vec![MockConnection::new(), MockConnection::new()],
+            mock_cli,
+            sample_context(),
+        );
+        executor.peers[1].conn.queue_recv(fs_bytes);
+        executor.peers[1].conn.queue_recv(cr_bytes);
+        executor.peers[1]
+            .negotiations
+            .insert(ChannelId::new([0xbb; 32]), sample_funding_negotiation());
+
+        let mut instrs = send_funding_created_and_recv_funding_signed_instructions();
+        for instr in &mut instrs {
+            if let Operation::SendFundingCreated { peer } = &mut instr.operation {
+                *peer = 1;
+            }
+        }
+        instrs.extend([
+            Instruction {
+                operation: Operation::MineBlocks(8),
+                inputs: vec![],
+            },
+            Instruction {
+                operation: Operation::RecvChannelReady,
+                inputs: vec![],
+            },
+        ]);
+        executor
+            .execute(
+                &Program {
+                    instructions: instrs,
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+
+        assert!(executor.peers[0].channel_states.is_empty());
+        assert!(executor.peers[1].conn.recv_queue.is_empty());
+        let state = executor.peers[1].channel_states.get(&channel_id).unwrap();
+        assert_eq!(
+            *state.next_counterparty_per_commitment_point(),
+            Some(target_pcp)
+        );
     }
 
     #[test]
@@ -4266,7 +4510,7 @@ mod tests {
                 inputs: vec![],
             },
             Instruction {
-                operation: Operation::SendFundingCreated,
+                operation: Operation::SendFundingCreated { peer: 0 },
                 inputs: vec![6, 0, 9],
             },
             Instruction {
