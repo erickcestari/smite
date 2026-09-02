@@ -13,8 +13,8 @@ use super::{PingOutcome, SnapshotSetup, is_known_parked_error, ping_pong_checked
 use crate::executor::{ExecuteError, Executor};
 use crate::targets::Target;
 
-/// Scenario that executes IR programs against a target over an encrypted
-/// connection established by `S`.
+/// Scenario that executes IR programs against a target over encrypted
+/// connections, one per fuzzer peer, established by `S`.
 ///
 /// The program is expected to be well-formed and produced by `smite-ir`'s
 /// mutators or generators; the executor panics on invariant violations
@@ -32,9 +32,9 @@ pub struct IrScenario<T: Target, S: SnapshotSetup<T>> {
 impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
     fn new(_args: &[String]) -> Result<Self, ScenarioError> {
         let target = T::start(T::Config::default())?;
-        let (conn, context) = S::setup(&target)?;
+        let (conns, context) = S::setup(&target)?;
         let bitcoin_cli = target.bitcoin_cli().clone();
-        let executor = Executor::new(vec![conn], bitcoin_cli, context);
+        let executor = Executor::new(conns, bitcoin_cli, context);
         Ok(Self {
             target,
             executor,
@@ -57,9 +57,10 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
             input.len(),
         );
 
-        // Set when the target has sent an error after which it is known to not
-        // service this connection any further. See `is_known_parked_error`.
-        let mut parked = false;
+        // Peer on whose connection the target sent an error after which it is
+        // known to not service that connection any further. See
+        // `is_known_parked_error`.
+        let mut parked: Option<u8> = None;
 
         match self.executor.execute(&program, start) {
             Ok(()) => {
@@ -79,9 +80,12 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
             }
             Err(ExecuteError::PeerError { peer, error }) => {
                 // Normal protocol behavior: the target rejected our input.
-                parked = is_known_parked_error(&error);
+                let is_parked = is_known_parked_error(&error);
+                if is_parked {
+                    parked = Some(peer);
+                }
                 log::debug!(
-                    "[{:?}] peer {peer} error (parked: {parked}): {}",
+                    "[{:?}] peer {peer} error (parked: {is_parked}): {}",
                     start.elapsed(),
                     error.message().unwrap_or("<non-utf8>"),
                 );
@@ -116,25 +120,33 @@ impl<T: Target, S: SnapshotSetup<T>> Scenario for IrScenario<T, S> {
             }
         }
 
-        // Ping-pong sync to ensure the target has at least done the initial
-        // processing of all previous messages. Timeouts here signal a hang,
-        // unless we know the connection has been parked by the target, in which
-        // case we continue without requiring a pong.
-        if parked {
-            log::info!(
-                "[{:?}] connection parked by target, skipping ping-pong",
-                start.elapsed()
-            );
-        } else {
-            match ping_pong_checked(self.executor.conn_mut(0)) {
+        // Ping-pong sync on every peer to ensure the target has at least done
+        // the initial processing of all previous messages. Timeouts here signal
+        // a hang, unless we know the target has parked that connection, in
+        // which case no pong is coming and we continue without one.
+        for peer in 0..self.executor.peer_count() {
+            if parked == Some(peer) {
+                log::info!(
+                    "[{:?}] peer {peer} parked by target, skipping ping-pong",
+                    start.elapsed()
+                );
+                continue;
+            }
+            match ping_pong_checked(self.executor.conn_mut(peer)) {
                 Ok(PingOutcome::Pong) => {
-                    log::debug!("[{:?}] Target responded with pong", start.elapsed());
+                    log::debug!(
+                        "[{:?}] peer {peer}: target responded with pong",
+                        start.elapsed()
+                    );
                 }
                 Ok(PingOutcome::ParkedConnection(msg)) => {
-                    log::info!("[{:?}] connection parked by target: {msg}", start.elapsed());
+                    log::info!(
+                        "[{:?}] peer {peer} parked by target: {msg}",
+                        start.elapsed()
+                    );
                 }
                 Err(e) => {
-                    log::debug!("[{:?}] ping_pong: {e}", start.elapsed());
+                    log::debug!("[{:?}] peer {peer} ping_pong: {e}", start.elapsed());
                     if e.is_timeout() {
                         return ScenarioResult::Fail(Violation::Hung.to_string());
                     }

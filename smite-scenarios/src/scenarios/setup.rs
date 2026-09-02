@@ -5,6 +5,7 @@ use std::time::Duration;
 use smite::bolt::{Init, InitTlvs, Message};
 use smite::noise::NoiseConnection;
 use smite::scenarios::ScenarioError;
+use smite_ir::PEER_COUNT;
 
 use super::{handshake_with_target, ping_pong};
 use crate::executor::ProgramContext;
@@ -18,16 +19,18 @@ pub const REGTEST_CHAIN_HASH: [u8; 32] = [
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Pre-snapshot setup that establishes a ready-to-use connection and produces
-/// the [`ProgramContext`] an IR program will read at execution time. Called
-/// once from `IrScenario::new()` before the Nyx snapshot is taken.
+/// Pre-snapshot setup that establishes one ready-to-use connection per fuzzer
+/// peer and produces the [`ProgramContext`] an IR program will read at
+/// execution time. Called once from `IrScenario::new()` before the Nyx
+/// snapshot is taken.
 pub trait SnapshotSetup<T: Target> {
-    /// Execute the setup and return the connection and context.
+    /// Execute the setup and return the connections, indexed by peer and
+    /// exactly [`PEER_COUNT`] long, together with the context.
     ///
     /// # Errors
     ///
     /// Setup-specific; propagated to the scenario's `new()`.
-    fn setup(target: &T) -> Result<(NoiseConnection, ProgramContext), ScenarioError>;
+    fn setup(target: &T) -> Result<(Vec<NoiseConnection>, ProgramContext), ScenarioError>;
 }
 
 /// Clears a feature bit from a feature vector.
@@ -77,22 +80,40 @@ fn init_for_single_funded(received: &Init) -> Init {
     }
 }
 
+/// Connects fuzzer peer `peer` and completes the init exchange, returning the
+/// connection and the target's `init`.
+fn connect_post_init<T: Target>(
+    target: &T,
+    peer: u8,
+) -> Result<(NoiseConnection, Init), ScenarioError> {
+    let (mut conn, target_init) = handshake_with_target(target, peer, TIMEOUT)?;
+
+    // Echo features but strip the bits that would take us off the
+    // single-funded `open_channel` path this setup is built for.
+    let our_init = init_for_single_funded(&target_init);
+    conn.send_message(&Message::Init(our_init).encode())?;
+
+    // Drain any remaining post-init noise so the snapshot starts with a
+    // clean connection.
+    ping_pong(&mut conn)?;
+
+    Ok((conn, target_init))
+}
+
 /// Setup that snapshots just after the Noise handshake and init exchange are
-/// complete.
+/// complete on every fuzzer peer.
 pub struct PostInitSetup;
 
 impl<T: Target> SnapshotSetup<T> for PostInitSetup {
-    fn setup(target: &T) -> Result<(NoiseConnection, ProgramContext), ScenarioError> {
-        let (mut conn, target_init) = handshake_with_target(target, 0, TIMEOUT)?;
-
-        // Echo features but strip the bits that would take us off the
-        // single-funded `open_channel` path this setup is built for.
-        let our_init = init_for_single_funded(&target_init);
-        conn.send_message(&Message::Init(our_init).encode())?;
-
-        // Drain any remaining post-init noise so the snapshot starts with a
-        // clean connection.
-        ping_pong(&mut conn)?;
+    fn setup(target: &T) -> Result<(Vec<NoiseConnection>, ProgramContext), ScenarioError> {
+        // Peer 0's init describes the target for the context; the target
+        // advertises the same features to every peer. Peers connect one after
+        // another so each connection is fully settled before the next starts.
+        let (conn, target_init) = connect_post_init(target, 0)?;
+        let mut conns = vec![conn];
+        for peer in 1..PEER_COUNT {
+            conns.push(connect_post_init(target, peer)?.0);
+        }
 
         let context = ProgramContext {
             target_pubkey: *target.pubkey(),
@@ -104,6 +125,6 @@ impl<T: Target> SnapshotSetup<T> for PostInitSetup {
             target_features: target_init.features,
         };
 
-        Ok((conn, context))
+        Ok((conns, context))
     }
 }

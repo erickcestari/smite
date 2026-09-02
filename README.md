@@ -72,6 +72,14 @@ AFL_FRAMESHIFT_DISABLE=1 \
 `AFL_CUSTOM_MUTATOR_ONLY=1` disables AFL++'s built-in mutators (which would
 corrupt the postcard encoding).
 
+Before the snapshot the scenario opens `smite_ir::PEER_COUNT` Noise connections
+to the target, each with its own node id, so a program can drive several peers
+at once. Every `Send*` operation names the peer it goes out on (`smitebot
+print-ir` shows it as `SendOpenChannel{peer=1}`), while `Recv*` operations read
+from the peer the request was sent to. The mutator library and the scenario
+binary must be built from the same commit so they agree on `PEER_COUNT` and the
+program encoding.
+
 ## Running Modes
 
 ### Nyx Mode

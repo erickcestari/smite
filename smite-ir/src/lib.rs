@@ -18,7 +18,8 @@
 /// Read by generators and mutators in the AFL++ process and by the scenario
 /// inside the VM, so both must be built from the same commit. The executor
 /// panics on a `peer` index without a connection.
-pub const PEER_COUNT: u8 = 1;
+pub const PEER_COUNT: u8 = 2;
+const _: () = assert!(PEER_COUNT >= 1, "the snapshot setup needs a peer");
 
 pub mod builder;
 pub mod generators;

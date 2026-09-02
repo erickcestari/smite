@@ -3129,3 +3129,98 @@ fn postcard_roundtrip_preserves_peer() {
     let bytes = postcard::to_allocvec(&program).unwrap();
     assert_eq!(postcard::from_bytes::<Program>(&bytes).unwrap(), program);
 }
+
+#[test]
+fn generators_address_every_peer() {
+    let mut seen = vec![false; usize::from(PEER_COUNT)];
+    for seed in 0..100 {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        for generator in AnyGenerator::ALL {
+            let mut builder = ProgramBuilder::new();
+            generator.generate(&mut builder, &mut rng);
+            for instr in &builder.build().instructions {
+                if let Some(peer) = instr.operation.peer() {
+                    seen[usize::from(peer)] = true;
+                }
+            }
+        }
+    }
+    assert!(seen.iter().all(|&s| s), "unused peers: {seen:?}");
+}
+
+#[test]
+fn pick_peer_prefers_the_last_sent_peer() {
+    let mut rng = SmallRng::seed_from_u64(11);
+    let mut builder = ProgramBuilder::new();
+    let channel_id = builder.append(Operation::LoadChannelId([0x11; 32]), &[]);
+    let script = builder.append(Operation::LoadBytes(vec![]), &[]);
+    builder.append(Operation::SendShutdown { peer: 1 }, &[channel_id, script]);
+
+    let sticky = (0..200)
+        .filter(|_| builder.pick_peer(&mut rng) == 1)
+        .count();
+    // 75% by construction; leave slack for the seed.
+    assert!(
+        (120..=180).contains(&sticky),
+        "picked peer 1 {sticky} times"
+    );
+}
+
+#[test]
+fn param_mutator_moves_send_to_another_peer() {
+    let program = Program {
+        instructions: vec![Instruction {
+            operation: Operation::SendMessage { peer: 0 },
+            inputs: vec![],
+        }],
+    };
+    let mutator = OperationParamMutator;
+    let mut rng = SmallRng::seed_from_u64(5);
+    for _ in 0..50 {
+        let mut mutated = program.clone();
+        assert!(mutator.mutate(&mut mutated, &mut rng));
+        match mutated.instructions[0].operation {
+            Operation::SendMessage { peer } => {
+                assert_ne!(peer, 0, "mutation did not change the peer");
+                assert!(peer < PEER_COUNT);
+            }
+            ref other => panic!("OperationParamMutator changed the operation type: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn param_mutator_changes_one_channel_ready_param_at_a_time() {
+    let program = Program {
+        instructions: vec![Instruction {
+            operation: Operation::SendChannelReady {
+                include_alias: false,
+                peer: 0,
+            },
+            inputs: vec![],
+        }],
+    };
+    let mutator = OperationParamMutator;
+    let mut rng = SmallRng::seed_from_u64(9);
+    let (mut alias_flips, mut peer_moves) = (0, 0);
+    for _ in 0..100 {
+        let mut mutated = program.clone();
+        assert!(mutator.mutate(&mut mutated, &mut rng));
+        let Operation::SendChannelReady {
+            include_alias,
+            peer,
+        } = mutated.instructions[0].operation
+        else {
+            panic!("OperationParamMutator changed the operation type");
+        };
+        match (include_alias, peer) {
+            (true, 0) => alias_flips += 1,
+            (false, p) if p != 0 && p < PEER_COUNT => peer_moves += 1,
+            other => panic!("unexpected mutation {other:?}"),
+        }
+    }
+    assert!(
+        alias_flips > 0 && peer_moves > 0,
+        "{alias_flips} flips, {peer_moves} moves"
+    );
+}
