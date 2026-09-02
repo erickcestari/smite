@@ -19,6 +19,7 @@ pub mod minimizers;
 pub mod mutators;
 pub mod operation;
 pub mod program;
+mod stable_enum;
 pub mod variable;
 
 pub use builder::ProgramBuilder;

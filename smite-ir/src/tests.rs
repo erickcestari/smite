@@ -3054,3 +3054,25 @@ fn cse_does_not_merge_send_message() {
     assert!(CommonSubexpressionEliminator.minimize(&mut program));
     assert_eq!(program, expected, "SendMessage must not be deduplicated");
 }
+
+#[test]
+fn stable_tags_pin_wire_format() {
+    let enc = |op: Operation| postcard::to_allocvec(&op).expect("encode");
+    assert_eq!(enc(Operation::LookupShortChannelId), [34]);
+    assert_eq!(enc(Operation::MineBlocks(3)), [32, 3]);
+    assert_eq!(
+        enc(Operation::SendChannelReady {
+            include_alias: true
+        }),
+        [27, 1]
+    );
+    let script = ShutdownScriptVariant::AnySegwit {
+        version: 1,
+        program: vec![7, 8],
+    };
+    assert_eq!(
+        enc(Operation::LoadShutdownScript(script)),
+        [12, 5, 1, 2, 7, 8]
+    );
+    assert!(postcard::from_bytes::<Operation>(&[35]).is_err());
+}

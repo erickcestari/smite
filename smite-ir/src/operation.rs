@@ -11,286 +11,290 @@
 use std::fmt;
 use std::fmt::Write;
 
+use crate::stable_enum::stable_enum;
 use bitcoin::{opcodes::all as opcodes, script::Builder, script::PushBytes};
 use rand::{Rng, RngExt};
-use serde::{Deserialize, Serialize};
 use smite::bolt::{FeatureBit, Features, ShortChannelId};
 
 use super::VariableType;
 
-/// An IR operation.  Each instruction in a program contains one operation plus
-/// input variable indices.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Operation {
-    // -- Load: produce a variable from an embedded literal or the context --
-    /// Load a satoshi or millisatoshi amount.
-    LoadAmount(u64),
-    /// Load a BOLT 7 `short_channel_id` in its packed `u64` form
-    /// (`(block << 40) | (tx_index << 16) | output_index`).
-    LoadShortChannelId(u64),
-    /// Load a fee rate in sat/kw.
-    LoadFeeratePerKw(u32),
-    /// Load a block height or count.
-    LoadBlockHeight(u32),
-    /// Load a Unix timestamp in seconds.
-    LoadTimestamp(u32),
-    /// Load a BOLT 7 `channel_update` fee parameter (`fee_base_msat` in
-    /// millisatoshi or `fee_proportional_millionths` in millionths).
-    LoadForwardingFee(u32),
-    /// Load a u16 protocol parameter (e.g., `to_self_delay`).
-    LoadU16(u16),
-    /// Load a u8 protocol parameter (e.g., `channel_flags`).
-    LoadU8(u8),
-    /// Load raw bytes.
-    LoadBytes(Vec<u8>),
-    /// Load feature bits.
-    LoadFeatures(Vec<u8>),
-    /// Load a secp256k1 private key.
-    LoadPrivateKey([u8; 32]),
-    /// Load a 32-byte channel identifier.
-    LoadChannelId([u8; 32]),
-    /// Load a BOLT 2 compliant `upfront_shutdown_script`.
-    ///
-    /// Produces a [`VariableType::Bytes`] value whose contents match one of the
-    /// standard script templates required by BOLT 2.
-    LoadShutdownScript(ShutdownScriptVariant),
-    /// Load a valid `channel_type` feature vector.
-    ///
-    /// Produces a [`VariableType::Features`] value encoding one of a set of
-    /// channel types known to be accepted by at least one target.
-    LoadChannelType(ChannelTypeVariant),
-    /// Load the target node's public key from the program context.
-    LoadTargetPubkeyFromContext,
-    /// Load the chain hash from the program context.
-    LoadChainHashFromContext,
+stable_enum! {
+    /// An IR operation.  Each instruction in a program contains one operation plus
+    /// input variable indices.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub enum Operation {
+        // -- Load: produce a variable from an embedded literal or the context --
+        /// Load a satoshi or millisatoshi amount.
+        LoadAmount(u64) = 0,
+        /// Load a BOLT 7 `short_channel_id` in its packed `u64` form
+        /// (`(block << 40) | (tx_index << 16) | output_index`).
+        LoadShortChannelId(u64) = 1,
+        /// Load a fee rate in sat/kw.
+        LoadFeeratePerKw(u32) = 2,
+        /// Load a block height or count.
+        LoadBlockHeight(u32) = 3,
+        /// Load a Unix timestamp in seconds.
+        LoadTimestamp(u32) = 4,
+        /// Load a BOLT 7 `channel_update` fee parameter (`fee_base_msat` in
+        /// millisatoshi or `fee_proportional_millionths` in millionths).
+        LoadForwardingFee(u32) = 5,
+        /// Load a u16 protocol parameter (e.g., `to_self_delay`).
+        LoadU16(u16) = 6,
+        /// Load a u8 protocol parameter (e.g., `channel_flags`).
+        LoadU8(u8) = 7,
+        /// Load raw bytes.
+        LoadBytes(Vec<u8>) = 8,
+        /// Load feature bits.
+        LoadFeatures(Vec<u8>) = 9,
+        /// Load a secp256k1 private key.
+        LoadPrivateKey([u8; 32]) = 10,
+        /// Load a 32-byte channel identifier.
+        LoadChannelId([u8; 32]) = 11,
+        /// Load a BOLT 2 compliant `upfront_shutdown_script`.
+        ///
+        /// Produces a [`VariableType::Bytes`] value whose contents match one of the
+        /// standard script templates required by BOLT 2.
+        LoadShutdownScript(ShutdownScriptVariant) = 12,
+        /// Load a valid `channel_type` feature vector.
+        ///
+        /// Produces a [`VariableType::Features`] value encoding one of a set of
+        /// channel types known to be accepted by at least one target.
+        LoadChannelType(ChannelTypeVariant) = 13,
+        /// Load the target node's public key from the program context.
+        LoadTargetPubkeyFromContext = 14,
+        /// Load the chain hash from the program context.
+        LoadChainHashFromContext = 15,
 
-    // -- Compute: derive a variable from inputs --
-    /// Derive a compressed public key from a private key. The executor
-    /// validates that the bytes are in range `[1, curve_order)` and errors if
-    /// not.
-    /// Input: `PrivateKey`.
-    DerivePoint,
-    /// Extract a field from a parsed `accept_channel` response.
-    /// Input: `AcceptChannel`.
-    ExtractAcceptChannel(AcceptChannelField),
-    /// Create a BOLT 3 funding transaction for the channel funding flow.
-    ///
-    /// Inputs (4):
-    ///   0: `opener_funding_pubkey` (`Point`)
-    ///   1: `acceptor_funding_pubkey` (`Point`)
-    ///   2: `funding_satoshis` (`Amount`)
-    ///   3: `feerate_per_kw` (`FeeratePerKw`)
-    CreateFundingTransaction,
+        // -- Compute: derive a variable from inputs --
+        /// Derive a compressed public key from a private key. The executor
+        /// validates that the bytes are in range `[1, curve_order)` and errors if
+        /// not.
+        /// Input: `PrivateKey`.
+        DerivePoint = 16,
+        /// Extract a field from a parsed `accept_channel` response.
+        /// Input: `AcceptChannel`.
+        ExtractAcceptChannel(AcceptChannelField) = 17,
+        /// Create a BOLT 3 funding transaction for the channel funding flow.
+        ///
+        /// Inputs (4):
+        ///   0: `opener_funding_pubkey` (`Point`)
+        ///   1: `acceptor_funding_pubkey` (`Point`)
+        ///   2: `funding_satoshis` (`Amount`)
+        ///   3: `feerate_per_kw` (`FeeratePerKw`)
+        CreateFundingTransaction = 18,
 
-    // -- Build: construct a BOLT message from inputs --
-    /// Build an `open_channel` message (BOLT 2, type 32).
-    ///
-    /// Inputs (20, matching wire order):
-    ///   0: `chain_hash` (`ChainHash`)
-    ///   1: `temporary_channel_id` (`ChannelId`)
-    ///   2: `funding_satoshis` (`Amount`)
-    ///   3: `push_msat` (`Amount`)
-    ///   4: `dust_limit_satoshis` (`Amount`)
-    ///   5: `max_htlc_value_in_flight_msat` (`Amount`)
-    ///   6: `channel_reserve_satoshis` (`Amount`)
-    ///   7: `htlc_minimum_msat` (`Amount`)
-    ///   8: `feerate_per_kw` (`FeeratePerKw`)
-    ///   9: `to_self_delay` (`U16`)
-    ///  10: `max_accepted_htlcs` (`U16`)
-    ///  11: `funding_pubkey` (`Point`)
-    ///  12: `revocation_basepoint` (`Point`)
-    ///  13: `payment_basepoint` (`Point`)
-    ///  14: `delayed_payment_basepoint` (`Point`)
-    ///  15: `htlc_basepoint` (`Point`)
-    ///  16: `first_per_commitment_point` (`Point`)
-    ///  17: `channel_flags` (`U8`)
-    ///  18: `upfront_shutdown_script` (`Bytes`, empty = omit TLV)
-    ///  19: `channel_type` (`Features`, empty = omit TLV)
-    BuildOpenChannel,
-    /// Build a `channel_announcement` message (BOLT 7, type 256).
-    ///
-    /// All four `PrivateKey` inputs are used to sign the body.
-    ///
-    /// Inputs (7):
-    ///   0: `features`         (`Features`)
-    ///   1: `chain_hash`       (`ChainHash`)
-    ///   2: `short_channel_id` (`ShortChannelId`)
-    ///   3: `node_sk_1`        (`PrivateKey`) -- derives `node_id_1`
-    ///   4: `node_sk_2`        (`PrivateKey`) -- derives `node_id_2`
-    ///   5: `bitcoin_sk_1`     (`PrivateKey`) -- derives `bitcoin_key_1`
-    ///   6: `bitcoin_sk_2`     (`PrivateKey`) -- derives `bitcoin_key_2`
-    BuildChannelAnnouncement,
-    /// Build a `node_announcement` message (BOLT 7, type 257).
-    ///
-    /// `rgb_color` and `alias` are op-level params (not variable inputs) so the
-    /// mutator can flip bits inside them but cannot change their lengths.
-    ///
-    /// Inputs (4):
-    ///   0: `node_sk` (`PrivateKey`) -- derives `node_id` and signs the body
-    ///   1: `features` (`Features`)
-    ///   2: `timestamp` (`Timestamp`)
-    ///   3: `addresses` (`Bytes`, raw network address descriptor bytes)
-    BuildNodeAnnouncement {
-        /// 3-byte RGB color for UI display.
-        rgb_color: [u8; 3],
-        /// 32-byte node alias, zero-padded.
-        alias: [u8; 32],
-    },
-    /// Build a `channel_update` message (BOLT 7, type 258).
-    ///
-    /// The signature is computed internally over the double-SHA256 of the
-    /// message body following the signature field, using the supplied node
-    /// secret key (per BOLT 7).
-    ///
-    /// Inputs (11):
-    ///   0: `node_sk` (`PrivateKey`) -- signs the body
-    ///   1: `chain_hash` (`ChainHash`)
-    ///   2: `short_channel_id` (`ShortChannelId`)
-    ///   3: `timestamp` (`Timestamp`)
-    ///   4: `message_flags` (`U8`)
-    ///   5: `channel_flags` (`U8`)
-    ///   6: `cltv_expiry_delta` (`U16`)
-    ///   7: `htlc_minimum_msat` (`Amount`)
-    ///   8: `fee_base_msat` (`ForwardingFee`)
-    ///   9: `fee_proportional_millionths` (`ForwardingFee`)
-    ///  10: `htlc_maximum_msat` (`Amount`)
-    BuildChannelUpdate,
-    /// Build an `announcement_signatures` message (BOLT 7, type 259).
-    ///
-    /// Signs the `channel_announcement` body with our node and bitcoin secret
-    /// keys. The body is constructed with pubkeys sorted in the lexicographic
-    /// order required by BOLT 7, using the target's public keys (inputs 5 and
-    /// 7) directly — we do not need the target's secret keys.
-    ///
-    /// Inputs (8):
-    ///   0: `channel_id`       (`ChannelId`)
-    ///   1: `features`         (`Features`)
-    ///   2: `chain_hash`       (`ChainHash`)
-    ///   3: `short_channel_id` (`ShortChannelId`)
-    ///   4: `node_sk_1`        (`PrivateKey`) -- our node signing key
-    ///   5: `node_id_2`        (`Point`)      -- target's node public key
-    ///   6: `bitcoin_sk_1`     (`PrivateKey`) -- our bitcoin signing key
-    ///   7: `bitcoin_key_2`    (`Point`)      -- target's bitcoin public key
-    BuildAnnouncementSignatures,
+        // -- Build: construct a BOLT message from inputs --
+        /// Build an `open_channel` message (BOLT 2, type 32).
+        ///
+        /// Inputs (20, matching wire order):
+        ///   0: `chain_hash` (`ChainHash`)
+        ///   1: `temporary_channel_id` (`ChannelId`)
+        ///   2: `funding_satoshis` (`Amount`)
+        ///   3: `push_msat` (`Amount`)
+        ///   4: `dust_limit_satoshis` (`Amount`)
+        ///   5: `max_htlc_value_in_flight_msat` (`Amount`)
+        ///   6: `channel_reserve_satoshis` (`Amount`)
+        ///   7: `htlc_minimum_msat` (`Amount`)
+        ///   8: `feerate_per_kw` (`FeeratePerKw`)
+        ///   9: `to_self_delay` (`U16`)
+        ///  10: `max_accepted_htlcs` (`U16`)
+        ///  11: `funding_pubkey` (`Point`)
+        ///  12: `revocation_basepoint` (`Point`)
+        ///  13: `payment_basepoint` (`Point`)
+        ///  14: `delayed_payment_basepoint` (`Point`)
+        ///  15: `htlc_basepoint` (`Point`)
+        ///  16: `first_per_commitment_point` (`Point`)
+        ///  17: `channel_flags` (`U8`)
+        ///  18: `upfront_shutdown_script` (`Bytes`, empty = omit TLV)
+        ///  19: `channel_type` (`Features`, empty = omit TLV)
+        BuildOpenChannel = 19,
+        /// Build a `channel_announcement` message (BOLT 7, type 256).
+        ///
+        /// All four `PrivateKey` inputs are used to sign the body.
+        ///
+        /// Inputs (7):
+        ///   0: `features`         (`Features`)
+        ///   1: `chain_hash`       (`ChainHash`)
+        ///   2: `short_channel_id` (`ShortChannelId`)
+        ///   3: `node_sk_1`        (`PrivateKey`) -- derives `node_id_1`
+        ///   4: `node_sk_2`        (`PrivateKey`) -- derives `node_id_2`
+        ///   5: `bitcoin_sk_1`     (`PrivateKey`) -- derives `bitcoin_key_1`
+        ///   6: `bitcoin_sk_2`     (`PrivateKey`) -- derives `bitcoin_key_2`
+        BuildChannelAnnouncement = 20,
+        /// Build a `node_announcement` message (BOLT 7, type 257).
+        ///
+        /// `rgb_color` and `alias` are op-level params (not variable inputs) so the
+        /// mutator can flip bits inside them but cannot change their lengths.
+        ///
+        /// Inputs (4):
+        ///   0: `node_sk` (`PrivateKey`) -- derives `node_id` and signs the body
+        ///   1: `features` (`Features`)
+        ///   2: `timestamp` (`Timestamp`)
+        ///   3: `addresses` (`Bytes`, raw network address descriptor bytes)
+        BuildNodeAnnouncement {
+            /// 3-byte RGB color for UI display.
+            rgb_color: [u8; 3],
+            /// 32-byte node alias, zero-padded.
+            alias: [u8; 32],
+        } = 21,
+        /// Build a `channel_update` message (BOLT 7, type 258).
+        ///
+        /// The signature is computed internally over the double-SHA256 of the
+        /// message body following the signature field, using the supplied node
+        /// secret key (per BOLT 7).
+        ///
+        /// Inputs (11):
+        ///   0: `node_sk` (`PrivateKey`) -- signs the body
+        ///   1: `chain_hash` (`ChainHash`)
+        ///   2: `short_channel_id` (`ShortChannelId`)
+        ///   3: `timestamp` (`Timestamp`)
+        ///   4: `message_flags` (`U8`)
+        ///   5: `channel_flags` (`U8`)
+        ///   6: `cltv_expiry_delta` (`U16`)
+        ///   7: `htlc_minimum_msat` (`Amount`)
+        ///   8: `fee_base_msat` (`ForwardingFee`)
+        ///   9: `fee_proportional_millionths` (`ForwardingFee`)
+        ///  10: `htlc_maximum_msat` (`Amount`)
+        BuildChannelUpdate = 22,
+        /// Build an `announcement_signatures` message (BOLT 7, type 259).
+        ///
+        /// Signs the `channel_announcement` body with our node and bitcoin secret
+        /// keys. The body is constructed with pubkeys sorted in the lexicographic
+        /// order required by BOLT 7, using the target's public keys (inputs 5 and
+        /// 7) directly — we do not need the target's secret keys.
+        ///
+        /// Inputs (8):
+        ///   0: `channel_id`       (`ChannelId`)
+        ///   1: `features`         (`Features`)
+        ///   2: `chain_hash`       (`ChainHash`)
+        ///   3: `short_channel_id` (`ShortChannelId`)
+        ///   4: `node_sk_1`        (`PrivateKey`) -- our node signing key
+        ///   5: `node_id_2`        (`Point`)      -- target's node public key
+        ///   6: `bitcoin_sk_1`     (`PrivateKey`) -- our bitcoin signing key
+        ///   7: `bitcoin_key_2`    (`Point`)      -- target's bitcoin public key
+        BuildAnnouncementSignatures = 23,
 
-    // -- Act: side effects against the target --
-    /// Send an encoded message over the connection.
-    /// Input: `Message`.
-    SendMessage,
-    /// Send an `open_channel` message over the connection.
-    /// Produces a `SentOpenChannel` variable.
-    /// Input: `OpenChannelMessage`.
-    SendOpenChannel,
-    /// Build and send a `funding_created` message (BOLT 2, type 34).
-    /// Produces a `SentFundingCreated` variable.
-    ///
-    /// Inputs (3):
-    ///   0: `funding_transaction` (`FundingTransaction`)
-    ///   1: `opener_funding_privkey` (`PrivateKey`)
-    ///   2: `temporary_channel_id` (`ChannelId`)
-    SendFundingCreated,
-    /// Build and send a `channel_ready` message (BOLT 2, type 36).
-    ///
-    /// The alias TLV is optional in `channel_ready`. Since every `u64` is a
-    /// valid `ShortChannelId`, presence is controlled by `include_alias`
-    /// rather than a sentinel value. When `false`, the alias TLV is omitted
-    /// and input 2 is ignored. The `ShortChannelId` is used directly by
-    /// `channel_update`, so the alias type must match it in order to exercise
-    /// both valid and invalid alias SCID cases.
-    ///
-    /// Inputs (3):
-    ///   0: `channel_id` (`ChannelId`)
-    ///   1: `second_per_commitment_point` (`Point`)
-    ///   2: `short_channel_id` (`ShortChannelId`) -- the alias SCID
-    SendChannelReady {
-        /// Whether to include the alias `short_channel_id` TLV from input 2.
-        /// If `false`, the TLV is omitted and input 2 is ignored.
-        include_alias: bool,
-    },
-    /// Build and send a `shutdown` message (BOLT 2, type 38).
-    /// Produces a `SentShutdown` variable.
-    ///
-    /// Inputs (2):
-    ///   0: `channel_id`   (`ChannelId`)
-    ///   1: `scriptpubkey` (`Bytes`)
-    SendShutdown,
-    /// Receive and parse an `accept_channel` response.
-    /// Produces an `AcceptChannel` compound variable.
-    RecvAcceptChannel,
-    /// Receive and parse a `funding_signed` response.
-    /// Produces the `ChannelId` carried in the message.
-    /// TODO: Add `ExtractFundingSigned` when implementing force-close scenarios.
-    RecvFundingSigned,
-    /// Receive and parse a `channel_ready` response.
-    ///
-    /// This is a no-op unless some tracked channel is awaiting `channel_ready`
-    /// (still at commitment number 0 with the counterparty's next per-commitment
-    /// point unknown) and its funding transaction has enough confirmations for
-    /// the target to have sent `channel_ready`.
-    RecvChannelReady,
-    /// Mines the given number of blocks on the Bitcoin network.
-    MineBlocks(u8),
-    /// Sign wallet inputs of the transaction and broadcast it via `bitcoin-cli`.
-    /// Input: `FundingTransaction`.
-    BroadcastTransaction,
-    // -- Query: read state from outside the program --
-    /// Look up the confirmed block position of a broadcast funding transaction
-    /// and produce the corresponding BOLT 7 `short_channel_id`.
-    ///
-    /// This is the bridge between an on-chain funding output and the gossip
-    /// layer: the resulting `ShortChannelId` can be fed into
-    /// `BuildChannelAnnouncement`, `BuildChannelUpdate`, and
-    /// `BuildAnnouncementSignatures` so that gossip messages reference a real
-    /// UTXO and can pass the on-chain validation performed by CLN and LND.
-    ///
-    /// The typical program shape is:
-    ///
-    /// ```text
-    /// ft   = CreateFundingTransaction(...)
-    /// _    = BroadcastTransaction(ft)
-    /// _    = MineBlocks(k)          // k >= 1 for the tx to be confirmed
-    /// scid = LookupShortChannelId(ft)
-    /// ```
-    ///
-    /// If the funding transaction is unknown to the node or still in the
-    /// mempool (e.g. `MineBlocks` was dropped by a mutator), the sentinel
-    /// `ShortChannelId::new(0, 0, 0)` is produced. This keeps downstream
-    /// consumers well-typed without introducing a target- or program-side
-    /// error: any resulting gossip message simply fails on-chain validation.
-    ///
-    /// Input: `FundingTransaction`.
-    LookupShortChannelId,
+        // -- Act: side effects against the target --
+        /// Send an encoded message over the connection.
+        /// Input: `Message`.
+        SendMessage = 24,
+        /// Send an `open_channel` message over the connection.
+        /// Produces a `SentOpenChannel` variable.
+        /// Input: `OpenChannelMessage`.
+        SendOpenChannel = 25,
+        /// Build and send a `funding_created` message (BOLT 2, type 34).
+        /// Produces a `SentFundingCreated` variable.
+        ///
+        /// Inputs (3):
+        ///   0: `funding_transaction` (`FundingTransaction`)
+        ///   1: `opener_funding_privkey` (`PrivateKey`)
+        ///   2: `temporary_channel_id` (`ChannelId`)
+        SendFundingCreated = 26,
+        /// Build and send a `channel_ready` message (BOLT 2, type 36).
+        ///
+        /// The alias TLV is optional in `channel_ready`. Since every `u64` is a
+        /// valid `ShortChannelId`, presence is controlled by `include_alias`
+        /// rather than a sentinel value. When `false`, the alias TLV is omitted
+        /// and input 2 is ignored. The `ShortChannelId` is used directly by
+        /// `channel_update`, so the alias type must match it in order to exercise
+        /// both valid and invalid alias SCID cases.
+        ///
+        /// Inputs (3):
+        ///   0: `channel_id` (`ChannelId`)
+        ///   1: `second_per_commitment_point` (`Point`)
+        ///   2: `short_channel_id` (`ShortChannelId`) -- the alias SCID
+        SendChannelReady {
+            /// Whether to include the alias `short_channel_id` TLV from input 2.
+            /// If `false`, the TLV is omitted and input 2 is ignored.
+            include_alias: bool,
+        } = 27,
+        /// Build and send a `shutdown` message (BOLT 2, type 38).
+        /// Produces a `SentShutdown` variable.
+        ///
+        /// Inputs (2):
+        ///   0: `channel_id`   (`ChannelId`)
+        ///   1: `scriptpubkey` (`Bytes`)
+        SendShutdown = 28,
+        /// Receive and parse an `accept_channel` response.
+        /// Produces an `AcceptChannel` compound variable.
+        RecvAcceptChannel = 29,
+        /// Receive and parse a `funding_signed` response.
+        /// Produces the `ChannelId` carried in the message.
+        /// TODO: Add `ExtractFundingSigned` when implementing force-close scenarios.
+        RecvFundingSigned = 30,
+        /// Receive and parse a `channel_ready` response.
+        ///
+        /// This is a no-op unless some tracked channel is awaiting `channel_ready`
+        /// (still at commitment number 0 with the counterparty's next per-commitment
+        /// point unknown) and its funding transaction has enough confirmations for
+        /// the target to have sent `channel_ready`.
+        RecvChannelReady = 31,
+        /// Mines the given number of blocks on the Bitcoin network.
+        MineBlocks(u8) = 32,
+        /// Sign wallet inputs of the transaction and broadcast it via `bitcoin-cli`.
+        /// Input: `FundingTransaction`.
+        BroadcastTransaction = 33,
+        // -- Query: read state from outside the program --
+        /// Look up the confirmed block position of a broadcast funding transaction
+        /// and produce the corresponding BOLT 7 `short_channel_id`.
+        ///
+        /// This is the bridge between an on-chain funding output and the gossip
+        /// layer: the resulting `ShortChannelId` can be fed into
+        /// `BuildChannelAnnouncement`, `BuildChannelUpdate`, and
+        /// `BuildAnnouncementSignatures` so that gossip messages reference a real
+        /// UTXO and can pass the on-chain validation performed by CLN and LND.
+        ///
+        /// The typical program shape is:
+        ///
+        /// ```text
+        /// ft   = CreateFundingTransaction(...)
+        /// _    = BroadcastTransaction(ft)
+        /// _    = MineBlocks(k)          // k >= 1 for the tx to be confirmed
+        /// scid = LookupShortChannelId(ft)
+        /// ```
+        ///
+        /// If the funding transaction is unknown to the node or still in the
+        /// mempool (e.g. `MineBlocks` was dropped by a mutator), the sentinel
+        /// `ShortChannelId::new(0, 0, 0)` is produced. This keeps downstream
+        /// consumers well-typed without introducing a target- or program-side
+        /// error: any resulting gossip message simply fails on-chain validation.
+        ///
+        /// Input: `FundingTransaction`.
+        LookupShortChannelId = 34,
+    }
 }
 
-/// A BOLT 2 compliant `upfront_shutdown_script` template.
-///
-/// Each variant encodes to a script matching one of the formats required by
-/// BOLT 2 for the upfront shutdown TLV. `Empty` opts out of upfront shutdown
-/// entirely and is accepted regardless of feature negotiation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ShutdownScriptVariant {
-    /// Zero-length script. Opts out of upfront shutdown.
-    Empty,
-    /// `OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG`.
-    P2pkh([u8; 20]),
-    /// `OP_HASH160 <20-byte hash> OP_EQUAL`.
-    P2sh([u8; 20]),
-    /// `OP_0 <20-byte hash>`.
-    P2wpkh([u8; 20]),
-    /// `OP_0 <32-byte hash>`.
-    P2wsh([u8; 32]),
-    /// `OP_<version> <program>` for witness program versions 1..=16 with a
-    /// 2..=40 byte program. Requires the counterparty to signal
-    /// `option_shutdown_anysegwit`.
-    AnySegwit {
-        /// Witness program version, in `1..=16`.
-        version: u8,
-        /// Witness program bytes, length in `2..=40`.
-        program: Vec<u8>,
-    },
-    /// `OP_RETURN <data>` where `data` is 6..=80 bytes. Requires the
-    /// counterparty to signal `option_simple_close`.
-    OpReturn(Vec<u8>),
+stable_enum! {
+    /// A BOLT 2 compliant `upfront_shutdown_script` template.
+    ///
+    /// Each variant encodes to a script matching one of the formats required by
+    /// BOLT 2 for the upfront shutdown TLV. `Empty` opts out of upfront shutdown
+    /// entirely and is accepted regardless of feature negotiation.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub enum ShutdownScriptVariant {
+        /// Zero-length script. Opts out of upfront shutdown.
+        Empty = 0,
+        /// `OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG`.
+        P2pkh([u8; 20]) = 1,
+        /// `OP_HASH160 <20-byte hash> OP_EQUAL`.
+        P2sh([u8; 20]) = 2,
+        /// `OP_0 <20-byte hash>`.
+        P2wpkh([u8; 20]) = 3,
+        /// `OP_0 <32-byte hash>`.
+        P2wsh([u8; 32]) = 4,
+        /// `OP_<version> <program>` for witness program versions 1..=16 with a
+        /// 2..=40 byte program. Requires the counterparty to signal
+        /// `option_shutdown_anysegwit`.
+        AnySegwit {
+            /// Witness program version, in `1..=16`.
+            version: u8,
+            /// Witness program bytes, length in `2..=40`.
+            program: Vec<u8>,
+        } = 5,
+        /// `OP_RETURN <data>` where `data` is 6..=80 bytes. Requires the
+        /// counterparty to signal `option_simple_close`.
+        OpReturn(Vec<u8>) = 6,
+    }
 }
 
 impl ShutdownScriptVariant {
@@ -423,71 +427,73 @@ impl fmt::Display for ShutdownScriptVariant {
     }
 }
 
-/// A specific BOLT 2 `channel_type` feature-bit combination.
-///
-/// Each variant corresponds to a channel type accepted by at least one target
-/// implementation:
-///
-/// - `option_static_remotekey` (bit 12)
-/// - `option_anchors` (bits 22 and 12)
-/// - `zero_fee_commitments` (bit 40)
-/// - `option_simple_taproot` (bit 80)
-/// - `option_simple_taproot_staging` (bit 180)
-/// - `option_script_enforced_lease` (bits 2022, 22, 12)
-///
-/// Additionally, the following bits can be added to any channel type:
-/// - `option_scid_alias` (bit 46)
-/// - `option_zeroconf` (bit 50)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ChannelTypeVariant {
-    /// bit 12
-    StaticRemoteKey,
-    /// bits 12, 46
-    StaticRemoteKeyScidAlias,
-    /// bits 12, 50
-    StaticRemoteKeyZeroConf,
-    /// bits 12, 46, 50
-    StaticRemoteKeyScidAliasZeroConf,
-    /// bits 12, 22
-    Anchors,
-    /// bits 12, 22, 46
-    AnchorsScidAlias,
-    /// bits 12, 22, 50
-    AnchorsZeroConf,
-    /// bits 12, 22, 46, 50
-    AnchorsScidAliasZeroConf,
-    /// bit 40
-    ZeroFeeCommitments,
-    /// bits 40, 46
-    ZeroFeeCommitmentsScidAlias,
-    /// bits 40, 50
-    ZeroFeeCommitmentsZeroConf,
-    /// bits 40, 46, 50
-    ZeroFeeCommitmentsScidAliasZeroConf,
-    /// bit 80
-    SimpleTaproot,
-    /// bits 80, 46
-    SimpleTaprootScidAlias,
-    /// bits 80, 50
-    SimpleTaprootZeroConf,
-    /// bits 80, 46, 50
-    SimpleTaprootScidAliasZeroConf,
-    /// bit 180
-    SimpleTaprootStaging,
-    /// bits 180, 46
-    SimpleTaprootStagingScidAlias,
-    /// bits 180, 50
-    SimpleTaprootStagingZeroConf,
-    /// bits 180, 46, 50
-    SimpleTaprootStagingScidAliasZeroConf,
-    /// bits 12, 22, 2022
-    ScriptEnforcedLease,
-    /// bits 12, 22, 2022, 46
-    ScriptEnforcedLeaseScidAlias,
-    /// bits 12, 22, 2022, 50
-    ScriptEnforcedLeaseZeroConf,
-    /// bits 12, 22, 2022, 46, 50
-    ScriptEnforcedLeaseScidAliasZeroConf,
+stable_enum! {
+    /// A specific BOLT 2 `channel_type` feature-bit combination.
+    ///
+    /// Each variant corresponds to a channel type accepted by at least one target
+    /// implementation:
+    ///
+    /// - `option_static_remotekey` (bit 12)
+    /// - `option_anchors` (bits 22 and 12)
+    /// - `zero_fee_commitments` (bit 40)
+    /// - `option_simple_taproot` (bit 80)
+    /// - `option_simple_taproot_staging` (bit 180)
+    /// - `option_script_enforced_lease` (bits 2022, 22, 12)
+    ///
+    /// Additionally, the following bits can be added to any channel type:
+    /// - `option_scid_alias` (bit 46)
+    /// - `option_zeroconf` (bit 50)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum ChannelTypeVariant {
+        /// bit 12
+        StaticRemoteKey = 0,
+        /// bits 12, 46
+        StaticRemoteKeyScidAlias = 1,
+        /// bits 12, 50
+        StaticRemoteKeyZeroConf = 2,
+        /// bits 12, 46, 50
+        StaticRemoteKeyScidAliasZeroConf = 3,
+        /// bits 12, 22
+        Anchors = 4,
+        /// bits 12, 22, 46
+        AnchorsScidAlias = 5,
+        /// bits 12, 22, 50
+        AnchorsZeroConf = 6,
+        /// bits 12, 22, 46, 50
+        AnchorsScidAliasZeroConf = 7,
+        /// bit 40
+        ZeroFeeCommitments = 8,
+        /// bits 40, 46
+        ZeroFeeCommitmentsScidAlias = 9,
+        /// bits 40, 50
+        ZeroFeeCommitmentsZeroConf = 10,
+        /// bits 40, 46, 50
+        ZeroFeeCommitmentsScidAliasZeroConf = 11,
+        /// bit 80
+        SimpleTaproot = 12,
+        /// bits 80, 46
+        SimpleTaprootScidAlias = 13,
+        /// bits 80, 50
+        SimpleTaprootZeroConf = 14,
+        /// bits 80, 46, 50
+        SimpleTaprootScidAliasZeroConf = 15,
+        /// bit 180
+        SimpleTaprootStaging = 16,
+        /// bits 180, 46
+        SimpleTaprootStagingScidAlias = 17,
+        /// bits 180, 50
+        SimpleTaprootStagingZeroConf = 18,
+        /// bits 180, 46, 50
+        SimpleTaprootStagingScidAliasZeroConf = 19,
+        /// bits 12, 22, 2022
+        ScriptEnforcedLease = 20,
+        /// bits 12, 22, 2022, 46
+        ScriptEnforcedLeaseScidAlias = 21,
+        /// bits 12, 22, 2022, 50
+        ScriptEnforcedLeaseZeroConf = 22,
+        /// bits 12, 22, 2022, 46, 50
+        ScriptEnforcedLeaseScidAliasZeroConf = 23,
+    }
 }
 
 impl ChannelTypeVariant {
@@ -617,25 +623,27 @@ impl fmt::Display for ChannelTypeVariant {
     }
 }
 
-/// Fields that can be extracted from an `AcceptChannel` compound variable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AcceptChannelField {
-    TemporaryChannelId,
-    DustLimitSatoshis,
-    MaxHtlcValueInFlightMsat,
-    ChannelReserveSatoshis,
-    HtlcMinimumMsat,
-    MinimumDepth,
-    ToSelfDelay,
-    MaxAcceptedHtlcs,
-    FundingPubkey,
-    RevocationBasepoint,
-    PaymentBasepoint,
-    DelayedPaymentBasepoint,
-    HtlcBasepoint,
-    FirstPerCommitmentPoint,
-    UpfrontShutdownScript,
-    ChannelType,
+stable_enum! {
+    /// Fields that can be extracted from an `AcceptChannel` compound variable.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AcceptChannelField {
+        TemporaryChannelId = 0,
+        DustLimitSatoshis = 1,
+        MaxHtlcValueInFlightMsat = 2,
+        ChannelReserveSatoshis = 3,
+        HtlcMinimumMsat = 4,
+        MinimumDepth = 5,
+        ToSelfDelay = 6,
+        MaxAcceptedHtlcs = 7,
+        FundingPubkey = 8,
+        RevocationBasepoint = 9,
+        PaymentBasepoint = 10,
+        DelayedPaymentBasepoint = 11,
+        HtlcBasepoint = 12,
+        FirstPerCommitmentPoint = 13,
+        UpfrontShutdownScript = 14,
+        ChannelType = 15,
+    }
 }
 
 impl fmt::Display for AcceptChannelField {
