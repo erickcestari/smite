@@ -13,6 +13,7 @@ use std::time::Duration;
 use bitcoin::secp256k1;
 use serde::Deserialize;
 use smite::bitcoin::BitcoinCli;
+use smite::crash_handler;
 use smite::process::ManagedProcess;
 
 use super::bitcoind;
@@ -129,11 +130,9 @@ impl EclairTarget {
 
         let mut cmd = Command::new("eclair-node.sh");
 
-        // LD_PRELOAD the crash handler to report crashes immediately (before
+        // Preload the crash handler to report crashes immediately (before
         // process teardown closes TCP sockets).
-        if let Ok(handler) = std::env::var("SMITE_CRASH_HANDLER") {
-            cmd.env("LD_PRELOAD", handler);
-        }
+        crash_handler::preload(&mut cmd);
 
         cmd.arg(format!("-Declair.datadir={}", eclair_dir.display()))
             .stdout(Stdio::null())

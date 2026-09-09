@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 
 use bitcoin::secp256k1;
 use smite::bitcoin::BitcoinCli;
+use smite::crash_handler;
 use smite::process::{ManagedProcess, send_sigusr1};
 
 use super::bitcoind;
@@ -113,11 +114,9 @@ impl LdkTarget {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
-        // LD_PRELOAD the crash handler to report crashes immediately (before
+        // Preload the crash handler to report crashes immediately (before
         // process teardown closes TCP sockets).
-        if let Ok(handler) = std::env::var("SMITE_CRASH_HANDLER") {
-            cmd.env("LD_PRELOAD", handler);
-        }
+        crash_handler::preload(&mut cmd);
 
         let mut ldk = ManagedProcess::spawn(&mut cmd, "ldk-node-wrapper")?;
 

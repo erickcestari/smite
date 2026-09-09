@@ -9,6 +9,7 @@
 //! - [`bitcoin`] - Utilities for interacting with `bitcoind` instances via `bitcoin-cli`.
 //! - [`bolt`] - BOLT message encoding and decoding.
 //! - [`channel_tx`] - BOLT 3 channel transaction construction (funding and commitment).
+//! - [`crash_handler`] - Harness side of the `LD_PRELOAD`ed crash handler protocol.
 //! - [`noise`] - BOLT 8 `Noise_XK` encrypted transport.
 //! - [`oracles`] - Protocol invariant checks.
 //! - [`pending_channel`] - BOLT 2 channel negotiation state.
@@ -20,6 +21,7 @@
 pub mod bitcoin;
 pub mod bolt;
 pub mod channel_tx;
+pub mod crash_handler;
 pub mod noise;
 #[cfg(feature = "nyx")]
 pub mod nyx_log;

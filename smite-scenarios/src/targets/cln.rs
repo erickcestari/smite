@@ -19,6 +19,7 @@ use std::time::Duration;
 use bitcoin::secp256k1;
 use serde::Deserialize;
 use smite::bitcoin::BitcoinCli;
+use smite::crash_handler;
 use smite::process::ManagedProcess;
 
 use super::bitcoind;
@@ -195,12 +196,8 @@ impl ClnTarget {
         // can track the PID for liveness checks and signal delivery.
         let mut cmd = Command::new("lightningd");
 
-        // LD_PRELOAD the crash handler into lightningd and its subdaemons.
-        // Set only on lightningd (not lightning-cli/bitcoin-cli) to avoid
-        // interfering with helper processes.
-        if let Ok(handler) = std::env::var("SMITE_CRASH_HANDLER") {
-            cmd.env("LD_PRELOAD", handler);
-        }
+        // Preload the crash handler into lightningd and its subdaemons.
+        crash_handler::preload(&mut cmd);
 
         cmd.arg(format!("--lightning-dir={}", cln_dir.display()))
             .arg("--network=regtest")
