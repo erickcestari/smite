@@ -12,31 +12,25 @@ pub use eclair::{EclairConfig, EclairRpc, EclairTarget};
 pub use ldk::{LdkConfig, LdkRpc, LdkTarget};
 pub use lnd::{LndConfig, LndRpc, LndTarget};
 use smite::bitcoin::BitcoinCli;
+use smite::crash_handler;
 use smite::scenarios::TargetError;
 
 use bitcoin::secp256k1;
 use std::net::SocketAddr;
-
-/// Path where the crash handler writes crash data in local (non-Nyx) mode.
-const CRASH_LOG_PATH: &str = "/tmp/smite-crash.log";
 
 /// Checks if the crash handler was triggered in local mode.
 ///
 /// In Nyx mode, crashes are reported directly via hypercall and we never get to
 /// this point. In local mode, the crash handler writes crash data to a file.
 ///
-/// Used by targets that have an external crash handler (CLN, Eclair).
+/// Used by targets that have an external crash handler (CLN, Eclair, LDK).
 ///
 /// # Errors
 ///
 /// Returns [`TargetError::Crashed`] if the crash log file exists.
 pub fn check_crash_log() -> Result<(), TargetError> {
-    let crash_log = std::path::Path::new(CRASH_LOG_PATH);
-    if crash_log.exists() {
-        if let Ok(msg) = std::fs::read_to_string(crash_log) {
-            log::error!("crash handler: {}", msg.trim());
-        }
-        let _ = std::fs::remove_file(crash_log);
+    if let Some(report) = crash_handler::take_crash_log() {
+        log::error!("crash handler: {}", report.trim());
         return Err(TargetError::Crashed);
     }
     Ok(())

@@ -24,6 +24,10 @@
 /// a crash report. The fuzz scenarios never check for these crash reports, so
 /// no false positives are ever reported.
 ///
+/// In local mode the crash report is written to /tmp/smite-crash.log and the
+/// harness named by SMITE_HARNESS_PID is sent SIGUSR1 so it fails the test
+/// case right away.
+///
 /// Compile-time options:
 ///   -DENABLE_NYX  Report crashes via Nyx hypercalls instead of crash file.
 ///   -DNO_PT_NYX   Use port I/O hypercalls (must match nyx-agent.c build).
@@ -36,7 +40,9 @@
 ///       jvm-crash-handler.c -o nyx-jvm-crash-handler.so
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -44,12 +50,27 @@
 #include "nyx.h"
 #endif
 
-// Must match STARTUP_COMPLETE_MARKER in smite/src/runners.rs.
+// Must match the constants in smite/src/crash_handler.rs.
 #define STARTUP_COMPLETE_MARKER "/tmp/smite-startup-complete"
+#define CRASH_LOG_PATH "/tmp/smite-crash.log"
+#define HARNESS_PID_ENV "SMITE_HARNESS_PID"
 
 static int startup_complete(void) {
   return access(STARTUP_COMPLETE_MARKER, F_OK) == 0;
 }
+
+#ifndef ENABLE_NYX
+// Pid of the smite harness, read once at load time. 0 when the harness did
+// not tell us.
+static pid_t harness_pid = 0;
+
+__attribute__((constructor)) static void init_harness_pid(void) {
+  const char *pid = getenv(HARNESS_PID_ENV);
+  if (pid != NULL) {
+    harness_pid = (pid_t)atoi(pid);
+  }
+}
+#endif
 
 static void report_crash(const char *reason, int code) {
   char buf[256];
@@ -61,10 +82,13 @@ static void report_crash(const char *reason, int code) {
   kAFL_hypercall(HYPERCALL_KAFL_PANIC_EXTENDED, (uintptr_t)buf);
   __builtin_unreachable();
 #else
-  int fd = open("/tmp/smite-crash.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int fd = open(CRASH_LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
     write(fd, buf, len);
     close(fd);
+  }
+  if (harness_pid > 0) {
+    kill(harness_pid, SIGUSR1);
   }
 #endif
 }

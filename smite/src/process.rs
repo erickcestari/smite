@@ -8,8 +8,9 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
+use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{Signal, kill, killpg};
-use nix::unistd::Pid;
+use nix::unistd::{Pid, getppid};
 
 /// A managed subprocess with graceful shutdown support.
 ///
@@ -18,6 +19,12 @@ use nix::unistd::Pid;
 ///
 /// Each managed child is placed into its own process group when spawned so
 /// that shutdown can reliably clean up grandchildren as well.
+///
+/// The child is also given a parent-death signal, so the kernel SIGKILLs it
+/// whenever the harness goes away without dropping it: a crash-triggered
+/// `process::exit`, a panic, or the harness itself being killed. Linux ties
+/// that signal to the *thread* that spawned the child, so spawn targets from a
+/// thread that outlives them (in practice, the main thread).
 pub struct ManagedProcess {
     child: Child,
     name: String,
@@ -33,6 +40,22 @@ impl ManagedProcess {
         // Put the child in its own process group so shutdown can signal the
         // whole subtree rather than just the direct child process.
         cmd.process_group(0);
+
+        let harness = Pid::this();
+        // SAFETY: runs in the forked child before exec. prctl and getppid are
+        // async-signal-safe and the closure allocates nothing.
+        unsafe {
+            cmd.pre_exec(move || {
+                set_pdeathsig(Signal::SIGKILL)?;
+                // The death signal only covers deaths after it is set. If the
+                // harness died in the fork-to-prctl window we were reparented
+                // and would outlive it, so bail out instead.
+                if getppid() != harness {
+                    return Err(io::Error::other("harness exited during spawn"));
+                }
+                Ok(())
+            });
+        }
 
         let child = cmd.spawn()?;
 
@@ -231,6 +254,29 @@ mod tests {
         assert!(
             !process_exists(grandchild_pid),
             "grandchild process {grandchild_pid} should have been terminated"
+        );
+    }
+
+    #[test]
+    fn child_is_killed_when_spawning_thread_exits() {
+        // The parent-death signal fires on the death of the spawning thread,
+        // which is the only way to exercise it without killing the test
+        // process itself.
+        let mut proc = std::thread::spawn(|| {
+            let mut proc = ManagedProcess::spawn(Command::new("sleep").arg("60"), "sleep").unwrap();
+            assert!(proc.is_running());
+            proc
+        })
+        .join()
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while proc.is_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !proc.is_running(),
+            "child should die with its spawning thread"
         );
     }
 

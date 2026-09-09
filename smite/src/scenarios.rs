@@ -6,7 +6,7 @@
 //! initializes the runner, creates the scenario, delivers input and
 //! reports results.
 
-use crate::{bolt::BoltError, noise::ConnectionError};
+use crate::{bolt::BoltError, crash_handler, noise::ConnectionError};
 
 /// `ScenarioResult` describes the outcomes of running a scenario
 pub enum ScenarioResult {
@@ -97,6 +97,42 @@ fn init_logging() {
     simple_logger::init_with_env().expect("logger not already set");
 }
 
+/// Fails the test case the instant the crash handler signals a target crash.
+///
+/// In local mode the preloaded crash handler sends `SIGUSR1` right after
+/// writing its report (see [`crash_handler`]). Handling it here, rather than
+/// waiting for the scenario's next liveness check, means the harness dies
+/// before it can act on a crashed target (e.g. broadcast a funding
+/// transaction) and the crash report is the last thing it prints.
+///
+/// The signal is consumed synchronously by a dedicated thread via `sigwait`,
+/// so the crash path can use the logger and the runner; no signal handler is
+/// installed. Must be called before any other thread exists: the mask that
+/// keeps `SIGUSR1` from terminating the process is inherited by threads
+/// spawned afterwards, not applied to existing ones. Children spawned via
+/// `Command` get a clean mask, so targets are unaffected.
+///
+/// # Panics
+///
+/// Panics if `SIGUSR1` cannot be blocked or waited on.
+fn fail_on_target_crash_signal() {
+    use crate::runners::{LocalRunner, Runner};
+    use crate::violation::Violation;
+    use nix::sys::signal::{SigSet, Signal};
+
+    let mut set = SigSet::empty();
+    set.add(Signal::SIGUSR1);
+    set.thread_block().expect("SIGUSR1 blocked");
+    std::thread::spawn(move || {
+        set.wait().expect("sigwait on SIGUSR1");
+        if let Some(report) = crash_handler::take_crash_log() {
+            log::error!("crash handler: {}", report.trim());
+        }
+        LocalRunner::new().fail(&format!("Test case failed: {}", Violation::Crashed));
+        std::process::exit(1);
+    });
+}
+
 /// Run a scenario with the standard runner.
 ///
 /// This is the main entry point for smite scenario binaries. It initializes
@@ -127,6 +163,12 @@ pub fn smite_run<S: Scenario>() -> std::process::ExitCode {
                 smite_nyx_sys::nyx_fail(c_message.as_ptr());
             }
         }));
+    }
+
+    // In Nyx mode the crash handler reports straight to the hypervisor, so
+    // the signal path only exists for local runs.
+    if !(cfg!(feature = "nyx") && std::env::var("SMITE_NYX").is_ok()) {
+        fail_on_target_crash_signal();
     }
 
     // Initialize the runner before the scenario. This is important when

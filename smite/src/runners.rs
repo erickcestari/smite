@@ -10,14 +10,7 @@
 #[cfg(feature = "nyx")]
 use smite_nyx_sys::{nyx_fail, nyx_get_fuzz_input, nyx_init, nyx_release, nyx_skip};
 
-/// Marker file created right before the first fuzz input is delivered, so
-/// crash handlers can filter out expected subprocess exits that occur during
-/// node startup.
-const STARTUP_COMPLETE_MARKER: &str = "/tmp/smite-startup-complete";
-
-fn create_startup_complete_marker() {
-    std::fs::File::create(STARTUP_COMPLETE_MARKER).expect("startup complete file created");
-}
+use crate::crash_handler::create_startup_complete_marker;
 
 /// `Runner` provides an abstraction for a smite test case runner (e.g. run under nyx,
 /// local system for reproduction, etc.)

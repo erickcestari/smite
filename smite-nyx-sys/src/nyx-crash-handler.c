@@ -10,7 +10,8 @@
 /// - -DCATCH_SIGNALS: Install our own signal handler for fatal signals, and
 ///   block any attempts to override our signal handler.
 /// - -DENABLE_NYX: Use nyx hypercalls to let nyx know that a crash has occured.
-///   If not set, crash reports are written to /tmp/smite-crash.log.
+///   If not set, crash reports are written to /tmp/smite-crash.log and the
+///   harness named by SMITE_HARNESS_PID is sent SIGUSR1.
 /// - -DASAN_LOG_PATH=<path>: Path to the ASan log file.
 /// - -DCUSTOM_BACKTRACE: Enable custom backtrace.
 ///
@@ -36,6 +37,9 @@
 
 // Must match PANIC_LOG_PATH in workloads/ldk/src/main.rs.
 #define PANIC_LOG_PATH "/tmp/smite-panic.log"
+// Must match CRASH_LOG_PATH and HARNESS_PID_ENV in smite/src/crash_handler.rs.
+#define CRASH_LOG_PATH "/tmp/smite-crash.log"
+#define HARNESS_PID_ENV "SMITE_HARNESS_PID"
 #define ASAN_LOG_PATH "/tmp/asan.log"
 #define MAX_CUSTOM_BACKTRACE_SIZE 50
 
@@ -101,14 +105,29 @@ void append_target_log(const char *path) {
 
 #else
 
-// Write the crash log to a file so the scenario can read it. The scenario must
-// specifically check this file to detect crashes.
+// Pid of the smite harness, read once at load time so the crash path only
+// needs the async-signal-safe kill(). 0 when the harness did not tell us.
+static pid_t harness_pid = 0;
+
+__attribute__((constructor)) void init_harness_pid(void) {
+  const char *pid = getenv(HARNESS_PID_ENV);
+  if (pid != NULL) {
+    harness_pid = (pid_t)atoi(pid);
+  }
+}
+
+// Write the crash log to a file so the harness can read it, then wake the
+// harness with SIGUSR1 so it fails the test case right away. The harness also
+// checks the file on its own liveness checks.
 #define EXIT_WITH_LOG()                                                        \
   do {                                                                         \
-    FILE *f = fopen("/tmp/smite-crash.log", "w");                              \
+    FILE *f = fopen(CRASH_LOG_PATH, "w");                                      \
     if (f) {                                                                   \
       fprintf(f, "%s\n", log);                                                 \
       fclose(f);                                                               \
+    }                                                                          \
+    if (harness_pid > 0) {                                                     \
+      kill(harness_pid, SIGUSR1);                                              \
     }                                                                          \
     _exit(1);                                                                  \
   } while (0)
