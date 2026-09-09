@@ -345,9 +345,10 @@ impl BitcoinCli {
     /// the minimum relay feerate or creates a dust output), it is returned
     /// instead so the caller can mine it later, bypassing mempool policy.
     ///
-    /// Returns `None` if the transaction was already confirmed, could not be
-    /// fully signed, or was broadcast successfully; or the hex-encoded raw
-    /// transaction if it was rejected by the mempool.
+    /// Returns `None` if the transaction has no inputs, was already confirmed,
+    /// could not be fully signed, is consensus invalid, or was broadcast
+    /// successfully; or the hex-encoded raw transaction if it was rejected by
+    /// mempool policy.
     ///
     /// # Panics
     ///
@@ -356,15 +357,25 @@ impl BitcoinCli {
     /// - If the sign output is not valid JSON.
     /// - If `bitcoin-cli sendrawtransaction` fails to execute.
     /// - If the broadcast is rejected for a reason other than a known mempool
-    ///   policy rule or the transaction already being known to the node.
+    ///   policy rule, a consensus rule, or the transaction already being known
+    ///   to the node.
     /// - If a successful broadcast does not return a valid UTF-8 txid.
     /// - If the broadcasted txid does not match the given transaction's txid.
     #[must_use]
     pub fn sign_and_broadcast_tx(&self, tx: &Transaction) -> Option<String> {
+        let txid = tx.compute_txid();
+        // A channel establishment v2 funding transaction holds whatever the
+        // fuzzer negotiated, which may be no inputs at all. Consensus forbids
+        // that, and bitcoind cannot even decode the segwit serialization of
+        // it, so there is nothing to sign or broadcast.
+        if tx.input.is_empty() {
+            log::debug!("{txid} has no inputs, not broadcasting");
+            return None;
+        }
+
         // A confirmed transaction may be broadcast again by the fuzzer. Its
         // inputs are spent, so the wallet can no longer fully sign it, skip
         // signing and broadcasting it again.
-        let txid = tx.compute_txid();
         if self.get_transaction_confirmations(txid) > 0 {
             return None;
         }
@@ -388,15 +399,24 @@ impl BitcoinCli {
             .arg(&signed_tx.hex)
             // Disable the high-feerate cap and accept any fee rate for broadcast.
             .arg("0")
+            // Lift the burn cap (`maxburnamount`, in BTC) as well: an output
+            // the fuzzer made provably unspendable, such as an `OP_RETURN`
+            // script in `tx_add_output`, is still a mineable transaction.
+            .arg("21000000")
             .output()
             .expect("bitcoin-cli sendrawtransaction should not fail");
 
         if !broadcast_out.status.success() {
             let stderr = String::from_utf8_lossy(&broadcast_out.stderr);
-            // If the feerate is below the default minimum relay feerate, or any
-            // output is below its dust threshold, return the transactions so
-            // they can be mined directly, bypassing mempool policy.
-            if stderr.contains("tx with dust output") || stderr.contains("min relay fee not met") {
+            // If the feerate is below the default minimum relay feerate, any
+            // output is below its dust threshold, or an output script is not
+            // one of the standard templates (`tx_add_output` sends whatever
+            // script the fuzzer picked), return the transaction so it can be
+            // mined directly, bypassing mempool policy.
+            if stderr.contains("dust")
+                || stderr.contains("min relay fee not met")
+                || stderr.contains("scriptpubkey")
+            {
                 return Some(signed_tx.hex);
             }
             // The transaction may already be known to the node: the fuzzer can
@@ -411,10 +431,19 @@ impl BitcoinCli {
                 return None;
             }
             // A channel establishment v2 funding transaction takes its
-            // `nLockTime` from `open_channel2.locktime`, which the fuzzer picks
-            // freely, so it is routinely in the future.
-            if stderr.contains("non-final") {
+            // `nLockTime` from `open_channel2.locktime` and each input's
+            // `nSequence` from `tx_add_input`, both of which the fuzzer picks
+            // freely, so it is routinely locked until a later block, either
+            // absolutely or relative to the inputs it spends.
+            if stderr.contains("non-final") || stderr.contains("non-BIP68-final") {
                 log::debug!("{txid} is not final yet, not broadcasting");
+                return None;
+            }
+            if stderr.contains("bad-txns-") {
+                log::debug!(
+                    "{txid} is consensus invalid, not broadcasting: {}",
+                    stderr.trim()
+                );
                 return None;
             }
             panic!("bitcoin-cli sendrawtransaction failed: {stderr}");
