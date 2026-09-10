@@ -9,6 +9,7 @@ use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use harness::*;
 use programs::*;
 use smite::bolt::{AcceptChannelTlvs, GossipTimestampFilter, Init, Ping, TxAbort};
+use smite::channel_tx::build_funding_witness_script;
 use smite::pending_channel::PendingChannelV2;
 use smite_ir::Instruction;
 use smite_ir::operation::{ChannelTypeVariant, ShutdownScriptVariant};
@@ -2878,15 +2879,7 @@ fn execute_recv_accept_channel2_affine_overuse_panics() {
 fn run_v2_negotiation(
     extra: Vec<Instruction>,
 ) -> Executor<MockConnection, MockBitcoinCli, MockTargetRpc> {
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32 channel_id
+    let mut instructions = v2_channel_id_instructions();
     instructions.extend(extra);
 
     let accept = sample_accept_channel2(sample_v2_temporary_channel_id());
@@ -2903,9 +2896,6 @@ fn run_v2_negotiation(
         .expect("program executes");
     executor
 }
-
-/// Index of the `channel_id` variable produced by [`run_v2_negotiation`].
-const V2_CHANNEL_ID_VAR: usize = 32;
 
 fn decode_sent<T>(bytes: &[u8], f: impl Fn(Message) -> Option<T>) -> T {
     let msg = Message::decode(bytes).expect("valid message");
@@ -2924,14 +2914,7 @@ fn sole_negotiation(
 
 #[test]
 fn execute_send_tx_add_input_proposes_a_wallet_utxo() {
-    let executor = run_v2_negotiation(vec![Instruction {
-        operation: Operation::SendTxAddInput {
-            serial_id: 2,
-            utxo_index: 0,
-            sequence: 0xffff_fffd,
-        },
-        inputs: vec![V2_CHANNEL_ID_VAR],
-    }]);
+    let executor = run_v2_negotiation(vec![tx_add_input(2, 0)]);
 
     let sent = decode_sent(executor.conn.sent.last().unwrap(), |m| match m {
         Message::TxAddInput(m) => Some(m),
@@ -2960,14 +2943,7 @@ fn execute_send_tx_add_input_proposes_a_wallet_utxo() {
 
 #[test]
 fn execute_send_tx_add_input_locks_the_selected_utxo() {
-    let executor = run_v2_negotiation(vec![Instruction {
-        operation: Operation::SendTxAddInput {
-            serial_id: 2,
-            utxo_index: 0,
-            sequence: 0xffff_fffd,
-        },
-        inputs: vec![V2_CHANNEL_ID_VAR],
-    }]);
+    let executor = run_v2_negotiation(vec![tx_add_input(2, 0)]);
 
     // Locking is what stops a later selection proposing the same coin,
     // which the peer would reject as a duplicate input.
@@ -3016,13 +2992,7 @@ fn execute_send_tx_add_input_with_an_empty_wallet_sends_an_empty_prevtx() {
 
 #[test]
 fn execute_send_tx_add_output_derives_the_funding_output() {
-    let executor = run_v2_negotiation(vec![Instruction {
-        operation: Operation::SendTxAddOutput {
-            serial_id: 4,
-            role: TxOutputRole::Funding,
-        },
-        inputs: vec![V2_CHANNEL_ID_VAR, 3, 25],
-    }]);
+    let executor = run_v2_negotiation(vec![tx_add_output(4, TxOutputRole::Funding)]);
 
     let sent = decode_sent(executor.conn.sent.last().unwrap(), |m| match m {
         Message::TxAddOutput(m) => Some(m),
@@ -3045,28 +3015,9 @@ fn execute_send_tx_add_output_derives_the_funding_output() {
 #[test]
 fn execute_send_tx_add_output_change_covers_the_funding_and_the_fee() {
     let executor = run_v2_negotiation(vec![
-        Instruction {
-            operation: Operation::SendTxAddInput {
-                serial_id: 2,
-                utxo_index: 0,
-                sequence: 0xffff_fffd,
-            },
-            inputs: vec![V2_CHANNEL_ID_VAR],
-        },
-        Instruction {
-            operation: Operation::SendTxAddOutput {
-                serial_id: 4,
-                role: TxOutputRole::Funding,
-            },
-            inputs: vec![V2_CHANNEL_ID_VAR, 3, 25],
-        },
-        Instruction {
-            operation: Operation::SendTxAddOutput {
-                serial_id: 6,
-                role: TxOutputRole::Change,
-            },
-            inputs: vec![V2_CHANNEL_ID_VAR, 3, 25],
-        },
+        tx_add_input(2, 0),
+        tx_add_output(4, TxOutputRole::Funding),
+        tx_add_output(6, TxOutputRole::Change),
     ]);
 
     let sent = decode_sent(executor.conn.sent.last().unwrap(), |m| match m {
@@ -3105,27 +3056,9 @@ fn execute_send_tx_remove_input_keeps_the_peers_input() {
         &sample_v2_revocation_basepoint(),
         &sample_accept_channel2(sample_v2_temporary_channel_id()).revocation_basepoint,
     );
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32
-    instructions.push(Instruction {
-        operation: Operation::SendTxAddInput {
-            serial_id: 2,
-            utxo_index: 0,
-            sequence: 0xffff_fffd,
-        },
-        inputs: vec![32],
-    }); // v33
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![33],
-    }); // the peer contributes an input of its own
+    let mut instructions = v2_channel_id_instructions();
+    instructions.push(tx_add_input(2, 0)); // v33
+    instructions.push(recv_interactive_tx(33)); // the peer contributes an input of its own
     instructions.push(Instruction {
         // BOLT 2 forbids removing an input the peer added. A peer that
         // receives one keeps its input, so we must keep it too or our
@@ -3202,17 +3135,8 @@ fn execute_send_tx_remove_output_keeps_the_peers_output() {
         operation: Operation::DeriveChannelIdV2,
         inputs: vec![13, 31],
     });
-    instructions.push(Instruction {
-        operation: Operation::SendTxAddOutput {
-            serial_id: 4,
-            role: TxOutputRole::Funding,
-        },
-        inputs: vec![32, 3, 25],
-    }); // v33
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![33],
-    });
+    instructions.push(tx_add_output(4, TxOutputRole::Funding)); // v33
+    instructions.push(recv_interactive_tx(33));
     instructions.push(Instruction {
         operation: Operation::SendTxRemoveOutput { serial_id: 5 },
         inputs: vec![32],
@@ -3263,23 +3187,9 @@ fn execute_recv_interactive_tx_records_peer_contributions() {
         &sample_v2_revocation_basepoint(),
         &sample_accept_channel2(sample_v2_temporary_channel_id()).revocation_basepoint,
     );
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32
-    instructions.push(Instruction {
-        operation: Operation::SendTxComplete,
-        inputs: vec![32],
-    }); // v33
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![33],
-    });
+    let mut instructions = v2_channel_id_instructions();
+    instructions.push(tx_complete()); // v33
+    instructions.push(recv_interactive_tx(33));
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -3326,43 +3236,13 @@ fn execute_recv_interactive_tx_records_peer_contributions() {
 #[test]
 fn execute_recv_interactive_tx_remove_input_keeps_our_input() {
     let channel_id = v2_channel_id();
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32
-    instructions.push(Instruction {
-        operation: Operation::SendTxAddInput {
-            serial_id: 2,
-            utxo_index: 0,
-            sequence: 0xffff_fffd,
-        },
-        inputs: vec![32],
-    }); // v33
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![33],
-    }); // the peer adds an input
-    instructions.push(Instruction {
-        operation: Operation::SendTxComplete,
-        inputs: vec![32],
-    }); // v35
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![35],
-    }); // the peer removes ours, which BOLT 2 forbids
-    instructions.push(Instruction {
-        operation: Operation::SendTxComplete,
-        inputs: vec![32],
-    }); // v37
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![37],
-    }); // the peer removes its own
+    let mut instructions = v2_channel_id_instructions();
+    instructions.push(tx_add_input(2, 0)); // v33
+    instructions.push(recv_interactive_tx(33)); // the peer adds an input
+    instructions.push(tx_complete()); // v35
+    instructions.push(recv_interactive_tx(35)); // the peer removes ours, which BOLT 2 forbids
+    instructions.push(tx_complete()); // v37
+    instructions.push(recv_interactive_tx(37)); // the peer removes its own
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -3418,42 +3298,13 @@ fn execute_recv_interactive_tx_remove_input_keeps_our_input() {
 #[test]
 fn execute_recv_interactive_tx_remove_output_keeps_our_output() {
     let channel_id = v2_channel_id();
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32
-    instructions.push(Instruction {
-        operation: Operation::SendTxAddOutput {
-            serial_id: 4,
-            role: TxOutputRole::Funding,
-        },
-        inputs: vec![32, 3, 25],
-    }); // v33
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![33],
-    }); // the peer adds an output
-    instructions.push(Instruction {
-        operation: Operation::SendTxComplete,
-        inputs: vec![32],
-    }); // v35
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![35],
-    }); // the peer removes ours, which BOLT 2 forbids
-    instructions.push(Instruction {
-        operation: Operation::SendTxComplete,
-        inputs: vec![32],
-    }); // v37
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![37],
-    }); // the peer removes its own
+    let mut instructions = v2_channel_id_instructions();
+    instructions.push(tx_add_output(4, TxOutputRole::Funding)); // v33
+    instructions.push(recv_interactive_tx(33)); // the peer adds an output
+    instructions.push(tx_complete()); // v35
+    instructions.push(recv_interactive_tx(35)); // the peer removes ours, which BOLT 2 forbids
+    instructions.push(tx_complete()); // v37
+    instructions.push(recv_interactive_tx(37)); // the peer removes its own
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -3510,10 +3361,7 @@ fn execute_recv_interactive_tx_for_an_unknown_channel_is_ignored() {
         operation: Operation::SendTxComplete,
         inputs: vec![27],
     }); // v31
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![31],
-    });
+    instructions.push(recv_interactive_tx(31));
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -3551,10 +3399,7 @@ fn execute_recv_interactive_tx_unexpected_message() {
         operation: Operation::SendTxComplete,
         inputs: vec![27],
     });
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![31],
-    });
+    instructions.push(recv_interactive_tx(31));
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -3585,14 +3430,8 @@ fn execute_recv_interactive_tx_affine_overuse_panics() {
         operation: Operation::SendTxComplete,
         inputs: vec![27],
     });
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![31],
-    });
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![31],
-    });
+    instructions.push(recv_interactive_tx(31));
+    instructions.push(recv_interactive_tx(31));
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -3653,14 +3492,7 @@ fn counterparty_commitment_signed(
 #[test]
 fn execute_build_funding_transaction_v2_locates_the_funding_output() {
     let mut executor = Executor::new(
-        {
-            let mut conn = MockConnection::new();
-            conn.queue_recv(
-                Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id()))
-                    .encode(),
-            );
-            conn
-        },
+        v2_flow_connection(),
         sample_v2_wallet(),
         MockTargetRpc::default(),
         sample_context(),
@@ -3725,10 +3557,7 @@ fn execute_build_funding_transaction_v2_unknown_channel_is_empty() {
 
 #[test]
 fn execute_send_commitment_signed_tracks_the_channel() {
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(
         conn,
         sample_v2_wallet(),
@@ -3787,7 +3616,7 @@ fn execute_send_commitment_signed_splits_the_balance_by_contribution() {
     // The acceptor contributes half the channel.
     accept.funding_satoshis = 200_000;
     let mut conn = MockConnection::new();
-    conn.queue_recv(Message::AcceptChannel2(accept).encode());
+    queue_v2_flow_replies(&mut conn, accept);
     let mut executor = Executor::new(
         conn,
         sample_v2_wallet(),
@@ -3870,10 +3699,7 @@ fn execute_send_commitment_signed_commits_to_the_advertised_funding_pubkey() {
     // advertised key; deriving it from the signing key instead would leave
     // us verifying a different transaction and reporting the peer's correct
     // signature as invalid.
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(
         conn,
         sample_v2_wallet(),
@@ -3914,10 +3740,7 @@ fn execute_send_commitment_signed_commits_to_the_advertised_funding_pubkey() {
 #[test]
 fn execute_recv_commitment_signed_accepts_a_valid_signature() {
     let acceptor_key = sample_acceptor_funding_privkey();
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(
         conn,
         sample_v2_wallet(),
@@ -3939,8 +3762,9 @@ fn execute_recv_commitment_signed_accepts_a_valid_signature() {
         .expect("program executes");
 
     let reply = counterparty_commitment_signed(&executor, v2_channel_id(), &acceptor_key);
-    executor.conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+    queue_v2_flow_replies(
+        &mut executor.conn,
+        sample_accept_channel2(sample_v2_temporary_channel_id()),
     );
     executor
         .conn
@@ -3974,10 +3798,7 @@ fn execute_recv_commitment_signed_accepts_a_valid_signature() {
 
 #[test]
 fn execute_recv_commitment_signed_rejects_an_invalid_signature() {
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let mut conn = v2_flow_connection();
     conn.queue_recv(
         Message::CommitmentSigned(CommitmentSigned {
             channel_id: v2_channel_id(),
@@ -4028,10 +3849,7 @@ fn execute_recv_commitment_signed_rejects_an_invalid_signature() {
 
 #[test]
 fn execute_recv_commitment_signed_ignores_a_signature_over_another_funding_output() {
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let mut conn = v2_flow_connection();
     conn.queue_recv(
         Message::CommitmentSigned(CommitmentSigned {
             channel_id: v2_channel_id(),
@@ -4093,9 +3911,13 @@ fn execute_recv_commitment_signed_ignores_a_signature_over_another_funding_outpu
 
 #[test]
 fn execute_recv_commitment_signed_ignores_a_signature_over_a_stale_funding_transaction() {
-    let mut conn = MockConnection::new();
+    let mut conn = v2_flow_connection();
+    // The reply to the output added after the funding transaction was built.
     conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+        Message::TxComplete(TxComplete {
+            channel_id: v2_channel_id(),
+        })
+        .encode(),
     );
     conn.queue_recv(
         Message::CommitmentSigned(CommitmentSigned {
@@ -4121,17 +3943,11 @@ fn execute_recv_commitment_signed_ignores_a_signature_over_a_stale_funding_trans
             &Program {
                 instructions: v2_flow_instructions(vec![
                     // Another output after the funding transaction was
-                    // built, standing in for a mutated program that builds
-                    // it before the negotiation concludes: the funding
-                    // output is intact, but the txid the peer signs over
-                    // is a different one.
-                    Instruction {
-                        operation: Operation::SendTxAddOutput {
-                            serial_id: 8,
-                            role: TxOutputRole::Change,
-                        },
-                        inputs: vec![32, 3, 25],
-                    }, // v37
+                    // built, standing in for a mutated program that keeps
+                    // contributing past the transaction it signs over: the
+                    // funding output is intact, but the txid the peer signs
+                    // over is a different one.
+                    tx_add_output(8, TxOutputRole::Change), // v37
                     Instruction {
                         operation: Operation::SendCommitmentSigned,
                         inputs: vec![36, 10, 32],
@@ -4154,10 +3970,7 @@ fn execute_recv_commitment_signed_ignores_a_signature_over_a_stale_funding_trans
 
 #[test]
 fn execute_recv_commitment_signed_after_sending_on_the_temporary_id_is_ignored() {
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let mut conn = v2_flow_connection();
     // The peer sends its commitment_signed on the derived id as soon as the
     // exchange concludes, whatever we sent it.
     conn.queue_recv(
@@ -4216,10 +4029,7 @@ fn execute_recv_commitment_signed_after_sending_on_the_temporary_id_is_ignored()
 #[test]
 fn execute_recv_commitment_signed_rejects_htlc_signatures() {
     let acceptor_key = sample_acceptor_funding_privkey();
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(
         conn,
         sample_v2_wallet(),
@@ -4241,8 +4051,9 @@ fn execute_recv_commitment_signed_rejects_htlc_signatures() {
     let mut reply = counterparty_commitment_signed(&executor, v2_channel_id(), &acceptor_key);
     // BOLT 2 forbids HTLCs in the first commitment of a v2 open.
     reply.htlc_signatures = vec![reply.signature];
-    executor.conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+    queue_v2_flow_replies(
+        &mut executor.conn,
+        sample_accept_channel2(sample_v2_temporary_channel_id()),
     );
     executor
         .conn
@@ -4354,10 +4165,7 @@ fn recv_commitment_signed_on_our_own_channel_without_state_is_a_violation() {
 
 #[test]
 fn execute_send_tx_signatures_carries_our_witnesses() {
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(
         conn,
         sample_v2_signing_wallet(),
@@ -4402,10 +4210,7 @@ fn execute_send_tx_signatures_skips_inputs_the_wallet_cannot_sign() {
     // The wallet holds the coin but cannot sign it, as it could not sign a
     // peer-contributed input.
     wallet.signable_outpoints.clear();
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(conn, wallet, MockTargetRpc::default(), sample_context());
 
     executor
@@ -4433,10 +4238,7 @@ fn execute_send_tx_signatures_skips_inputs_the_wallet_cannot_sign() {
 fn execute_send_tx_signatures_with_signing_failure_sends_no_witnesses() {
     let mut wallet = sample_v2_signing_wallet();
     wallet.signing_fails = true;
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(conn, wallet, MockTargetRpc::default(), sample_context());
 
     executor
@@ -4460,10 +4262,7 @@ fn execute_send_tx_signatures_with_signing_failure_sends_no_witnesses() {
 
 #[test]
 fn execute_recv_tx_signatures_is_a_noop_before_the_commitment_exchange() {
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(
         conn,
         sample_v2_wallet(),
@@ -4761,10 +4560,7 @@ fn validate_peer_witnesses_cannot_count_against_an_untracked_negotiation() {
 #[test]
 fn execute_recv_tx_signatures_reads_when_the_peer_signs_first() {
     let acceptor_key = sample_acceptor_funding_privkey();
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
+    let conn = v2_flow_connection();
     let mut executor = Executor::new(
         conn,
         sample_v2_signing_wallet(),
@@ -4784,8 +4580,9 @@ fn execute_recv_tx_signatures_reads_when_the_peer_signs_first() {
         .expect("program executes");
 
     let reply = counterparty_commitment_signed(&executor, v2_channel_id(), &acceptor_key);
-    executor.conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+    queue_v2_flow_replies(
+        &mut executor.conn,
+        sample_accept_channel2(sample_v2_temporary_channel_id()),
     );
     executor
         .conn
@@ -4842,15 +4639,7 @@ fn execute_recv_interactive_tx_stops_once_the_exchange_concludes() {
     // then makes two consecutive ones, concluding the exchange, and the
     // peer moves straight on to commitment_signed.
     let channel_id = v2_channel_id();
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32
+    let mut instructions = v2_channel_id_instructions();
     // Each send is followed by the peer's reply, as the turn-based
     // protocol and the generator both require.
     let sends = [
@@ -4940,15 +4729,7 @@ fn execute_recv_interactive_tx_settles_a_backlog_left_by_a_dropped_receive() {
     // replies to all five contributions and stays silent after the
     // tx_complete that concludes the exchange, leaving one reply owed.
     let channel_id = v2_channel_id();
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32
+    let mut instructions = v2_channel_id_instructions();
 
     let sends = [
         Operation::SendTxAddInput {
@@ -5049,47 +4830,20 @@ fn execute_recv_interactive_tx_drops_contributions_sent_after_the_conclusion() {
     // agree, or the peer's perfectly good commitment signature reads as
     // invalid.
     let channel_id = v2_channel_id();
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32
+    let mut instructions = v2_channel_id_instructions();
 
-    let add_input = |serial_id, utxo_index| Instruction {
-        operation: Operation::SendTxAddInput {
-            serial_id,
-            utxo_index,
-            sequence: 0xffff_fffd,
-        },
-        inputs: vec![32],
-    };
-    let add_output = |serial_id, role| Instruction {
-        operation: Operation::SendTxAddOutput { serial_id, role },
-        inputs: vec![32, 3, 25],
-    };
-    let recv = |sent| Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![sent],
-    };
-    instructions.push(add_input(2, 0)); // v33
-    instructions.push(recv(33));
-    instructions.push(add_input(4, 1)); // v35
-    instructions.push(recv(35));
-    instructions.push(add_input(6, 2)); // v37
-    instructions.push(add_output(2000, TxOutputRole::Funding)); // v38
-    instructions.push(Instruction {
-        operation: Operation::SendTxComplete,
-        inputs: vec![32],
-    }); // v39
-    instructions.push(add_output(2002, TxOutputRole::Change)); // v40
-    instructions.push(recv(40));
-    instructions.push(recv(39));
+    instructions.push(tx_add_input(2, 0)); // v33
+    instructions.push(recv_interactive_tx(33));
+    instructions.push(tx_add_input(4, 1)); // v35
+    instructions.push(recv_interactive_tx(35));
+    instructions.push(tx_add_input(6, 2)); // v37
+    instructions.push(tx_add_output(2000, TxOutputRole::Funding)); // v38
+    instructions.push(tx_complete()); // v39
+    instructions.push(tx_add_output(2002, TxOutputRole::Change)); // v40
+    instructions.push(recv_interactive_tx(40));
+    instructions.push(recv_interactive_tx(39));
     // The exchange has concluded, so this one has nothing to read.
-    instructions.push(recv(37));
+    instructions.push(recv_interactive_tx(37));
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -5155,45 +4909,13 @@ fn execute_send_after_a_known_conclusion_is_not_recorded() {
     // The peer's tx_complete has been read, so ours concludes the exchange
     // on the spot and a later contribution is neither recorded nor waited on.
     let channel_id = v2_channel_id();
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    }); // v31
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    }); // v32
-    instructions.push(Instruction {
-        operation: Operation::SendTxAddOutput {
-            serial_id: 2000,
-            role: TxOutputRole::Funding,
-        },
-        inputs: vec![32, 3, 25],
-    }); // v33
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![33],
-    });
-    instructions.push(Instruction {
-        operation: Operation::SendTxComplete,
-        inputs: vec![32],
-    }); // v35
-    instructions.push(Instruction {
-        operation: Operation::SendTxAddOutput {
-            serial_id: 2002,
-            role: TxOutputRole::Change,
-        },
-        inputs: vec![32, 3, 25],
-    }); // v36
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![36],
-    });
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![35],
-    });
+    let mut instructions = v2_channel_id_instructions();
+    instructions.push(tx_add_output(2000, TxOutputRole::Funding)); // v33
+    instructions.push(recv_interactive_tx(33));
+    instructions.push(tx_complete()); // v35
+    instructions.push(tx_add_output(2002, TxOutputRole::Change)); // v36
+    instructions.push(recv_interactive_tx(36));
+    instructions.push(recv_interactive_tx(35));
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -5226,15 +4948,15 @@ fn execute_send_after_a_known_conclusion_is_not_recorded() {
 
 #[test]
 fn execute_recv_interactive_tx_still_reads_mid_exchange() {
-    // Only our own tx_complete is outstanding, so the peer still owes a
-    // reply and the receive must not be skipped.
+    // Three contributions go out and only one reply is read. The peer's
+    // tx_complete answered our first send, not our latest, so the exchange
+    // is not concluded and the receive must not be skipped.
     let channel_id = v2_channel_id();
-    let instructions = v2_flow_instructions(vec![Instruction {
-        operation: Operation::RecvInteractiveTx,
-        // The change output's send token: we have contributed since our
-        // last tx_complete, so the exchange is still open.
-        inputs: vec![35],
-    }]);
+    let mut instructions = v2_channel_id_instructions();
+    instructions.push(tx_add_input(2, 0)); // v33
+    instructions.push(tx_add_input(4, 1)); // v34
+    instructions.push(tx_add_input(6, 2)); // v35
+    instructions.push(recv_interactive_tx(35));
 
     let mut conn = MockConnection::new();
     conn.queue_recv(
@@ -5257,12 +4979,248 @@ fn execute_recv_interactive_tx_still_reads_mid_exchange() {
         "the reply was not read"
     );
     let pending = sole_negotiation(&executor);
-    // Three contributions went out and one reply came back, so the peer
-    // still owes two and the next receive must not skip either. Its
-    // tx_complete answered our first send, not our latest, so the exchange
-    // is not concluded.
+    // The peer still owes two replies and the next receive must not skip
+    // either.
     assert!(!pending.tx_exchange.concluded());
     assert_eq!(pending.tx_exchange.outstanding_replies(), 2);
+}
+
+/// The program from a real CLN run: four contributions go out with three
+/// replies unread, then a `tx_complete` and a change output. The peer's
+/// `tx_complete` answering the last input and ours are consecutive, so the
+/// exchange concluded without the change output, but the program builds the
+/// funding transaction and signs over it before reading the reply that says
+/// so. Both are answered on `channel_id` 32; `extra` follows the send.
+fn settle_before_build_instructions(extra: Vec<Instruction>) -> Vec<Instruction> {
+    let mut instructions = v2_channel_id_instructions();
+
+    instructions.push(tx_add_input(2, 0)); // v33
+    instructions.push(tx_add_output(2000, TxOutputRole::Funding)); // v34
+    instructions.push(tx_add_input(4, 1)); // v35
+    instructions.push(tx_add_input(6, 2)); // v36
+    instructions.push(recv_interactive_tx(33)); // v37
+    instructions.push(tx_complete()); // v38
+    instructions.push(tx_add_output(2002, TxOutputRole::Change)); // v39
+    instructions.push(recv_interactive_tx(39)); // v40
+    instructions.push(recv_interactive_tx(38)); // v41
+    // The reply to input 6 is still unread here.
+    instructions.push(Instruction {
+        operation: Operation::BuildFundingTransactionV2,
+        inputs: vec![32],
+    }); // v42
+    instructions.push(Instruction {
+        operation: Operation::SendCommitmentSigned,
+        inputs: vec![42, 10, 32],
+    }); // v43
+    instructions.push(recv_interactive_tx(36)); // v44
+    instructions.extend(extra);
+    instructions
+}
+
+/// Queues the peer's side of [`settle_before_build_instructions`]: one
+/// `tx_complete` per contribution before our own `tx_complete`, then whatever
+/// the peer moved on to.
+fn queue_settle_before_build_replies(conn: &mut MockConnection, then: &Message) {
+    conn.queue_recv(
+        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+    );
+    for _ in 0..4 {
+        conn.queue_recv(
+            Message::TxComplete(TxComplete {
+                channel_id: v2_channel_id(),
+            })
+            .encode(),
+        );
+    }
+    conn.queue_recv(then.encode());
+}
+
+#[test]
+fn execute_build_funding_transaction_v2_reads_owed_replies_first() {
+    let mut conn = MockConnection::new();
+    queue_settle_before_build_replies(
+        &mut conn,
+        &Message::CommitmentSigned(CommitmentSigned {
+            channel_id: v2_channel_id(),
+            signature: Signature::from_compact(&[0u8; 64]).expect("zero signature"),
+            htlc_signatures: Vec::new(),
+            tlvs: CommitmentSignedTlvs::default(),
+        }),
+    );
+    let mut executor = Executor::new(
+        conn,
+        sample_v2_wallet(),
+        MockTargetRpc::default(),
+        sample_context(),
+    );
+
+    executor
+        .execute(
+            &Program {
+                instructions: settle_before_build_instructions(vec![]),
+            },
+            std::time::Instant::now(),
+        )
+        .expect("program executes");
+
+    // Building read the reply to input 6, which concluded the exchange and
+    // dropped the change output, so the transaction we signed over is the
+    // one the peer negotiated.
+    let pending = sole_negotiation(&executor);
+    assert!(pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 0);
+    let outputs: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(outputs, vec![2000]);
+    let state = &executor.channel_states[&v2_channel_id()];
+    assert!(state.is_funding_outpoint_valid);
+    assert_eq!(
+        state.config.funding_outpoint.txid,
+        pending.tx_exchange.shared_tx().build().compute_txid(),
+    );
+    // Only what was owed was read: the peer's commitment_signed is still
+    // there for RecvCommitmentSigned, and the receive after the send found
+    // nothing owed.
+    assert_eq!(executor.conn.recv_queue.len(), 1);
+}
+
+#[test]
+fn execute_recv_commitment_signed_verifies_against_the_settled_funding_transaction() {
+    // The false positive the settling exists for: the peer signs over the
+    // transaction it negotiated, and so must we.
+    let acceptor_key = sample_acceptor_funding_privkey();
+    let mut conn = MockConnection::new();
+    queue_settle_before_build_replies(
+        &mut conn,
+        &Message::CommitmentSigned(CommitmentSigned {
+            channel_id: v2_channel_id(),
+            signature: Signature::from_compact(&[0u8; 64]).expect("zero signature"),
+            htlc_signatures: Vec::new(),
+            tlvs: CommitmentSignedTlvs::default(),
+        }),
+    );
+    let mut executor = Executor::new(
+        conn,
+        sample_v2_wallet(),
+        MockTargetRpc::default(),
+        sample_context(),
+    );
+
+    // First run establishes the channel state we need to sign against.
+    executor
+        .execute(
+            &Program {
+                instructions: settle_before_build_instructions(vec![]),
+            },
+            std::time::Instant::now(),
+        )
+        .expect("program executes");
+    executor.conn.recv_queue.clear();
+
+    // The peer signs over the outpoint it negotiated, whatever we tracked,
+    // so the reply is built over that one and only then verified against
+    // our state.
+    let negotiated = {
+        let pending = sole_negotiation(&executor);
+        let accept = pending
+            .accept_channel2
+            .as_ref()
+            .expect("accept_channel2 received");
+        let script = build_funding_witness_script(
+            &pending.open_channel2.funding_pubkey,
+            &accept.funding_pubkey,
+        )
+        .to_p2wsh();
+        let funding = pending
+            .tx_exchange
+            .shared_tx()
+            .build_funding(&script, pending.total_funding_satoshis());
+        OutPoint {
+            txid: funding.tx.compute_txid(),
+            vout: funding.vout,
+        }
+    };
+    let tracked = {
+        let state = executor
+            .channel_states
+            .get_mut(&v2_channel_id())
+            .expect("channel tracked");
+        std::mem::replace(&mut state.config.funding_outpoint, negotiated)
+    };
+    let reply = counterparty_commitment_signed(&executor, v2_channel_id(), &acceptor_key);
+    executor
+        .channel_states
+        .get_mut(&v2_channel_id())
+        .expect("channel tracked")
+        .config
+        .funding_outpoint = tracked;
+    queue_settle_before_build_replies(&mut executor.conn, &Message::CommitmentSigned(reply));
+    executor
+        .execute(
+            &Program {
+                instructions: settle_before_build_instructions(vec![Instruction {
+                    operation: Operation::RecvCommitmentSigned,
+                    inputs: vec![43],
+                }]),
+            },
+            std::time::Instant::now(),
+        )
+        .expect("the peer's signature over the negotiated transaction verifies");
+
+    assert!(
+        sole_negotiation(&executor)
+            .commitment_exchange
+            .commitment_signed
+            .received
+    );
+}
+
+#[test]
+fn execute_send_tx_signatures_reads_owed_replies_first() {
+    let mut conn = v2_flow_connection();
+    // The reply to the output added after the funding transaction was built.
+    conn.queue_recv(
+        Message::TxComplete(TxComplete {
+            channel_id: v2_channel_id(),
+        })
+        .encode(),
+    );
+    let mut executor = Executor::new(
+        conn,
+        sample_v2_signing_wallet(),
+        MockTargetRpc::default(),
+        sample_context(),
+    );
+
+    executor
+        .execute(
+            &Program {
+                instructions: v2_flow_instructions(vec![
+                    tx_add_output(8, TxOutputRole::Change), // v37
+                    Instruction {
+                        operation: Operation::SendTxSignatures,
+                        inputs: vec![32, 36],
+                    },
+                ]),
+            },
+            std::time::Instant::now(),
+        )
+        .expect("program executes");
+
+    assert!(
+        executor.conn.recv_queue.is_empty(),
+        "the reply was not read"
+    );
+    assert_eq!(
+        sole_negotiation(&executor)
+            .tx_exchange
+            .outstanding_replies(),
+        0
+    );
 }
 
 #[test]
@@ -5272,10 +5230,7 @@ fn execute_recv_interactive_tx_records_a_peer_abort() {
         operation: Operation::SendTxComplete,
         inputs: vec![27],
     }); // v31
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![31],
-    });
+    instructions.push(recv_interactive_tx(31));
 
     let mut conn = MockConnection::new();
     conn.queue_recv(

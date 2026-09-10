@@ -35,20 +35,9 @@ pub enum Step {
     Complete,
 }
 
-/// A message we sent that the peer still owes a reply to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Sent {
-    Contribution,
-    /// Our `tx_complete`, with the shared transaction as it stood when it went
-    /// out. Should the exchange turn out to have concluded on it, nothing we
-    /// sent afterwards reached the peer's transaction, so ours goes back to
-    /// this.
-    Complete(SharedTransaction),
-}
-
 /// The shared transaction together with how far the exchange building it has
 /// progressed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TxExchange {
     shared_tx: SharedTransaction,
     /// Whether two consecutive `tx_complete`s have concluded the exchange.
@@ -62,12 +51,15 @@ pub struct TxExchange {
     /// on the spot. Only ever set while nothing is unanswered.
     peer_sent_tx_complete: bool,
     /// Messages we have sent that the peer still owes a reply to, oldest
-    /// first.
+    /// first. `Some` is our `tx_complete`, with the shared transaction as it
+    /// stood when it went out: should the exchange turn out to have concluded
+    /// on it, nothing we sent afterwards reached the peer's transaction, so
+    /// ours goes back to this. `None` is a contribution.
     ///
     /// Queuing rather than tracking only the latest send keeps a program
     /// whose sends and receives have been knocked out of step by a mutator
     /// from reading a message behind for the rest of its run.
-    unanswered: VecDeque<Sent>,
+    unanswered: VecDeque<Option<SharedTransaction>>,
 }
 
 impl TxExchange {
@@ -133,12 +125,11 @@ impl TxExchange {
             if self.peer_sent_tx_complete {
                 self.concluded = true;
             } else {
-                self.unanswered
-                    .push_back(Sent::Complete(self.shared_tx.clone()));
+                self.unanswered.push_back(Some(self.shared_tx.clone()));
             }
         } else {
             self.apply(step, Contributor::Local);
-            self.unanswered.push_back(Sent::Contribution);
+            self.unanswered.push_back(None);
         }
         self.peer_sent_tx_complete = false;
     }
@@ -159,32 +150,28 @@ impl TxExchange {
             return;
         }
 
-        let concluding = match answered {
-            Some(Sent::Complete(snapshot)) => Some(snapshot),
-            _ => match self.unanswered.pop_front() {
-                Some(Sent::Complete(snapshot)) => Some(snapshot),
-                Some(other) => {
-                    self.unanswered.push_front(other);
-                    None
-                }
-                None => None,
-            },
+        // Consecutive with ours if it answers our tx_complete, or if our
+        // tx_complete is the next thing we sent after what it answers.
+        let concluding = answered.flatten().or_else(|| {
+            self.unanswered
+                .pop_front_if(|sent| sent.is_some())
+                .flatten()
+        });
+        let Some(snapshot) = concluding else {
+            self.peer_sent_tx_complete = self.unanswered.is_empty();
+            return;
         };
-        match concluding {
-            Some(snapshot) => {
-                self.concluded = true;
-                self.peer_sent_tx_complete = false;
-                if !self.unanswered.is_empty() {
-                    log::debug!(
-                        "exchange concluded on an earlier tx_complete, \
-                         dropped {} contribution(s) sent after it",
-                        self.unanswered.len(),
-                    );
-                    self.unanswered.clear();
-                    self.shared_tx.restore_local(&snapshot);
-                }
-            }
-            None => self.peer_sent_tx_complete = self.unanswered.is_empty(),
+
+        self.concluded = true;
+        self.peer_sent_tx_complete = false;
+        if !self.unanswered.is_empty() {
+            log::debug!(
+                "exchange concluded on an earlier tx_complete, \
+                 dropped {} contribution(s) sent after it",
+                self.unanswered.len(),
+            );
+            self.unanswered.clear();
+            self.shared_tx.restore_local(&snapshot);
         }
     }
 
@@ -197,11 +184,6 @@ impl TxExchange {
     }
 
     /// Applies a contribution on behalf of `contributor`.
-    ///
-    /// BOLT 2 forbids removing what the other peer added, and has the
-    /// receiver fail the negotiation if it happens. Whoever sent such a
-    /// removal, the other side keeps the entry, so we keep it too and only
-    /// note the attempt.
     ///
     /// `SharedTransaction` caps inputs and outputs at BOLT 2's 252 and drops
     /// anything past that. The message still goes out, so from there on our
@@ -234,26 +216,22 @@ impl TxExchange {
                 }
             }
             Step::RemoveInput(serial_id) => {
-                let owned = self
+                if self
                     .shared_tx
-                    .inputs()
-                    .any(|(id, input)| id == serial_id && input.contributor == contributor);
-                if owned {
-                    self.shared_tx.remove_input(serial_id);
-                } else {
+                    .remove_input(serial_id, contributor)
+                    .is_none()
+                {
                     log::debug!(
                         "{contributor:?} removed input with serial_id {serial_id} it did not add, kept"
                     );
                 }
             }
             Step::RemoveOutput(serial_id) => {
-                let owned = self
+                if self
                     .shared_tx
-                    .outputs()
-                    .any(|(id, output)| id == serial_id && output.contributor == contributor);
-                if owned {
-                    self.shared_tx.remove_output(serial_id);
-                } else {
+                    .remove_output(serial_id, contributor)
+                    .is_none()
+                {
                     log::debug!(
                         "{contributor:?} removed output with serial_id {serial_id} it did not add, kept"
                     );

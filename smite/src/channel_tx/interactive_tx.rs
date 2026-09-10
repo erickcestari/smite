@@ -180,13 +180,33 @@ impl SharedTransaction {
         true
     }
 
-    /// Removes the input with `serial_id`, returning it when it was present.
-    pub fn remove_input(&mut self, serial_id: u64) -> Option<SharedInput> {
+    /// Removes the input with `serial_id` on behalf of `contributor`,
+    /// returning it when `contributor` had added it.
+    ///
+    /// BOLT 2 forbids removing what the other peer added, and has the
+    /// receiver fail the negotiation if it happens. Whoever sent such a
+    /// removal, the other side keeps the entry, so we keep it too and return
+    /// `None`.
+    pub fn remove_input(
+        &mut self,
+        serial_id: u64,
+        contributor: Contributor,
+    ) -> Option<SharedInput> {
+        if self.inputs.get(&serial_id)?.contributor != contributor {
+            return None;
+        }
         self.inputs.remove(&serial_id)
     }
 
-    /// Removes the output with `serial_id`, returning it when it was present.
-    pub fn remove_output(&mut self, serial_id: u64) -> Option<SharedOutput> {
+    /// Output sibling of [`Self::remove_input`].
+    pub fn remove_output(
+        &mut self,
+        serial_id: u64,
+        contributor: Contributor,
+    ) -> Option<SharedOutput> {
+        if self.outputs.get(&serial_id)?.contributor != contributor {
+            return None;
+        }
         self.outputs.remove(&serial_id)
     }
 
@@ -551,7 +571,7 @@ e37d3280b2e60e0000000017a9147ecd1b519326bc13b0ec716e469b58ed02b112a087f0006bee00
     #[test]
     fn build_funding_falls_back_to_vout_zero_without_a_funding_output() {
         let mut shared = appendix_g();
-        shared.remove_output(44);
+        shared.remove_output(44, Contributor::Local);
 
         let funding =
             shared.build_funding(&script(APPENDIX_G_FUNDING_SPK), APPENDIX_G_FUNDING_SATS);
@@ -677,7 +697,7 @@ e37d3280b2e60e0000000017a9147ecd1b519326bc13b0ec716e469b58ed02b112a087f0006bee00
             1,
             SharedInput::from_prevtx(&prevtx, 1, MAX_SEQUENCE, Contributor::Remote),
         );
-        shared.remove_output(2000);
+        shared.remove_output(2000, Contributor::Local);
         shared.add_output(2002, output(Contributor::Local));
 
         shared.restore_local(&snapshot);
@@ -706,13 +726,15 @@ e37d3280b2e60e0000000017a9147ecd1b519326bc13b0ec716e469b58ed02b112a087f0006bee00
     }
 
     #[test]
-    fn remove_reports_whether_the_serial_id_was_present() {
+    fn remove_only_takes_the_contributors_own_entries() {
         let mut shared = appendix_g();
 
-        assert!(shared.remove_input(20).is_some());
-        assert!(shared.remove_input(20).is_none());
-        assert!(shared.remove_output(44).is_some());
-        assert!(shared.remove_output(9999).is_none());
+        assert!(shared.remove_input(20, Contributor::Remote).is_none());
+        assert!(shared.remove_input(20, Contributor::Local).is_some());
+        assert!(shared.remove_input(20, Contributor::Local).is_none());
+        assert!(shared.remove_output(44, Contributor::Remote).is_none());
+        assert!(shared.remove_output(44, Contributor::Local).is_some());
+        assert!(shared.remove_output(9999, Contributor::Local).is_none());
     }
 
     // -- Fee responsibility --

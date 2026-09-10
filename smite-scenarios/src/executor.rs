@@ -17,8 +17,7 @@ use smite::bolt::{
 };
 use smite::channel_tx::{
     ChannelConfig, ChannelPartyConfig, ChannelState, Contributor, FundingTransaction,
-    HolderIdentity, SharedInput, SharedOutput, Side, Step, build_funding_transaction,
-    build_funding_witness_script, signs_first,
+    HolderIdentity, SharedInput, SharedOutput, Side, Step, build_funding_transaction, signs_first,
 };
 use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{AcceptChannelContext, AcceptChannelOracle, Oracle};
@@ -767,9 +766,8 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     let channel_id = consume_sent_interactive_tx(&mut variables, instr.inputs[0]);
                     if is_interactive_tx_expected(&self.negotiations_v2, channel_id) {
                         log::debug!("[{:?}] RecvInteractiveTx: waiting", start.elapsed());
-                        let msg = recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)?;
+                        let msg = self.recv_interactive_tx()?;
                         log::debug!("[{:?}] RecvInteractiveTx: got {msg}", start.elapsed());
-                        apply_interactive_tx(&mut self.negotiations_v2, msg)?;
                     } else {
                         log::debug!(
                             "[{:?}] RecvInteractiveTx: negotiation concluded, nothing to receive",
@@ -781,6 +779,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
 
                 Operation::BuildFundingTransactionV2 => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    self.settle_negotiation(channel_id)?;
                     let ft = build_funding_transaction_v2(&self.negotiations_v2, channel_id);
                     log::debug!(
                         "[{:?}] BuildFundingTransactionV2: txid={} vout={}",
@@ -792,6 +791,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                 }
 
                 Operation::SendCommitmentSigned => {
+                    self.settle_negotiation(resolve_channel_id(&variables, instr.inputs[2]))?;
                     let cs = build_commitment_signed(
                         &variables,
                         &instr.inputs,
@@ -846,6 +846,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
 
                 Operation::SendTxSignatures => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    self.settle_negotiation(channel_id)?;
                     let ts = build_tx_signatures(
                         &variables,
                         &instr.inputs,
@@ -871,6 +872,40 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
             variables.push(result);
         }
 
+        Ok(())
+    }
+
+    /// Reads the peer's next interactive transaction message and applies it
+    /// to the negotiation it names.
+    fn recv_interactive_tx(&mut self) -> Result<Message, ExecuteError> {
+        let msg = recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)?;
+        apply_interactive_tx(&mut self.negotiations_v2, &msg)?;
+        Ok(msg)
+    }
+
+    /// Reads every reply the peer still owes on `channel_id`, so what is
+    /// built from the negotiation next is what the peer negotiated.
+    ///
+    /// A program may send several messages before reading any reply, and
+    /// whether our `tx_complete` concluded the exchange is only known from
+    /// the reply to the message before it. Building the funding transaction
+    /// or signing over it while replies are owed would use a transaction the
+    /// peer may never have agreed to, and its perfectly good signatures
+    /// would then read as invalid. The replies are already on their way, so
+    /// reading them costs nothing, and a later `RecvInteractiveTx` finds
+    /// nothing owed and reads nothing.
+    ///
+    /// The count of owed replies is exact, so this never reads into whatever
+    /// the peer moved on to after the exchange.
+    fn settle_negotiation(&mut self, channel_id: ChannelId) -> Result<(), ExecuteError> {
+        while self
+            .negotiations_v2
+            .get(channel_id)
+            .is_some_and(|pending| pending.tx_exchange.expects_reply())
+        {
+            let msg = self.recv_interactive_tx()?;
+            log::debug!("settling negotiation {channel_id}: got {msg}");
+        }
         Ok(())
     }
 }
@@ -1366,13 +1401,7 @@ fn build_tx_add_output(
     let derived = match role {
         TxOutputRole::Explicit => None,
         TxOutputRole::Funding => negotiations.get(channel_id).and_then(|pending| {
-            let accept = pending.accept_channel2.as_ref()?;
-            let script = build_funding_witness_script(
-                &pending.open_channel2.funding_pubkey,
-                &accept.funding_pubkey,
-            )
-            .to_p2wsh();
-            Some((pending.total_funding_satoshis(), script))
+            Some((pending.total_funding_satoshis(), pending.funding_script()?))
         }),
         TxOutputRole::Change => {
             let change_script = cli.get_new_address_script_pubkey();
@@ -1429,7 +1458,7 @@ fn build_tx_add_output(
 /// view, and it will fail the negotiation if not.
 fn apply_interactive_tx(
     negotiations: &mut V2Negotiations,
-    msg: Message,
+    msg: &Message,
 ) -> Result<(), ExecuteError> {
     let (channel_id, step) = match msg {
         Message::TxAddInput(m) => (
@@ -1450,7 +1479,7 @@ fn apply_interactive_tx(
                 serial_id: m.serial_id,
                 output: SharedOutput {
                     value: m.sats,
-                    script_pubkey: ScriptBuf::from(m.script),
+                    script_pubkey: ScriptBuf::from(m.script.clone()),
                     contributor: Contributor::Remote,
                 },
             },
@@ -1509,14 +1538,7 @@ fn build_funding_transaction_v2(
         };
     };
 
-    let funding_script = pending.accept_channel2.as_ref().map(|accept| {
-        build_funding_witness_script(
-            &pending.open_channel2.funding_pubkey,
-            &accept.funding_pubkey,
-        )
-        .to_p2wsh()
-    });
-    match funding_script {
+    match pending.funding_script() {
         Some(script) => pending
             .tx_exchange
             .shared_tx()

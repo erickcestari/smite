@@ -5,12 +5,12 @@
 
 use std::collections::HashMap;
 
-use bitcoin::Witness;
+use bitcoin::{ScriptBuf, Witness};
 
 use crate::bolt::{
     AcceptChannel, AcceptChannel2, ChannelId, OpenChannel, OpenChannel2, TemporaryChannelId,
 };
-use crate::channel_tx::TxExchange;
+use crate::channel_tx::{TxExchange, build_funding_witness_script};
 
 /// Negotiation parameters for a channel being established.
 ///
@@ -81,6 +81,20 @@ impl PendingChannelV2 {
             commitment_exchange: CommitmentExchange::default(),
             peer_witnesses: Vec::new(),
         }
+    }
+
+    /// The funding output's `scriptPubKey`, once `accept_channel2` has
+    /// revealed the peer's funding pubkey.
+    #[must_use]
+    pub fn funding_script(&self) -> Option<ScriptBuf> {
+        let accept = self.accept_channel2.as_ref()?;
+        Some(
+            build_funding_witness_script(
+                &self.open_channel2.funding_pubkey,
+                &accept.funding_pubkey,
+            )
+            .to_p2wsh(),
+        )
     }
 
     /// Total funding output value: the sum of both peers' contributions, per

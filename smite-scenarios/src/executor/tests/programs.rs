@@ -2,6 +2,7 @@
 //!
 //! Each helper returns the instructions for one flow.
 
+use super::harness::*;
 use crate::executor::*;
 use smite_ir::Instruction;
 use smite_ir::operation::ChannelTypeVariant;
@@ -416,45 +417,100 @@ pub fn send_open_channel2_instructions() -> (Vec<Instruction>, usize) {
 
 // -- Commitment and signature exchange --
 
-/// Drives the full v2 flow through `tx_complete`, then appends `extra`.
-///
-/// Variable indices of interest: 32 is the v2 `channel_id`, 36 the funding
-/// transaction, 10 our funding private key.
-pub fn v2_flow_instructions(extra: Vec<Instruction>) -> Vec<Instruction> {
-    let (mut instructions, _) = send_open_channel2_instructions();
+/// Queues the peer's side of [`v2_flow_instructions`] on `conn`: its
+/// `accept_channel2`, then a `tx_complete` answering each of the three
+/// contributions, which `BuildFundingTransactionV2` reads to settle the
+/// negotiation before building.
+pub fn queue_v2_flow_replies(conn: &mut MockConnection, accept: AcceptChannel2) {
+    conn.queue_recv(Message::AcceptChannel2(accept).encode());
+    for _ in 0..3 {
+        conn.queue_recv(
+            Message::TxComplete(TxComplete {
+                channel_id: v2_channel_id(),
+            })
+            .encode(),
+        );
+    }
+}
+
+/// A connection with the peer's side of [`v2_flow_instructions`] queued.
+pub fn v2_flow_connection() -> MockConnection {
+    let mut conn = MockConnection::new();
+    queue_v2_flow_replies(
+        &mut conn,
+        sample_accept_channel2(sample_v2_temporary_channel_id()),
+    );
+    conn
+}
+
+/// Index of the v2 `channel_id` produced by [`v2_channel_id_instructions`].
+pub const V2_CHANNEL_ID_VAR: usize = 32;
+
+/// Emits the `open_channel2` / `accept_channel2` exchange and derives the v2
+/// `channel_id` from it, at [`V2_CHANNEL_ID_VAR`].
+pub fn v2_channel_id_instructions() -> Vec<Instruction> {
+    let (mut instructions, accept) = send_open_channel2_instructions();
     instructions.push(Instruction {
         operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
+        inputs: vec![accept],
     }); // v31
     instructions.push(Instruction {
         operation: Operation::DeriveChannelIdV2,
         inputs: vec![13, 31],
-    }); // v32 channel_id
-    instructions.push(Instruction {
+    }); // v32
+    instructions
+}
+
+// -- Interactive transaction steps on the v2 channel --
+
+pub fn tx_add_input(serial_id: u64, utxo_index: u8) -> Instruction {
+    Instruction {
         operation: Operation::SendTxAddInput {
-            serial_id: 2,
-            utxo_index: 0,
+            serial_id,
+            utxo_index,
             sequence: 0xffff_fffd,
         },
-        inputs: vec![32],
-    }); // v33
-    instructions.push(Instruction {
-        operation: Operation::SendTxAddOutput {
-            serial_id: 4,
-            role: TxOutputRole::Funding,
-        },
-        inputs: vec![32, 3, 25],
-    }); // v34
-    instructions.push(Instruction {
-        operation: Operation::SendTxAddOutput {
-            serial_id: 6,
-            role: TxOutputRole::Change,
-        },
-        inputs: vec![32, 3, 25],
-    }); // v35
+        inputs: vec![V2_CHANNEL_ID_VAR],
+    }
+}
+
+/// The value and script inputs only matter for [`TxOutputRole::Explicit`].
+pub fn tx_add_output(serial_id: u64, role: TxOutputRole) -> Instruction {
+    Instruction {
+        operation: Operation::SendTxAddOutput { serial_id, role },
+        inputs: vec![V2_CHANNEL_ID_VAR, 3, 25],
+    }
+}
+
+pub fn tx_complete() -> Instruction {
+    Instruction {
+        operation: Operation::SendTxComplete,
+        inputs: vec![V2_CHANNEL_ID_VAR],
+    }
+}
+
+/// Reads the reply to the send at instruction index `sent`.
+pub fn recv_interactive_tx(sent: usize) -> Instruction {
+    Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![sent],
+    }
+}
+
+/// Drives the v2 flow through our three contributions and the funding
+/// transaction built from them, then appends `extra`. The peer's replies
+/// come from [`v2_flow_connection`].
+///
+/// Variable indices of interest: 32 is the v2 `channel_id`, 36 the funding
+/// transaction, 10 our funding private key.
+pub fn v2_flow_instructions(extra: Vec<Instruction>) -> Vec<Instruction> {
+    let mut instructions = v2_channel_id_instructions();
+    instructions.push(tx_add_input(2, 0)); // v33
+    instructions.push(tx_add_output(4, TxOutputRole::Funding)); // v34
+    instructions.push(tx_add_output(6, TxOutputRole::Change)); // v35
     instructions.push(Instruction {
         operation: Operation::BuildFundingTransactionV2,
-        inputs: vec![32],
+        inputs: vec![V2_CHANNEL_ID_VAR],
     }); // v36 funding transaction
     instructions.extend(extra);
     instructions
