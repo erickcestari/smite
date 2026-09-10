@@ -198,9 +198,10 @@ impl TxExchange {
 
     /// Applies a contribution on behalf of `contributor`.
     ///
-    /// BOLT 2 forbids removing what the other peer added. If a program does
-    /// it anyway the peer keeps the entry, so only our own are dropped to stay
-    /// in step with it.
+    /// BOLT 2 forbids removing what the other peer added, and has the
+    /// receiver fail the negotiation if it happens. Whoever sent such a
+    /// removal, the other side keeps the entry, so we keep it too and only
+    /// note the attempt.
     ///
     /// `SharedTransaction` caps inputs and outputs at BOLT 2's 252 and drops
     /// anything past that. The message still goes out, so from there on our
@@ -233,20 +234,29 @@ impl TxExchange {
                 }
             }
             Step::RemoveInput(serial_id) => {
-                let ours = self
+                let owned = self
                     .shared_tx
                     .inputs()
-                    .any(|(id, input)| id == serial_id && input.contributor == Contributor::Local);
-                if contributor == Contributor::Remote || ours {
+                    .any(|(id, input)| id == serial_id && input.contributor == contributor);
+                if owned {
                     self.shared_tx.remove_input(serial_id);
+                } else {
+                    log::debug!(
+                        "{contributor:?} removed input with serial_id {serial_id} it did not add, kept"
+                    );
                 }
             }
             Step::RemoveOutput(serial_id) => {
-                let ours = self.shared_tx.outputs().any(|(id, output)| {
-                    id == serial_id && output.contributor == Contributor::Local
-                });
-                if contributor == Contributor::Remote || ours {
+                let owned = self
+                    .shared_tx
+                    .outputs()
+                    .any(|(id, output)| id == serial_id && output.contributor == contributor);
+                if owned {
                     self.shared_tx.remove_output(serial_id);
+                } else {
+                    log::debug!(
+                        "{contributor:?} removed output with serial_id {serial_id} it did not add, kept"
+                    );
                 }
             }
             Step::Complete => unreachable!("tx_complete contributes nothing"),
@@ -468,19 +478,21 @@ mod tests {
     }
 
     #[test]
-    fn our_removals_only_touch_our_own_entries() {
+    fn removals_only_touch_the_senders_own_entries() {
         let mut exchange = TxExchange::new(0);
         exchange.send(add_input(2));
         exchange.receive(add_input(1));
 
         exchange.send(Step::RemoveInput(1));
+        exchange.receive(Step::RemoveInput(2));
         assert_eq!(
             input_ids(&exchange),
             vec![(1, Contributor::Remote), (2, Contributor::Local)],
         );
 
         exchange.send(Step::RemoveInput(2));
-        assert_eq!(input_ids(&exchange), vec![(1, Contributor::Remote)]);
+        exchange.receive(Step::RemoveInput(1));
+        assert!(input_ids(&exchange).is_empty());
     }
 
     #[test]

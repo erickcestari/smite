@@ -3324,6 +3324,186 @@ fn execute_recv_interactive_tx_records_peer_contributions() {
 }
 
 #[test]
+fn execute_recv_interactive_tx_remove_input_keeps_our_input() {
+    let channel_id = v2_channel_id();
+    let (mut instructions, _) = send_open_channel2_instructions();
+    instructions.push(Instruction {
+        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
+        inputs: vec![30],
+    }); // v31
+    instructions.push(Instruction {
+        operation: Operation::DeriveChannelIdV2,
+        inputs: vec![13, 31],
+    }); // v32
+    instructions.push(Instruction {
+        operation: Operation::SendTxAddInput {
+            serial_id: 2,
+            utxo_index: 0,
+            sequence: 0xffff_fffd,
+        },
+        inputs: vec![32],
+    }); // v33
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![33],
+    }); // the peer adds an input
+    instructions.push(Instruction {
+        operation: Operation::SendTxComplete,
+        inputs: vec![32],
+    }); // v35
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![35],
+    }); // the peer removes ours, which BOLT 2 forbids
+    instructions.push(Instruction {
+        operation: Operation::SendTxComplete,
+        inputs: vec![32],
+    }); // v37
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![37],
+    }); // the peer removes its own
+
+    let mut conn = MockConnection::new();
+    conn.queue_recv(
+        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+    );
+    conn.queue_recv(
+        Message::TxAddInput(TxAddInput {
+            channel_id,
+            serial_id: 3,
+            prevtx: bitcoin::consensus::encode::serialize(&sample_prevtx()),
+            prevtx_vout: 0,
+            sequence: 0xffff_fffd,
+            tlvs: TxAddInputTlvs::default(),
+        })
+        .encode(),
+    );
+    conn.queue_recv(
+        Message::TxRemoveInput(TxRemoveInput {
+            channel_id,
+            serial_id: 2,
+        })
+        .encode(),
+    );
+    conn.queue_recv(
+        Message::TxRemoveInput(TxRemoveInput {
+            channel_id,
+            serial_id: 3,
+        })
+        .encode(),
+    );
+    let mut executor = Executor::new(
+        conn,
+        sample_v2_wallet(),
+        MockTargetRpc::default(),
+        sample_context(),
+    );
+
+    executor
+        .execute(&Program { instructions }, std::time::Instant::now())
+        .expect("program executes");
+
+    // The peer's illegal removal left ours in place; its own is gone.
+    let pending = sole_negotiation(&executor);
+    let remaining: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(remaining, vec![2]);
+}
+
+#[test]
+fn execute_recv_interactive_tx_remove_output_keeps_our_output() {
+    let channel_id = v2_channel_id();
+    let (mut instructions, _) = send_open_channel2_instructions();
+    instructions.push(Instruction {
+        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
+        inputs: vec![30],
+    }); // v31
+    instructions.push(Instruction {
+        operation: Operation::DeriveChannelIdV2,
+        inputs: vec![13, 31],
+    }); // v32
+    instructions.push(Instruction {
+        operation: Operation::SendTxAddOutput {
+            serial_id: 4,
+            role: TxOutputRole::Funding,
+        },
+        inputs: vec![32, 3, 25],
+    }); // v33
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![33],
+    }); // the peer adds an output
+    instructions.push(Instruction {
+        operation: Operation::SendTxComplete,
+        inputs: vec![32],
+    }); // v35
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![35],
+    }); // the peer removes ours, which BOLT 2 forbids
+    instructions.push(Instruction {
+        operation: Operation::SendTxComplete,
+        inputs: vec![32],
+    }); // v37
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![37],
+    }); // the peer removes its own
+
+    let mut conn = MockConnection::new();
+    conn.queue_recv(
+        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+    );
+    conn.queue_recv(
+        Message::TxAddOutput(TxAddOutput {
+            channel_id,
+            serial_id: 5,
+            sats: 50_000,
+            script: sample_change_spk().into_bytes(),
+        })
+        .encode(),
+    );
+    conn.queue_recv(
+        Message::TxRemoveOutput(TxRemoveOutput {
+            channel_id,
+            serial_id: 4,
+        })
+        .encode(),
+    );
+    conn.queue_recv(
+        Message::TxRemoveOutput(TxRemoveOutput {
+            channel_id,
+            serial_id: 5,
+        })
+        .encode(),
+    );
+    let mut executor = Executor::new(
+        conn,
+        sample_v2_wallet(),
+        MockTargetRpc::default(),
+        sample_context(),
+    );
+
+    executor
+        .execute(&Program { instructions }, std::time::Instant::now())
+        .expect("program executes");
+
+    let pending = sole_negotiation(&executor);
+    let remaining: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(remaining, vec![4]);
+}
+
+#[test]
 fn execute_recv_interactive_tx_for_an_unknown_channel_is_ignored() {
     let (mut instructions, _) = send_open_channel2_instructions();
     instructions.push(Instruction {
