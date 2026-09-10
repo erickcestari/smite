@@ -2,8 +2,10 @@
 //!
 //! Each helper returns the instructions for one flow.
 
+use super::harness::*;
 use crate::executor::*;
 use smite_ir::Instruction;
+use smite_ir::operation::ChannelTypeVariant;
 use std::str::FromStr;
 
 /// Builds the 20 `open_channel` input instructions in wire order.
@@ -241,4 +243,275 @@ pub fn recv_channel_ready_instructions(confirmations: u8) -> Vec<Instruction> {
         },
     ]);
     instrs
+}
+
+// -- Channel establishment v2 --
+
+/// Builds the `open_channel2` inputs, deriving the `temporary_channel_id`
+/// from our revocation basepoint (the `[0x22; 32]` key) as BOLT 2 requires.
+/// [`OPEN_CHANNEL2_INPUTS`] maps each wire field to its variable index.
+#[allow(clippy::too_many_lines)]
+pub fn open_channel2_instructions() -> Vec<Instruction> {
+    vec![
+        Instruction {
+            operation: Operation::LoadChainHashFromContext,
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadFeeratePerKw(253),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadFeeratePerKw(2500),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadAmount(200_000),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadAmount(546),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadAmount(100_000_000),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadAmount(1_000),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadU16(144),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadU16(483),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadBlockHeight(120),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x11; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![10],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x22; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![12],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x33; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![14],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x44; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![16],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x55; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![18],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x66; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![20],
+        },
+        Instruction {
+            operation: Operation::LoadPrivateKey([0x77; 32]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DerivePoint,
+            inputs: vec![22],
+        },
+        Instruction {
+            operation: Operation::LoadU8(0),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadBytes(vec![]),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::LoadChannelType(ChannelTypeVariant::Anchors),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::DeriveTemporaryChannelIdV2,
+            inputs: vec![13],
+        },
+    ]
+}
+
+/// Indices into [`open_channel2_instructions`], in `BuildOpenChannel2`
+/// wire order.
+pub const OPEN_CHANNEL2_INPUTS: [usize; 21] = [
+    0,  // chain_hash
+    27, // temporary_channel_id
+    1,  // funding_feerate_perkw
+    2,  // commitment_feerate_perkw
+    3,  // funding_satoshis
+    4,  // dust_limit_satoshis
+    5,  // max_htlc_value_in_flight_msat
+    6,  // htlc_minimum_msat
+    7,  // to_self_delay
+    8,  // max_accepted_htlcs
+    9,  // locktime
+    11, // funding_pubkey
+    13, // revocation_basepoint
+    15, // payment_basepoint
+    17, // delayed_payment_basepoint
+    19, // htlc_basepoint
+    21, // first_per_commitment_point
+    23, // second_per_commitment_point
+    24, // channel_flags
+    25, // upfront_shutdown_script
+    26, // channel_type
+];
+
+/// Emits the full `open_channel2` / `accept_channel2` exchange. The
+/// `AcceptChannel2` compound lands at the returned instruction index.
+pub fn send_open_channel2_instructions() -> (Vec<Instruction>, usize) {
+    let mut instructions = open_channel2_instructions();
+    instructions.push(Instruction {
+        operation: Operation::BuildOpenChannel2 {
+            require_confirmed_inputs: false,
+        },
+        inputs: OPEN_CHANNEL2_INPUTS.to_vec(),
+    }); // v28
+    instructions.push(Instruction {
+        operation: Operation::SendOpenChannel2,
+        inputs: vec![28],
+    }); // v29
+    instructions.push(Instruction {
+        operation: Operation::RecvAcceptChannel2,
+        inputs: vec![29],
+    }); // v30
+    (instructions, 30)
+}
+
+// -- Commitment and signature exchange --
+
+/// Queues the peer's side of [`v2_flow_instructions`] on `conn`: its
+/// `accept_channel2`, then a `tx_complete` answering each of the three
+/// contributions, which `BuildFundingTransactionV2` reads to settle the
+/// negotiation before building.
+pub fn queue_v2_flow_replies(conn: &mut MockConnection, accept: AcceptChannel2) {
+    conn.queue_recv(Message::AcceptChannel2(accept).encode());
+    for _ in 0..3 {
+        conn.queue_recv(
+            Message::TxComplete(TxComplete {
+                channel_id: v2_channel_id(),
+            })
+            .encode(),
+        );
+    }
+}
+
+/// A connection with the peer's side of [`v2_flow_instructions`] queued.
+pub fn v2_flow_connection() -> MockConnection {
+    let mut conn = MockConnection::new();
+    queue_v2_flow_replies(
+        &mut conn,
+        sample_accept_channel2(sample_v2_temporary_channel_id()),
+    );
+    conn
+}
+
+/// Index of the v2 `channel_id` produced by [`v2_channel_id_instructions`].
+pub const V2_CHANNEL_ID_VAR: usize = 32;
+
+/// Emits the `open_channel2` / `accept_channel2` exchange and derives the v2
+/// `channel_id` from it, at [`V2_CHANNEL_ID_VAR`].
+pub fn v2_channel_id_instructions() -> Vec<Instruction> {
+    let (mut instructions, accept) = send_open_channel2_instructions();
+    instructions.push(Instruction {
+        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
+        inputs: vec![accept],
+    }); // v31
+    instructions.push(Instruction {
+        operation: Operation::DeriveChannelIdV2,
+        inputs: vec![13, 31],
+    }); // v32
+    instructions
+}
+
+// -- Interactive transaction steps on the v2 channel --
+
+pub fn tx_add_input(serial_id: u64, utxo_index: u8) -> Instruction {
+    Instruction {
+        operation: Operation::SendTxAddInput {
+            serial_id,
+            utxo_index,
+            sequence: 0xffff_fffd,
+        },
+        inputs: vec![V2_CHANNEL_ID_VAR],
+    }
+}
+
+/// The value and script inputs only matter for [`TxOutputRole::Explicit`].
+pub fn tx_add_output(serial_id: u64, role: TxOutputRole) -> Instruction {
+    Instruction {
+        operation: Operation::SendTxAddOutput { serial_id, role },
+        inputs: vec![V2_CHANNEL_ID_VAR, 3, 25],
+    }
+}
+
+pub fn tx_complete() -> Instruction {
+    Instruction {
+        operation: Operation::SendTxComplete,
+        inputs: vec![V2_CHANNEL_ID_VAR],
+    }
+}
+
+/// Reads the reply to the send at instruction index `sent`.
+pub fn recv_interactive_tx(sent: usize) -> Instruction {
+    Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![sent],
+    }
+}
+
+/// Drives the v2 flow through our three contributions and the funding
+/// transaction built from them, then appends `extra`. The peer's replies
+/// come from [`v2_flow_connection`].
+///
+/// Variable indices of interest: 32 is the v2 `channel_id`, 36 the funding
+/// transaction, 10 our funding private key.
+pub fn v2_flow_instructions(extra: Vec<Instruction>) -> Vec<Instruction> {
+    let mut instructions = v2_channel_id_instructions();
+    instructions.push(tx_add_input(2, 0)); // v33
+    instructions.push(tx_add_output(4, TxOutputRole::Funding)); // v34
+    instructions.push(tx_add_output(6, TxOutputRole::Change)); // v35
+    instructions.push(Instruction {
+        operation: Operation::BuildFundingTransactionV2,
+        inputs: vec![V2_CHANNEL_ID_VAR],
+    }); // v36 funding transaction
+    instructions.extend(extra);
+    instructions
 }
