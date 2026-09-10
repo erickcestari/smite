@@ -139,10 +139,6 @@ impl BitcoinCli {
     /// Mines a single block containing the current mempool together with the
     /// transactions stored in `private_mempool`.
     ///
-    /// Since `generateblock` only includes the transactions it is given, the
-    /// current mempool (fetched via `getrawmempool`) is included as well so
-    /// already-broadcast transactions are not omitted from the block.
-    ///
     /// # Panics
     ///
     /// - If `bitcoin-cli getrawmempool`, `getnewaddress`, or `generateblock`
@@ -153,8 +149,28 @@ impl BitcoinCli {
     /// - If the combined transaction list contains a duplicate rawtx/txid or is
     ///   not topologically ordered.
     fn mine_block_including(&self, private_mempool: &[String]) {
+        self.generate_block_with_mempool(private_mempool, true)
+            .unwrap_or_else(|stderr| panic!("bitcoin-cli generateblock failed: {stderr}"));
+    }
+
+    /// Runs `generateblock` over the current mempool together with `extra`,
+    /// either submitting the block or, with `submit` false, only checking that
+    /// it would be valid. Returns the command's stderr if it exits non-zero.
+    ///
+    /// Since `generateblock` only includes the transactions it is given, the
+    /// current mempool (fetched via `getrawmempool`) is included as well, so
+    /// already-broadcast transactions are neither omitted from the block nor
+    /// missing as parents of `extra`.
+    ///
+    /// # Panics
+    ///
+    /// - If `bitcoin-cli getrawmempool`, `getnewaddress`, or `generateblock`
+    ///   fails to execute.
+    /// - If `getrawmempool` does not return valid JSON.
+    /// - If `getnewaddress` does not return a valid regtest address.
+    fn generate_block_with_mempool(&self, extra: &[String], submit: bool) -> Result<(), String> {
         let mut txs = self.get_raw_mempool();
-        txs.extend_from_slice(private_mempool);
+        txs.extend_from_slice(extra);
         let txs_json = serde_json::to_string(&txs).expect("tx list serializes to valid JSON");
 
         let address = self.get_new_address();
@@ -163,13 +179,14 @@ impl BitcoinCli {
             .arg("generateblock")
             .arg(address.to_string())
             .arg(&txs_json)
+            .arg(submit.to_string())
             .output()
             .expect("bitcoin-cli generateblock should not fail");
-        assert!(
-            gen_out.status.success(),
-            "bitcoin-cli generateblock failed: {}",
-            String::from_utf8_lossy(&gen_out.stderr)
-        );
+        if gen_out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&gen_out.stderr).into_owned())
+        }
     }
 
     /// Returns the txids currently in the node's mempool.
@@ -346,9 +363,9 @@ impl BitcoinCli {
     /// instead so the caller can mine it later, bypassing mempool policy.
     ///
     /// Returns `None` if the transaction has no inputs, was already confirmed,
-    /// could not be fully signed, is consensus invalid, or was broadcast
+    /// could not be fully signed, could not go in a block, or was broadcast
     /// successfully; or the hex-encoded raw transaction if it was rejected by
-    /// mempool policy.
+    /// mempool policy alone.
     ///
     /// # Panics
     ///
@@ -359,6 +376,8 @@ impl BitcoinCli {
     /// - If the broadcast is rejected for a reason other than a known mempool
     ///   policy rule, a consensus rule, or the transaction already being known
     ///   to the node.
+    /// - If a policy-rejected transaction fails the block validity check for
+    ///   a reason other than a consensus rule.
     /// - If a successful broadcast does not return a valid UTF-8 txid.
     /// - If the broadcasted txid does not match the given transaction's txid.
     #[must_use]
@@ -413,11 +432,32 @@ impl BitcoinCli {
             // one of the standard templates (`tx_add_output` sends whatever
             // script the fuzzer picked), return the transaction so it can be
             // mined directly, bypassing mempool policy.
+            //
+            // A policy rejection says nothing about the checks bitcoind never
+            // got to. Standardness runs before finality and input values, so
+            // a non-standard script or a second dust output hides a lock time
+            // still in the future or outputs worth more than the inputs, both
+            // of which a funding transaction the fuzzer negotiated has as
+            // readily. Only a transaction a block would accept is worth mining
+            // later, so ask bitcoind to assemble one without submitting it.
             if stderr.contains("dust")
                 || stderr.contains("min relay fee not met")
                 || stderr.contains("scriptpubkey")
             {
-                return Some(signed_tx.hex);
+                return match self
+                    .generate_block_with_mempool(std::slice::from_ref(&signed_tx.hex), false)
+                {
+                    Ok(()) => Some(signed_tx.hex),
+                    Err(stderr) if stderr.contains("bad-txns-") => {
+                        log::debug!(
+                            "{txid} fails mempool policy and cannot go in a block either, \
+                             not broadcasting: {}",
+                            stderr.trim()
+                        );
+                        None
+                    }
+                    Err(stderr) => panic!("bitcoin-cli generateblock failed: {stderr}"),
+                };
             }
             // The transaction may already be known to the node: the fuzzer can
             // broadcast the same transaction twice before mining, and in
