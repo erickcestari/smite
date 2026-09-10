@@ -2946,7 +2946,12 @@ fn execute_send_tx_add_input_proposes_a_wallet_utxo() {
     // The input is recorded with the value we know from the wallet, so the
     // change output can be computed from it.
     let pending = sole_negotiation(&executor);
-    let (serial_id, input) = pending.shared_tx.inputs().next().expect("input recorded");
+    let (serial_id, input) = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .next()
+        .expect("input recorded");
     assert_eq!(serial_id, 2);
     assert_eq!(input.contributor, Contributor::Local);
     assert_eq!(input.outpoint.txid, prevtx.compute_txid());
@@ -3161,7 +3166,12 @@ fn execute_send_tx_remove_input_keeps_the_peers_input() {
 
     // Ours is gone, the peer's survives.
     let pending = sole_negotiation(&executor);
-    let remaining: Vec<u64> = pending.shared_tx.inputs().map(|(id, _)| id).collect();
+    let remaining: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .map(|(id, _)| id)
+        .collect();
     assert_eq!(remaining, vec![3]);
 
     // Both removals still went on the wire; only our own changed local
@@ -3237,7 +3247,12 @@ fn execute_send_tx_remove_output_keeps_the_peers_output() {
         .expect("program executes");
 
     let pending = sole_negotiation(&executor);
-    let remaining: Vec<u64> = pending.shared_tx.outputs().map(|(id, _)| id).collect();
+    let remaining: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
     assert_eq!(remaining, vec![5]);
 }
 
@@ -3294,62 +3309,18 @@ fn execute_recv_interactive_tx_records_peer_contributions() {
         .expect("program executes");
 
     let pending = sole_negotiation(&executor);
-    let (serial_id, input) = pending.shared_tx.inputs().next().expect("input recorded");
+    let (serial_id, input) = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .next()
+        .expect("input recorded");
     assert_eq!(serial_id, 3);
     assert_eq!(input.contributor, Contributor::Remote);
     assert_eq!(input.value(), 100_000_000);
-    // A contribution is not a tx_complete, so the negotiation has not
-    // concluded even though we sent ours.
     // The peer answered with a contribution, not a tx_complete, so our
-    // own tx_complete does not yet conclude the exchange.
-    assert!(!pending.tx_negotiation.peer_sent_tx_complete);
-}
-
-#[test]
-fn execute_recv_interactive_tx_completes_on_consecutive_tx_completes() {
-    let channel_id = ChannelId::v2_from_revocation_basepoints(
-        &sample_v2_revocation_basepoint(),
-        &sample_accept_channel2(sample_v2_temporary_channel_id()).revocation_basepoint,
-    );
-    let (mut instructions, _) = send_open_channel2_instructions();
-    instructions.push(Instruction {
-        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
-        inputs: vec![30],
-    });
-    instructions.push(Instruction {
-        operation: Operation::DeriveChannelIdV2,
-        inputs: vec![13, 31],
-    });
-    instructions.push(Instruction {
-        operation: Operation::SendTxComplete,
-        inputs: vec![32],
-    });
-    instructions.push(Instruction {
-        operation: Operation::RecvInteractiveTx,
-        inputs: vec![33],
-    });
-
-    let mut conn = MockConnection::new();
-    conn.queue_recv(
-        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
-    );
-    conn.queue_recv(Message::TxComplete(TxComplete { channel_id }).encode());
-    let mut executor = Executor::new(
-        conn,
-        sample_v2_wallet(),
-        MockTargetRpc::default(),
-        sample_context(),
-    );
-
-    executor
-        .execute(&Program { instructions }, std::time::Instant::now())
-        .expect("program executes");
-
-    let pending = sole_negotiation(&executor);
-    assert!(pending.tx_negotiation.peer_sent_tx_complete);
-    // Ours followed the peer's, so the exchange concluded and nothing
-    // further is owed.
-    assert_eq!(pending.tx_negotiation.outstanding_replies, 0);
+    // tx_complete did not conclude the exchange.
+    assert!(!pending.tx_exchange.concluded());
 }
 
 #[test]
@@ -3386,12 +3357,11 @@ fn execute_recv_interactive_tx_for_an_unknown_channel_is_ignored() {
         .expect("an unknown channel_id is not a harness error");
 
     // Only the peer can tell whether that message is consistent with its
-    // own view, so nothing is invented on our side.
-    assert!(
-        !sole_negotiation(&executor)
-            .tx_negotiation
-            .peer_sent_tx_complete
-    );
+    // own view, so nothing is invented on our side: the reply to our
+    // tx_complete is still owed.
+    let pending = sole_negotiation(&executor);
+    assert!(!pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 1);
 }
 
 #[test]
@@ -3528,7 +3498,7 @@ fn execute_build_funding_transaction_v2_locates_the_funding_output() {
     let secp = Secp256k1::new();
     let funding_pubkey =
         PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x11; 32]).unwrap());
-    let funding = pending.shared_tx.build_funding(
+    let funding = pending.tx_exchange.shared_tx().build_funding(
         &build_funding_witness_script(
             &funding_pubkey,
             &sample_accept_channel2(sample_v2_temporary_channel_id()).funding_pubkey,
@@ -4238,7 +4208,11 @@ fn execute_send_tx_signatures_carries_our_witnesses() {
     assert!(!sent.witnesses[0].is_empty());
     assert_eq!(
         sent.txid,
-        sole_negotiation(&executor).shared_tx.build().compute_txid()
+        sole_negotiation(&executor)
+            .tx_exchange
+            .shared_tx()
+            .build()
+            .compute_txid()
     );
 }
 
@@ -4354,29 +4328,32 @@ fn negotiation_awaiting_tx_signatures(local_value: u64, remote_value: u64) -> V2
         pending.commitment_exchange.commitment_signed.received = true;
 
         let prevtx = sample_prevtx();
-        let mut add = |serial_id: u64, value: u64, contributor| {
-            pending.shared_tx.add_input(
-                serial_id,
-                SharedInput {
-                    outpoint: OutPoint {
-                        txid: prevtx.compute_txid(),
-                        vout: u32::try_from(serial_id).expect("small"),
-                    },
-                    sequence: 0xffff_fffd,
-                    contributor,
-                    prevout: Some(TxOut {
-                        value: Amount::from_sat(value),
-                        script_pubkey: sample_change_spk(),
-                    }),
+        let add_input = |serial_id: u64, value: u64, contributor| Step::AddInput {
+            serial_id,
+            input: SharedInput {
+                outpoint: OutPoint {
+                    txid: prevtx.compute_txid(),
+                    vout: u32::try_from(serial_id).expect("small"),
                 },
-            );
+                sequence: 0xffff_fffd,
+                contributor,
+                prevout: Some(TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: sample_change_spk(),
+                }),
+            },
         };
-        if local_value > 0 {
-            add(2, local_value, Contributor::Local);
-        }
-        if remote_value > 0 {
-            add(3, remote_value, Contributor::Remote);
-        }
+        // One turn each way, so nothing is left owed.
+        pending.tx_exchange.send(if local_value > 0 {
+            add_input(2, local_value, Contributor::Local)
+        } else {
+            Step::Complete
+        });
+        pending.tx_exchange.receive(if remote_value > 0 {
+            add_input(3, remote_value, Contributor::Remote)
+        } else {
+            Step::Complete
+        });
     }
 
     negotiations
@@ -4453,8 +4430,8 @@ fn tx_signatures_not_expected_after_an_abort() {
     negotiations
         .get_mut(sample_v2_temporary_channel_id())
         .expect("negotiation")
-        .tx_negotiation
-        .aborted = true;
+        .tx_exchange
+        .abort();
 
     assert!(!is_tx_signatures_expected(
         &negotiations,
@@ -4509,7 +4486,8 @@ fn apply_peer_witnesses_fills_only_the_peers_inputs() {
     let unsigned = negotiations
         .get(sample_v2_temporary_channel_id())
         .expect("negotiation")
-        .shared_tx
+        .tx_exchange
+        .shared_tx()
         .build();
 
     let tx = apply_peer_witnesses(&negotiations, &unsigned);
@@ -4759,8 +4737,8 @@ fn execute_recv_interactive_tx_stops_once_the_exchange_concludes() {
 
     assert_eq!(
         sole_negotiation(&executor)
-            .tx_negotiation
-            .outstanding_replies,
+            .tx_exchange
+            .outstanding_replies(),
         0,
     );
     // The commitment_signed is still queued for whoever asks for it next.
@@ -4868,8 +4846,8 @@ fn execute_recv_interactive_tx_settles_a_backlog_left_by_a_dropped_receive() {
     // for the operation that actually wants it.
     assert_eq!(
         sole_negotiation(&executor)
-            .tx_negotiation
-            .outstanding_replies,
+            .tx_exchange
+            .outstanding_replies(),
         0,
     );
     assert_eq!(executor.conn.recv_queue.len(), 1);
@@ -4879,6 +4857,191 @@ fn execute_recv_interactive_tx_settles_a_backlog_left_by_a_dropped_receive() {
             .msg_type(),
         MessageType::COMMITMENT_SIGNED,
     );
+}
+
+#[test]
+fn execute_recv_interactive_tx_drops_contributions_sent_after_the_conclusion() {
+    // A mutated program from a real CLN run: three inputs go out, with the
+    // last two replies left unread, then the funding output, a tx_complete
+    // and a change output. From the peer's side its tx_complete answering
+    // the funding output and our tx_complete are consecutive, so the
+    // exchange concludes without the change output. Our transaction must
+    // agree, or the peer's perfectly good commitment signature reads as
+    // invalid.
+    let channel_id = v2_channel_id();
+    let (mut instructions, _) = send_open_channel2_instructions();
+    instructions.push(Instruction {
+        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
+        inputs: vec![30],
+    }); // v31
+    instructions.push(Instruction {
+        operation: Operation::DeriveChannelIdV2,
+        inputs: vec![13, 31],
+    }); // v32
+
+    let add_input = |serial_id, utxo_index| Instruction {
+        operation: Operation::SendTxAddInput {
+            serial_id,
+            utxo_index,
+            sequence: 0xffff_fffd,
+        },
+        inputs: vec![32],
+    };
+    let add_output = |serial_id, role| Instruction {
+        operation: Operation::SendTxAddOutput { serial_id, role },
+        inputs: vec![32, 3, 25],
+    };
+    let recv = |sent| Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![sent],
+    };
+    instructions.push(add_input(2, 0)); // v33
+    instructions.push(recv(33));
+    instructions.push(add_input(4, 1)); // v35
+    instructions.push(recv(35));
+    instructions.push(add_input(6, 2)); // v37
+    instructions.push(add_output(2000, TxOutputRole::Funding)); // v38
+    instructions.push(Instruction {
+        operation: Operation::SendTxComplete,
+        inputs: vec![32],
+    }); // v39
+    instructions.push(add_output(2002, TxOutputRole::Change)); // v40
+    instructions.push(recv(40));
+    instructions.push(recv(39));
+    // The exchange has concluded, so this one has nothing to read.
+    instructions.push(recv(37));
+
+    let mut conn = MockConnection::new();
+    conn.queue_recv(
+        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+    );
+    // One tx_complete per message before our own tx_complete; the peer then
+    // moves straight on to commitment_signed.
+    for _ in 0..4 {
+        conn.queue_recv(Message::TxComplete(TxComplete { channel_id }).encode());
+    }
+    conn.queue_recv(
+        Message::CommitmentSigned(CommitmentSigned {
+            channel_id,
+            signature: Signature::from_compact(&[0u8; 64]).expect("zero signature"),
+            htlc_signatures: Vec::new(),
+            tlvs: CommitmentSignedTlvs::default(),
+        })
+        .encode(),
+    );
+    let mut executor = Executor::new(
+        conn,
+        sample_v2_wallet(),
+        MockTargetRpc::default(),
+        sample_context(),
+    );
+
+    executor
+        .execute(&Program { instructions }, std::time::Instant::now())
+        .expect("program executes");
+
+    let pending = sole_negotiation(&executor);
+    assert!(pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 0);
+    let inputs: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(inputs, vec![2, 4, 6]);
+    let outputs: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        outputs,
+        vec![2000],
+        "the late change output is not the peer's"
+    );
+    assert_eq!(executor.conn.recv_queue.len(), 1);
+    assert_eq!(
+        Message::decode(&executor.conn.recv_queue[0])
+            .expect("valid")
+            .msg_type(),
+        MessageType::COMMITMENT_SIGNED,
+    );
+}
+
+#[test]
+fn execute_send_after_a_known_conclusion_is_not_recorded() {
+    // The peer's tx_complete has been read, so ours concludes the exchange
+    // on the spot and a later contribution is neither recorded nor waited on.
+    let channel_id = v2_channel_id();
+    let (mut instructions, _) = send_open_channel2_instructions();
+    instructions.push(Instruction {
+        operation: Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
+        inputs: vec![30],
+    }); // v31
+    instructions.push(Instruction {
+        operation: Operation::DeriveChannelIdV2,
+        inputs: vec![13, 31],
+    }); // v32
+    instructions.push(Instruction {
+        operation: Operation::SendTxAddOutput {
+            serial_id: 2000,
+            role: TxOutputRole::Funding,
+        },
+        inputs: vec![32, 3, 25],
+    }); // v33
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![33],
+    });
+    instructions.push(Instruction {
+        operation: Operation::SendTxComplete,
+        inputs: vec![32],
+    }); // v35
+    instructions.push(Instruction {
+        operation: Operation::SendTxAddOutput {
+            serial_id: 2002,
+            role: TxOutputRole::Change,
+        },
+        inputs: vec![32, 3, 25],
+    }); // v36
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![36],
+    });
+    instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![35],
+    });
+
+    let mut conn = MockConnection::new();
+    conn.queue_recv(
+        Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id())).encode(),
+    );
+    conn.queue_recv(Message::TxComplete(TxComplete { channel_id }).encode());
+    let mut executor = Executor::new(
+        conn,
+        sample_v2_wallet(),
+        MockTargetRpc::default(),
+        sample_context(),
+    );
+
+    executor
+        .execute(&Program { instructions }, std::time::Instant::now())
+        .expect("program executes");
+
+    let pending = sole_negotiation(&executor);
+    assert!(pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 0);
+    let outputs: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(outputs, vec![2000]);
+    assert!(executor.conn.recv_queue.is_empty());
 }
 
 #[test]
@@ -4914,10 +5077,12 @@ fn execute_recv_interactive_tx_still_reads_mid_exchange() {
         "the reply was not read"
     );
     let pending = sole_negotiation(&executor);
-    assert!(pending.tx_negotiation.peer_sent_tx_complete);
     // Three contributions went out and one reply came back, so the peer
-    // still owes two and the next receive must not skip either.
-    assert_eq!(pending.tx_negotiation.outstanding_replies, 2);
+    // still owes two and the next receive must not skip either. Its
+    // tx_complete answered our first send, not our latest, so the exchange
+    // is not concluded.
+    assert!(!pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 2);
 }
 
 #[test]
@@ -4955,7 +5120,7 @@ fn execute_recv_interactive_tx_records_a_peer_abort() {
         .expect("an abort is normal protocol behaviour, not a harness error");
 
     let pending = sole_negotiation(&executor);
-    assert!(pending.tx_negotiation.aborted);
+    assert!(pending.tx_exchange.aborted());
     // An abort is not a tx_complete, so the negotiation has not concluded.
-    assert!(!pending.tx_negotiation.peer_sent_tx_complete);
+    assert!(!pending.tx_exchange.concluded());
 }

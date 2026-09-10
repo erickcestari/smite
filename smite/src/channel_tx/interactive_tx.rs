@@ -190,6 +190,34 @@ impl SharedTransaction {
         self.outputs.remove(&serial_id)
     }
 
+    /// Puts our own contributions back to how they stood in `snapshot`,
+    /// leaving the peer's untouched.
+    ///
+    /// Used when the exchange turns out to have concluded before contributions
+    /// we had already sent: the peer never took them, so neither may we. The
+    /// peer's contributions that arrived since the snapshot did precede the
+    /// conclusion, so they stay.
+    pub(super) fn restore_local(&mut self, snapshot: &Self) {
+        self.inputs
+            .retain(|_, input| input.contributor == Contributor::Remote);
+        self.inputs.extend(
+            snapshot
+                .inputs
+                .iter()
+                .filter(|(_, input)| input.contributor == Contributor::Local)
+                .map(|(id, input)| (*id, input.clone())),
+        );
+        self.outputs
+            .retain(|_, output| output.contributor == Contributor::Remote);
+        self.outputs.extend(
+            snapshot
+                .outputs
+                .iter()
+                .filter(|(_, output)| output.contributor == Contributor::Local)
+                .map(|(id, output)| (*id, output.clone())),
+        );
+    }
+
     /// Inputs in ascending `serial_id` order.
     pub fn inputs(&self) -> impl Iterator<Item = (u64, &SharedInput)> {
         self.inputs.iter().map(|(id, input)| (*id, input))
@@ -626,6 +654,38 @@ e37d3280b2e60e0000000017a9147ecd1b519326bc13b0ec716e469b58ed02b112a087f0006bee00
             SharedInput::from_prevtx(&prevtx, 1, MAX_SEQUENCE, Contributor::Remote),
         ));
         assert_eq!(shared.inputs().count(), MAX_INPUTS);
+    }
+
+    #[test]
+    fn restore_local_rolls_back_only_our_contributions() {
+        let prevtx = hex::decode(APPENDIX_G_PREVTX).expect("valid hex");
+        let output = |contributor| SharedOutput {
+            value: 1000,
+            script_pubkey: script(APPENDIX_G_ACCEPTER_CHANGE_SPK),
+            contributor,
+        };
+        let mut shared = SharedTransaction::new(0);
+        shared.add_input(
+            2,
+            SharedInput::from_prevtx(&prevtx, 0, MAX_SEQUENCE, Contributor::Local),
+        );
+        shared.add_output(2000, output(Contributor::Local));
+        let snapshot = shared.clone();
+
+        // The peer's reply lands after the snapshot; ours is sent after it.
+        shared.add_input(
+            1,
+            SharedInput::from_prevtx(&prevtx, 1, MAX_SEQUENCE, Contributor::Remote),
+        );
+        shared.remove_output(2000);
+        shared.add_output(2002, output(Contributor::Local));
+
+        shared.restore_local(&snapshot);
+
+        let inputs: Vec<u64> = shared.inputs().map(|(id, _)| id).collect();
+        assert_eq!(inputs, vec![1, 2]);
+        let outputs: Vec<u64> = shared.outputs().map(|(id, _)| id).collect();
+        assert_eq!(outputs, vec![2000]);
     }
 
     #[test]

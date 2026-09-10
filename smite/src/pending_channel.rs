@@ -10,7 +10,7 @@ use bitcoin::Witness;
 use crate::bolt::{
     AcceptChannel, AcceptChannel2, ChannelId, OpenChannel, OpenChannel2, TemporaryChannelId,
 };
-use crate::channel_tx::SharedTransaction;
+use crate::channel_tx::TxExchange;
 
 /// Negotiation parameters for a channel being established.
 ///
@@ -36,47 +36,12 @@ pub struct PendingChannelV2 {
     /// The v2 `channel_id`, known once `accept_channel2` reveals the peer's
     /// revocation basepoint.
     pub channel_id: Option<ChannelId>,
-    /// The transaction being built by interactive construction, accumulating
-    /// both peers' contributions.
-    pub shared_tx: SharedTransaction,
-    /// Progress through the interactive transaction exchange.
-    pub tx_negotiation: TxNegotiation,
+    /// The interactive transaction exchange and the transaction it builds.
+    pub tx_exchange: TxExchange,
     /// Progress through the commitment and signature exchange that follows it.
     pub commitment_exchange: CommitmentExchange,
     /// Witnesses from the peer's `tx_signatures`
     pub peer_witnesses: Vec<Witness>,
-}
-
-/// How far the interactive transaction exchange has progressed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TxNegotiation {
-    /// Whether the peer's most recent message was `tx_complete`.
-    ///
-    /// The exchange concludes only on two consecutive `tx_complete`s, so this
-    /// is what decides whether our own `tx_complete` ends it or earns another
-    /// reply. Any other message from the peer clears it.
-    pub peer_sent_tx_complete: bool,
-    /// Whether either peer has aborted the negotiation.
-    pub aborted: bool,
-    /// Messages we have sent that the peer still owes a reply to.
-    ///
-    /// The exchange is turn-based, so the peer answers every message until the
-    /// one that concludes it. Counting rather than tracking only the latest
-    /// send keeps a program whose sends and receives have been knocked out of
-    /// step by a mutator from reading a message behind for the rest of its run.
-    pub outstanding_replies: u32,
-}
-
-impl TxNegotiation {
-    /// Records that we sent a message the peer owes a reply to.
-    pub fn expect_reply(&mut self) {
-        self.outstanding_replies = self.outstanding_replies.saturating_add(1);
-    }
-
-    /// Records that one owed reply arrived.
-    pub fn reply_received(&mut self) {
-        self.outstanding_replies = self.outstanding_replies.saturating_sub(1);
-    }
 }
 
 /// Progress through a two-way exchange of one message type.
@@ -107,13 +72,12 @@ impl PendingChannelV2 {
     /// shared transaction's `nLockTime` from it.
     #[must_use]
     pub fn new(open_channel2: OpenChannel2) -> Self {
-        let shared_tx = SharedTransaction::new(open_channel2.locktime);
+        let tx_exchange = TxExchange::new(open_channel2.locktime);
         Self {
             open_channel2,
             accept_channel2: None,
             channel_id: None,
-            shared_tx,
-            tx_negotiation: TxNegotiation::default(),
+            tx_exchange,
             commitment_exchange: CommitmentExchange::default(),
             peer_witnesses: Vec::new(),
         }
