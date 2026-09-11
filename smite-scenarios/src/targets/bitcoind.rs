@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use smite::bitcoin::BitcoinCli;
+use smite::bitcoin::BitcoindClient;
 use smite::process::ManagedProcess;
 
 use super::TargetError;
@@ -63,7 +63,7 @@ pub fn resolve_data_dir() -> Result<(PathBuf, Option<tempfile::TempDir>), Target
 pub fn start(
     config: &BitcoindConfig,
     data_dir: &Path,
-) -> Result<(ManagedProcess, BitcoinCli), TargetError> {
+) -> Result<(ManagedProcess, BitcoindClient), TargetError> {
     log::info!("Starting bitcoind...");
 
     let bitcoind_dir = data_dir.join("bitcoind");
@@ -101,10 +101,7 @@ pub fn start(
     }
 
     let bitcoind = ManagedProcess::spawn(&mut cmd, "bitcoind")?;
-    let cli = BitcoinCli {
-        rpc_port: config.rpc_port,
-        bitcoind_dir,
-    };
+    let cli = BitcoindClient::new(config.rpc_port, bitcoind_dir);
 
     // Wait for bitcoind to be ready
     log::info!("Waiting for bitcoind to be ready...");
@@ -131,7 +128,7 @@ pub fn start(
 }
 
 /// Creates wallet and generates initial blocks.
-fn setup_wallet(cli: &BitcoinCli) -> Result<(), TargetError> {
+fn setup_wallet(cli: &BitcoindClient) -> Result<(), TargetError> {
     // Create wallet
     let status = cli
         .run()
