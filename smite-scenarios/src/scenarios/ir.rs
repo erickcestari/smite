@@ -21,7 +21,7 @@ use crate::targets::Target;
 /// (out-of-bounds variable refs, type mismatches, `MineBlocks(0)`, etc.).
 pub struct IrScenario<T: Target, S: SnapshotSetup<T>> {
     target: T,
-    /// Executes IR programs and owns the connection, bitcoin-cli handle,
+    /// Executes IR programs and owns the connection, bitcoind client,
     /// program context, and the target's RPC handle. Created once before the
     /// snapshot and reused across fuzzing runs.
     executor: Executor<NoiseConnection, BitcoindClient, T::Rpc>,

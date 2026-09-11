@@ -101,25 +101,18 @@ pub fn start(
     }
 
     let bitcoind = ManagedProcess::spawn(&mut cmd, "bitcoind")?;
-    let cli = BitcoindClient::new(config.rpc_port, bitcoind_dir);
+    let mut client = BitcoindClient::new(config.rpc_port);
 
     // Wait for bitcoind to be ready
     log::info!("Waiting for bitcoind to be ready...");
     for _ in 0..30 {
-        let status = cli
-            .run()
-            .arg("getblockchaininfo")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-
-        if status.is_ok_and(|s| s.success()) {
-            log::info!("bitcoind is ready");
-            setup_wallet(&cli)?;
-            return Ok((bitcoind, cli));
-        }
-
         std::thread::sleep(Duration::from_secs(1));
+
+        if client.is_ready() {
+            log::info!("bitcoind is ready");
+            setup_wallet(&mut client)?;
+            return Ok((bitcoind, client));
+        }
     }
 
     Err(TargetError::StartFailed(
@@ -128,37 +121,18 @@ pub fn start(
 }
 
 /// Creates wallet and generates initial blocks.
-fn setup_wallet(cli: &BitcoindClient) -> Result<(), TargetError> {
-    // Create wallet
-    let status = cli
-        .run()
-        .arg("createwallet")
-        .arg("default")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
+fn setup_wallet(client: &mut BitcoindClient) -> Result<(), TargetError> {
+    // Fails if the wallet already exists (i.e. SMITE_DATA_DIR was mounted).
+    client.create_wallet("default").map_err(|e| {
+        TargetError::StartFailed(format!(
+            "failed to create wallet (does it already exist?): {e}"
+        ))
+    })?;
 
-    // command fails if wallet already exists (i.e. SMITE_DATA_DIR was mounted)
-    if !status.success() {
-        return Err(TargetError::StartFailed(
-            "failed to create wallet (does it already exist?)".into(),
-        ));
-    }
-
-    // Generate initial blocks
-    let status = cli
-        .run()
-        .arg("-generate")
-        .arg(INITIAL_BLOCKS.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-
-    if !status.success() {
-        return Err(TargetError::StartFailed(
-            "failed to generate initial blocks".into(),
-        ));
-    }
+    let initial_blocks = u32::try_from(INITIAL_BLOCKS).expect("fits in u32");
+    client
+        .generate(initial_blocks)
+        .map_err(|e| TargetError::StartFailed(format!("failed to generate initial blocks: {e}")))?;
 
     Ok(())
 }

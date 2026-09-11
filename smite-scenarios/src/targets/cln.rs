@@ -196,7 +196,7 @@ impl ClnTarget {
         let mut cmd = Command::new("lightningd");
 
         // LD_PRELOAD the crash handler into lightningd and its subdaemons.
-        // Set only on lightningd (not lightning-cli/bitcoin-cli) to avoid
+        // Set only on lightningd (not lightning-cli) to avoid
         // interfering with helper processes.
         if let Ok(handler) = std::env::var("SMITE_CRASH_HANDLER") {
             cmd.env("LD_PRELOAD", handler);

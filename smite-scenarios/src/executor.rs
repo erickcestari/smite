@@ -60,7 +60,7 @@ pub const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 /// reconfiguring or patching CLN to poll more frequently.
 pub const RECV_CHANNEL_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Abstraction over bitcoin-cli operations, allowing mock implementations in tests.
+/// Abstraction over bitcoind operations, allowing mock implementations in tests.
 pub trait BitcoinRpc {
     /// Mines the given number of blocks, including any transactions in the
     /// `private_mempool` in the first block.
@@ -264,7 +264,7 @@ pub struct Executor<C, B, R> {
 }
 
 impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
-    /// Creates an executor with the given connection, bitcoin-cli handle,
+    /// Creates an executor with the given connection, bitcoind client,
     /// program context, and target RPC handle. Channel state and negotiations
     /// start empty.
     pub fn new(conn: C, bitcoind_client: B, rpc: R, context: ProgramContext) -> Self {
