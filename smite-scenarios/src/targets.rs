@@ -76,7 +76,7 @@ pub trait Target: Sized {
     /// Target's RPC handle for executing commands.
     fn rpc(&self) -> Self::Rpc;
 
-    /// `bitcoin-cli` wrapper for the regtest `bitcoind` instance.
+    /// JSON-RPC client for the regtest `bitcoind` instance.
     fn bitcoind_client(&self) -> &BitcoindClient;
 
     /// Check if target is still alive. Returns `Err(Crashed)` if dead.
