@@ -10,7 +10,7 @@ pub use encrypted_bytes::EncryptedBytesScenario;
 pub use init::InitScenario;
 pub use ir::IrScenario;
 pub use noise::NoiseScenario;
-pub use setup::{PostInitSetup, SnapshotSetup};
+pub use setup::{PostInitDualFundSetup, PostInitSetup, SnapshotSetup};
 use smite::scenarios::ScenarioError;
 
 use std::time::Duration;
