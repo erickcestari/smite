@@ -8,7 +8,7 @@ use bitcoin::Amount;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use harness::*;
 use programs::*;
-use smite::bolt::{AcceptChannelTlvs, GossipTimestampFilter, Init, Ping};
+use smite::bolt::{AcceptChannelTlvs, ChannelTypeVariant, GossipTimestampFilter, Init, Ping};
 use smite_ir::Instruction;
 use smite_ir::builder::ProgramBuilder;
 use smite_ir::operation::ShutdownScriptVariant;
@@ -1337,4 +1337,244 @@ fn extract_tlvs_absent() {
         extract_field(&ac, AcceptChannelField::ChannelType),
         Variable::Features(vec![])
     );
+}
+
+// -- Channel establishment v2 --
+
+#[test]
+fn execute_build_and_send_open_channel2() {
+    let mut b = ProgramBuilder::new();
+    let inputs = load_open_channel2_inputs(&mut b);
+    send_open_channel2_with(&mut b, inputs, true);
+
+    let mut fx = Fixture::new();
+    fx.run(&b.build());
+
+    assert_eq!(fx.sent_len(), 1);
+    let sent: OpenChannel2 = fx.sent(0);
+    assert_eq!(sent.temporary_channel_id, sample_v2_temporary_channel_id());
+    assert_eq!(sent.funding_feerate_perkw, 253);
+    assert_eq!(sent.commitment_feerate_perkw, 2500);
+    assert_eq!(sent.funding_satoshis, 200_000);
+    assert_eq!(sent.locktime, 120);
+    assert_eq!(sent.revocation_basepoint, sample_v2_revocation_basepoint());
+    let secp = Secp256k1::new();
+    assert_eq!(
+        sent.second_per_commitment_point,
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x77; 32]).unwrap())
+    );
+    assert!(sent.tlvs.require_confirmed_inputs);
+    assert_eq!(
+        sent.tlvs.channel_type,
+        Some(ChannelTypeVariant::Anchors.encode()),
+    );
+    // A zero-length upfront_shutdown_script is the BOLT 2 opt-out signal,
+    // so the TLV is sent rather than omitted.
+    assert_eq!(sent.tlvs.upfront_shutdown_script, Some(vec![]));
+
+    // The negotiation is recorded so later steps can build from what we
+    // actually put on the wire.
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert_eq!(pending.open_channel2, sent);
+    assert!(pending.accept_channel2.is_none());
+    assert!(pending.channel_id.is_none());
+}
+
+#[test]
+fn execute_build_open_channel2_omits_an_empty_channel_type() {
+    let mut b = ProgramBuilder::new();
+    let mut inputs = load_open_channel2_inputs(&mut b);
+    // Replace the channel type with an empty feature vector.
+    inputs.channel_type = b.append(Operation::LoadFeatures(vec![]), &[]);
+    send_open_channel2_with(&mut b, inputs, false);
+
+    let mut fx = Fixture::new();
+    fx.run(&b.build());
+
+    // BOLT 2 requires open_channel2 to set channel_type, so omitting it
+    // must stay reachable for fuzzing the receiver's rejection path.
+    assert_eq!(fx.sent::<OpenChannel2>(0).tlvs.channel_type, None);
+}
+
+#[test]
+fn execute_recv_accept_channel2_records_the_v2_channel_id() {
+    let accept = sample_accept_channel2(sample_v2_temporary_channel_id());
+
+    let mut fx = Fixture::new().queue(&Message::AcceptChannel2(accept.clone()));
+    fx.run(&negotiate_channel2_program());
+
+    let expected_channel_id = ChannelId::v2_from_revocation_basepoints(
+        &sample_v2_revocation_basepoint(),
+        &accept.revocation_basepoint,
+    );
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert_eq!(pending.accept_channel2.as_ref(), Some(&accept));
+    assert_eq!(pending.channel_id, Some(expected_channel_id));
+    // Later messages carry the v2 channel_id, and must reach the same
+    // negotiation as its temporary_channel_id does.
+    assert_eq!(
+        fx.negotiation_v2(expected_channel_id).channel_id,
+        Some(expected_channel_id),
+    );
+}
+
+#[test]
+fn execute_recv_accept_channel2_unknown_temporary_channel_id_is_ignored() {
+    // An accept_channel2 answering a temporary_channel_id we never opened,
+    // as a mutated program that dropped its open_channel2 would see.
+    let accept = sample_accept_channel2(ChannelId::new([0x77; 32]));
+
+    let mut fx = Fixture::new().queue(&Message::AcceptChannel2(accept));
+    // Executes without reporting a violation.
+    fx.run(&negotiate_channel2_program());
+
+    // The unknown negotiation is not invented, and the one we did open is
+    // left untouched: no accept_channel2 paired, so no channel_id derived
+    // and nothing for a later message to reach it by.
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert!(pending.accept_channel2.is_none());
+    assert!(pending.channel_id.is_none());
+}
+
+#[test]
+fn record_open_forgets_the_replaced_negotiations_channel_id() {
+    let temporary_channel_id = sample_v2_temporary_channel_id();
+    let mut negotiations = V2Negotiations::default();
+
+    negotiations.record_open(&sample_open_channel2());
+    negotiations.record_accept(&sample_accept_channel2(temporary_channel_id));
+    assert!(negotiations.get(v2_channel_id()).is_some());
+
+    // Reusing the temporary_channel_id starts a fresh negotiation, which
+    // has derived no channel_id yet. A message still naming the replaced
+    // negotiation's must not land on it.
+    negotiations.record_open(&sample_open_channel2());
+
+    assert!(negotiations.get(v2_channel_id()).is_none());
+    assert!(negotiations.get(temporary_channel_id).is_some());
+}
+
+#[test]
+fn execute_recv_accept_channel2_unexpected_message() {
+    let mut fx = Fixture::new().queue(&Message::AcceptChannel(sample_accept_channel()));
+
+    // A v1 accept_channel does not answer an open_channel2.
+    let err = fx.run_err(&negotiate_channel2_program());
+
+    assert!(
+        matches!(
+            err,
+            ExecuteError::UnexpectedMessage {
+                expected: MessageType::ACCEPT_CHANNEL2,
+                ..
+            }
+        ),
+        "unexpected error: {err}",
+    );
+}
+
+#[test]
+fn execute_extract_all_accept_channel2_fields() {
+    let mut b = ProgramBuilder::new();
+    let negotiated = negotiate_channel2(&mut b);
+    for &field in AcceptChannel2Field::ALL {
+        b.append(
+            Operation::ExtractAcceptChannel2(field),
+            &[negotiated.accept_channel2],
+        );
+    }
+    let accept = sample_accept_channel2(sample_v2_temporary_channel_id());
+
+    Fixture::new()
+        .queue(&Message::AcceptChannel2(accept.clone()))
+        .run(&b.build());
+
+    // Every field extracts, and each one produces the type it declares.
+    for &field in AcceptChannel2Field::ALL {
+        let extracted = extract_field_v2(&accept, field);
+        assert_eq!(
+            extracted.var_type(),
+            field.output_type(),
+            "{field} produced the wrong variable type",
+        );
+    }
+    assert_eq!(
+        extract_field_v2(&accept, AcceptChannel2Field::FundingSatoshis),
+        Variable::Amount(0),
+    );
+    assert_eq!(
+        extract_field_v2(&accept, AcceptChannel2Field::SecondPerCommitmentPoint),
+        Variable::Point(sample_pubkey(17)),
+    );
+    assert_eq!(
+        extract_field_v2(&accept, AcceptChannel2Field::MinimumDepth),
+        Variable::BlockHeight(6),
+    );
+}
+
+#[test]
+fn execute_derive_channel_id_v2_feeds_the_channel_id_on_the_wire() {
+    // Runtime variables do not outlive execution, so observe
+    // DeriveChannelIdV2 through the only field that carries a ChannelId
+    // here: open_channel2's temporary_channel_id.
+    let mut b = ProgramBuilder::new();
+    let mut inputs = load_open_channel2_inputs(&mut b);
+    let peer_revocation_basepoint = b.append(Operation::LoadTargetPubkeyFromContext, &[]);
+    inputs.temporary_channel_id = b.append(
+        Operation::DeriveChannelIdV2,
+        &[inputs.revocation_basepoint, peer_revocation_basepoint],
+    );
+    send_open_channel2_with(&mut b, inputs, false);
+
+    let mut fx = Fixture::new();
+    fx.run(&b.build());
+
+    let sent: OpenChannel2 = fx.sent(0);
+    assert_eq!(
+        sent.temporary_channel_id,
+        ChannelId::v2_from_revocation_basepoints(
+            &sample_v2_revocation_basepoint(),
+            &sample_context().target_pubkey,
+        ),
+    );
+    // Both basepoints are mixed in, so this is not the temporary id.
+    assert_ne!(sent.temporary_channel_id, sample_v2_temporary_channel_id());
+}
+
+#[test]
+#[should_panic(expected = "expected OpenChannel2Message, got Amount")]
+fn execute_send_open_channel2_wrong_type_panics() {
+    let instructions = vec![
+        Instruction {
+            operation: Operation::LoadAmount(1),
+            inputs: vec![],
+        },
+        Instruction {
+            operation: Operation::SendOpenChannel2,
+            inputs: vec![0],
+        },
+    ];
+
+    Fixture::new().run(&Program { instructions });
+}
+
+#[test]
+#[should_panic(expected = "is void")]
+fn execute_recv_accept_channel2_affine_overuse_panics() {
+    let mut b = ProgramBuilder::new();
+    let negotiated = negotiate_channel2(&mut b);
+    let mut program = b.build();
+
+    // `ProgramBuilder` rejects the reuse itself, so we manually append the
+    // second receive instruction.
+    program.instructions.push(Instruction {
+        operation: Operation::RecvAcceptChannel2,
+        inputs: vec![negotiated.sent_open_channel2],
+    });
+    let accept = sample_accept_channel2(sample_v2_temporary_channel_id());
+
+    Fixture::new()
+        .queue(&Message::AcceptChannel2(accept.clone()))
+        .queue(&Message::AcceptChannel2(accept))
+        .run(&program);
 }
