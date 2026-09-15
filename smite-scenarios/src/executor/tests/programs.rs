@@ -9,8 +9,15 @@
 
 use super::harness::{PointSource, SampleOpenChannel, acceptor_funding_sk, opener_funding_sk};
 use crate::executor::*;
+use smite::bolt::ChannelTypeVariant;
 use smite_ir::Instruction;
 use smite_ir::builder::ProgramBuilder;
+
+/// Loads the private key `sk` and derives its point.
+fn load_point(b: &mut ProgramBuilder, sk: [u8; 32]) -> usize {
+    let sk = b.append(Operation::LoadPrivateKey(sk), &[]);
+    b.append(Operation::DerivePoint, &[sk])
+}
 
 // -- open_channel --
 
@@ -79,10 +86,7 @@ pub fn build_open_channel(b: &mut ProgramBuilder, oc: &SampleOpenChannel) -> Ope
     let msg = &oc.message;
     let pubkey = match oc.points {
         PointSource::TargetContext => b.append(Operation::LoadTargetPubkeyFromContext, &[]),
-        PointSource::Secret(bytes) => {
-            let sk = b.append(Operation::LoadPrivateKey(bytes), &[]);
-            b.append(Operation::DerivePoint, &[sk])
-        }
+        PointSource::Secret(bytes) => load_point(b, bytes),
     };
 
     let mut vars = OpenChannelVars {
@@ -341,6 +345,153 @@ pub fn send_channel_announcement(b: &mut ProgramBuilder, scid: usize) {
         ],
     );
     b.append(Operation::SendMessage, &[announcement]);
+}
+
+// -- Channel establishment v2 --
+
+/// The `open_channel2` inputs, named so that callers can swap one before
+/// building.
+#[derive(Clone, Copy)]
+pub struct OpenChannel2Inputs {
+    pub chain_hash: usize,
+    pub temporary_channel_id: usize,
+    pub funding_feerate_perkw: usize,
+    pub commitment_feerate_perkw: usize,
+    pub funding_satoshis: usize,
+    pub dust_limit_satoshis: usize,
+    pub max_htlc_value_in_flight_msat: usize,
+    pub htlc_minimum_msat: usize,
+    pub to_self_delay: usize,
+    pub max_accepted_htlcs: usize,
+    pub locktime: usize,
+    pub funding_pubkey: usize,
+    pub revocation_basepoint: usize,
+    pub payment_basepoint: usize,
+    pub delayed_payment_basepoint: usize,
+    pub htlc_basepoint: usize,
+    pub first_per_commitment_point: usize,
+    pub second_per_commitment_point: usize,
+    pub channel_flags: usize,
+    pub upfront_shutdown_script: usize,
+    pub channel_type: usize,
+}
+
+impl OpenChannel2Inputs {
+    /// The `BuildOpenChannel2` inputs in wire order.
+    pub fn build_inputs(&self) -> [usize; 21] {
+        [
+            self.chain_hash,
+            self.temporary_channel_id,
+            self.funding_feerate_perkw,
+            self.commitment_feerate_perkw,
+            self.funding_satoshis,
+            self.dust_limit_satoshis,
+            self.max_htlc_value_in_flight_msat,
+            self.htlc_minimum_msat,
+            self.to_self_delay,
+            self.max_accepted_htlcs,
+            self.locktime,
+            self.funding_pubkey,
+            self.revocation_basepoint,
+            self.payment_basepoint,
+            self.delayed_payment_basepoint,
+            self.htlc_basepoint,
+            self.first_per_commitment_point,
+            self.second_per_commitment_point,
+            self.channel_flags,
+            self.upfront_shutdown_script,
+            self.channel_type,
+        ]
+    }
+}
+
+/// Emits the inputs of `sample_open_channel2`, deriving the
+/// `temporary_channel_id` from our revocation basepoint (the `[0x22; 32]`
+/// key) as BOLT 2 requires.
+pub fn load_open_channel2_inputs(b: &mut ProgramBuilder) -> OpenChannel2Inputs {
+    let revocation_basepoint = load_point(b, [0x22; 32]);
+
+    OpenChannel2Inputs {
+        chain_hash: b.append(Operation::LoadChainHashFromContext, &[]),
+        temporary_channel_id: b.append(
+            Operation::DeriveTemporaryChannelIdV2,
+            &[revocation_basepoint],
+        ),
+        funding_feerate_perkw: b.append(Operation::LoadFeeratePerKw(253), &[]),
+        commitment_feerate_perkw: b.append(Operation::LoadFeeratePerKw(2500), &[]),
+        funding_satoshis: b.append(Operation::LoadAmount(200_000), &[]),
+        dust_limit_satoshis: b.append(Operation::LoadAmount(546), &[]),
+        max_htlc_value_in_flight_msat: b.append(Operation::LoadAmount(100_000_000), &[]),
+        htlc_minimum_msat: b.append(Operation::LoadAmount(1_000), &[]),
+        to_self_delay: b.append(Operation::LoadU16(144), &[]),
+        max_accepted_htlcs: b.append(Operation::LoadU16(483), &[]),
+        locktime: b.append(Operation::LoadBlockHeight(120), &[]),
+        funding_pubkey: load_point(b, [0x11; 32]),
+        revocation_basepoint,
+        payment_basepoint: load_point(b, [0x33; 32]),
+        delayed_payment_basepoint: load_point(b, [0x44; 32]),
+        htlc_basepoint: load_point(b, [0x55; 32]),
+        first_per_commitment_point: load_point(b, [0x66; 32]),
+        second_per_commitment_point: load_point(b, [0x77; 32]),
+        channel_flags: b.append(Operation::LoadU8(0), &[]),
+        upfront_shutdown_script: b.append(Operation::LoadBytes(vec![]), &[]),
+        channel_type: b.append(Operation::LoadChannelType(ChannelTypeVariant::Anchors), &[]),
+    }
+}
+
+/// Emits `sample_open_channel2` and sends it, returning the
+/// `SendOpenChannel2` result: an affine variable a single `RecvAcceptChannel2`
+/// may consume.
+pub fn send_open_channel2(b: &mut ProgramBuilder) -> usize {
+    let inputs = load_open_channel2_inputs(b);
+
+    send_open_channel2_with(b, inputs, false)
+}
+
+/// Builds `open_channel2` from `inputs` and sends it, returning the
+/// `SendOpenChannel2` result.
+pub fn send_open_channel2_with(
+    b: &mut ProgramBuilder,
+    inputs: OpenChannel2Inputs,
+    require_confirmed_inputs: bool,
+) -> usize {
+    let built = b.append(
+        Operation::BuildOpenChannel2 {
+            require_confirmed_inputs,
+        },
+        &inputs.build_inputs(),
+    );
+
+    b.append(Operation::SendOpenChannel2, &[built])
+}
+
+/// The variables a v2 channel negotiation produces.
+#[derive(Clone, Copy)]
+pub struct NegotiatedChannel2 {
+    /// The `SendOpenChannel2` result.
+    pub sent_open_channel2: usize,
+    /// The `RecvAcceptChannel2` result.
+    pub accept_channel2: usize,
+}
+
+/// Emits `sample_open_channel2`, sends it, and receives the peer's
+/// `accept_channel2`.
+pub fn negotiate_channel2(b: &mut ProgramBuilder) -> NegotiatedChannel2 {
+    let sent_open_channel2 = send_open_channel2(b);
+    let accept_channel2 = b.append(Operation::RecvAcceptChannel2, &[sent_open_channel2]);
+
+    NegotiatedChannel2 {
+        sent_open_channel2,
+        accept_channel2,
+    }
+}
+
+/// A program that negotiates `sample_open_channel2`.
+pub fn negotiate_channel2_program() -> Program {
+    let mut b = ProgramBuilder::new();
+    negotiate_channel2(&mut b);
+
+    b.build()
 }
 
 // -- Malformed programs --
