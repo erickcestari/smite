@@ -596,6 +596,7 @@ impl_from_message! {
     OpenChannel2 => OPEN_CHANNEL2,
     AcceptChannel2 => ACCEPT_CHANNEL2,
     TxAddInput => TX_ADD_INPUT,
+    TxAddOutput => TX_ADD_OUTPUT,
     TxRemoveInput => TX_REMOVE_INPUT,
     TxRemoveOutput => TX_REMOVE_OUTPUT,
     TxComplete => TX_COMPLETE,

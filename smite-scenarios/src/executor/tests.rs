@@ -8,7 +8,10 @@ use bitcoin::Amount;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use harness::*;
 use programs::*;
-use smite::bolt::{AcceptChannelTlvs, ChannelTypeVariant, GossipTimestampFilter, Init, Ping};
+use smite::bolt::{
+    AcceptChannelTlvs, ChannelTypeVariant, GossipTimestampFilter, Init, Ping, TxAbort,
+};
+use smite::channel_tx::build_funding_witness_script;
 use smite_ir::Instruction;
 use smite_ir::builder::ProgramBuilder;
 use smite_ir::operation::ShutdownScriptVariant;
@@ -1569,7 +1572,7 @@ fn execute_recv_accept_channel2_affine_overuse_panics() {
     // second receive instruction.
     program.instructions.push(Instruction {
         operation: Operation::RecvAcceptChannel2,
-        inputs: vec![negotiated.sent_open_channel2],
+        inputs: vec![negotiated.open_channel2.sent],
     });
     let accept = sample_accept_channel2(sample_v2_temporary_channel_id());
 
@@ -1577,4 +1580,591 @@ fn execute_recv_accept_channel2_affine_overuse_panics() {
         .queue(&Message::AcceptChannel2(accept.clone()))
         .queue(&Message::AcceptChannel2(accept))
         .run(&program);
+}
+
+// -- Interactive transaction construction --
+
+#[test]
+fn execute_send_tx_add_input_proposes_a_wallet_utxo() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    send_tx_add_input(&mut b, channel_id, 2, 0);
+
+    let mut fx = v2_fixture();
+    fx.run(&b.build());
+
+    let sent: TxAddInput = fx.last_sent();
+    let prevtx = sample_prevtx();
+    assert_eq!(sent.serial_id, 2);
+    assert_eq!(sent.sequence, 0xffff_fffd);
+    assert_eq!(sent.prevtx_vout, 0);
+    assert_eq!(sent.prevtx, bitcoin::consensus::encode::serialize(&prevtx));
+
+    // The input is recorded with the value we know from the wallet, so the
+    // change output can be computed from it.
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    let (serial_id, input) = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .next()
+        .expect("input recorded");
+    assert_eq!(serial_id, 2);
+    assert_eq!(input.contributor, Contributor::Local);
+    assert_eq!(input.outpoint.txid, prevtx.compute_txid());
+    assert_eq!(input.value(), 100_000_000);
+}
+
+#[test]
+fn execute_send_tx_add_input_locks_the_selected_utxo() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    send_tx_add_input(&mut b, channel_id, 2, 0);
+
+    let mut fx = v2_fixture();
+    fx.run(&b.build());
+
+    // Locking is what stops a later selection proposing the same coin,
+    // which the peer would reject as a duplicate input.
+    assert_eq!(
+        fx.bitcoin().locked_outpoints,
+        vec![OutPoint {
+            txid: sample_prevtx().compute_txid(),
+            vout: 0,
+        }],
+    );
+}
+
+#[test]
+fn execute_send_tx_add_input_with_an_empty_wallet_sends_an_empty_prevtx() {
+    let mut b = ProgramBuilder::new();
+    let negotiated = negotiate_channel2(&mut b);
+    send_tx_add_input(
+        &mut b,
+        negotiated.open_channel2.inputs.temporary_channel_id,
+        2,
+        0,
+    );
+
+    // An empty wallet is not a harness error.
+    let mut fx = Fixture::new()
+        .with_utxos(vec![])
+        .queue(&accept_channel2_reply());
+    fx.run(&b.build());
+
+    // Nothing to spend, so nothing to prove non-malleable. The message
+    // still goes out for the peer to reject.
+    assert!(fx.last_sent::<TxAddInput>().prevtx.is_empty());
+}
+
+#[test]
+fn execute_send_tx_add_output_derives_the_funding_output() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    send_tx_add_output(&mut b, channel_id, 4, TxOutputRole::Funding);
+
+    let mut fx = v2_fixture();
+    fx.run(&b.build());
+
+    let sent: TxAddOutput = fx.last_sent();
+    // The acceptor contributes nothing, so the funding output is worth
+    // exactly our open_channel2.funding_satoshis.
+    assert_eq!(sent.sats, 200_000);
+    let secp = Secp256k1::new();
+    let funding_pubkey =
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x11; 32]).unwrap());
+    let expected_script = build_funding_witness_script(
+        &funding_pubkey,
+        &sample_accept_channel2(sample_v2_temporary_channel_id()).funding_pubkey,
+    )
+    .to_p2wsh();
+    assert_eq!(ScriptBuf::from(sent.script), expected_script);
+}
+
+#[test]
+fn execute_send_tx_add_output_change_covers_the_funding_and_the_fee() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    send_tx_add_input(&mut b, channel_id, 2, 0);
+    send_tx_add_output(&mut b, channel_id, 4, TxOutputRole::Funding);
+    send_tx_add_output(&mut b, channel_id, 6, TxOutputRole::Change);
+
+    let mut fx = v2_fixture();
+    fx.run(&b.build());
+
+    let sent: TxAddOutput = fx.last_sent();
+    // One 1 BTC input, 200_000 sat to the funding output, and our share of
+    // the fee at 253 sat/kw: weight 42 + 164 + 172 + 124 + 108 = 610,
+    // giving ceil(610 * 253 / 1000) = 155 sat.
+    assert_eq!(sent.sats, 100_000_000 - 200_000 - 155);
+    assert_eq!(ScriptBuf::from(sent.script), sample_change_spk());
+}
+
+#[test]
+fn execute_send_tx_add_output_explicit_uses_its_inputs() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    let sats = b.append(Operation::LoadAmount(200_000), &[]);
+    let script = b.append(Operation::LoadBytes(vec![]), &[]);
+    b.append(
+        Operation::SendTxAddOutput {
+            serial_id: 4,
+            role: TxOutputRole::Explicit,
+        },
+        &[channel_id, sats, script],
+    );
+
+    let mut fx = v2_fixture();
+    fx.run(&b.build());
+
+    let sent: TxAddOutput = fx.last_sent();
+    assert_eq!(sent.sats, 200_000);
+    assert!(sent.script.is_empty());
+}
+
+#[test]
+fn execute_send_tx_remove_input_keeps_the_peers_input() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    let sent = send_tx_add_input(&mut b, channel_id, 2, 0);
+    // The peer contributes an input of its own.
+    recv_interactive_tx(&mut b, sent);
+    // BOLT 2 forbids removing an input the peer added. A peer that
+    // receives one keeps its input, so we must keep it too or our
+    // reconstruction of the shared transaction diverges from theirs.
+    b.append(Operation::SendTxRemoveInput { serial_id: 3 }, &[channel_id]);
+    b.append(Operation::SendTxRemoveInput { serial_id: 2 }, &[channel_id]);
+
+    let mut fx = v2_fixture().queue(&tx_add_input_reply(v2_channel_id(), 3));
+    fx.run(&b.build());
+
+    // Ours is gone, the peer's survives.
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    let remaining: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(remaining, vec![3]);
+
+    // Both removals still went on the wire; only our own changed local
+    // state, so the peer gets to reject the illegal one.
+    let removals = fx
+        .sent_types()
+        .iter()
+        .filter(|ty| **ty == MessageType::TX_REMOVE_INPUT)
+        .count();
+    assert_eq!(removals, 2);
+}
+
+#[test]
+fn execute_send_tx_remove_output_keeps_the_peers_output() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    let sent = send_tx_add_output(&mut b, channel_id, 4, TxOutputRole::Funding);
+    // The peer contributes an output of its own.
+    recv_interactive_tx(&mut b, sent);
+    b.append(
+        Operation::SendTxRemoveOutput { serial_id: 5 },
+        &[channel_id],
+    );
+    b.append(
+        Operation::SendTxRemoveOutput { serial_id: 4 },
+        &[channel_id],
+    );
+
+    let mut fx = v2_fixture().queue(&tx_add_output_reply(v2_channel_id(), 5));
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    let remaining: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(remaining, vec![5]);
+}
+
+#[test]
+fn execute_recv_interactive_tx_records_peer_contributions() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    let sent = send_tx_complete(&mut b, channel_id);
+    recv_interactive_tx(&mut b, sent);
+
+    // The non-initiator uses odd serial ids.
+    let mut fx = v2_fixture().queue(&tx_add_input_reply(v2_channel_id(), 3));
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    let (serial_id, input) = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .next()
+        .expect("input recorded");
+    assert_eq!(serial_id, 3);
+    assert_eq!(input.contributor, Contributor::Remote);
+    assert_eq!(input.value(), 100_000_000);
+    // The peer answered with a contribution, not a tx_complete, so our
+    // tx_complete did not conclude the exchange.
+    assert!(!pending.tx_exchange.concluded());
+}
+
+#[test]
+fn execute_recv_interactive_tx_remove_input_keeps_our_input() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    let sent = send_tx_add_input(&mut b, channel_id, 2, 0);
+    recv_interactive_tx(&mut b, sent); // the peer adds an input
+    let sent = send_tx_complete(&mut b, channel_id);
+    recv_interactive_tx(&mut b, sent); // the peer removes ours, which BOLT 2 forbids
+    let sent = send_tx_complete(&mut b, channel_id);
+    recv_interactive_tx(&mut b, sent); // the peer removes its own
+
+    let mut fx = v2_fixture()
+        .queue(&tx_add_input_reply(v2_channel_id(), 3))
+        .queue(&tx_remove_input_reply(v2_channel_id(), 2))
+        .queue(&tx_remove_input_reply(v2_channel_id(), 3));
+    fx.run(&b.build());
+
+    // The peer's illegal removal left ours in place; its own is gone.
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    let remaining: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(remaining, vec![2]);
+}
+
+#[test]
+fn execute_recv_interactive_tx_remove_output_keeps_our_output() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    let sent = send_tx_add_output(&mut b, channel_id, 4, TxOutputRole::Funding);
+    recv_interactive_tx(&mut b, sent); // the peer adds an output
+    let sent = send_tx_complete(&mut b, channel_id);
+    recv_interactive_tx(&mut b, sent); // the peer removes ours, which BOLT 2 forbids
+    let sent = send_tx_complete(&mut b, channel_id);
+    recv_interactive_tx(&mut b, sent); // the peer removes its own
+
+    let mut fx = v2_fixture()
+        .queue(&tx_add_output_reply(v2_channel_id(), 5))
+        .queue(&tx_remove_output_reply(v2_channel_id(), 4))
+        .queue(&tx_remove_output_reply(v2_channel_id(), 5));
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    let remaining: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(remaining, vec![4]);
+}
+
+#[test]
+fn execute_recv_interactive_tx_for_an_unknown_channel_is_ignored() {
+    let mut b = ProgramBuilder::new();
+    let negotiated = negotiate_channel2(&mut b);
+    let sent = send_tx_complete(&mut b, negotiated.open_channel2.inputs.temporary_channel_id);
+    recv_interactive_tx(&mut b, sent);
+
+    // An unknown channel_id is not a harness error.
+    let mut fx = v2_fixture().queue(&tx_complete_reply(ChannelId::new([0x99; 32])));
+    fx.run(&b.build());
+
+    // Only the peer can tell whether that message is consistent with its
+    // own view, so nothing is invented on our side: the reply to our
+    // tx_complete is still owed.
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert!(!pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 1);
+}
+
+#[test]
+fn execute_recv_interactive_tx_unexpected_message() {
+    let mut b = ProgramBuilder::new();
+    let negotiated = negotiate_channel2(&mut b);
+    let sent = send_tx_complete(&mut b, negotiated.open_channel2.inputs.temporary_channel_id);
+    recv_interactive_tx(&mut b, sent);
+
+    // An accept_channel does not belong in an interactive tx exchange.
+    let mut fx = v2_fixture().queue(&Message::AcceptChannel(sample_accept_channel()));
+    let err = fx.run_err(&b.build());
+
+    assert!(
+        matches!(err, ExecuteError::UnexpectedMessage { .. }),
+        "unexpected error: {err}",
+    );
+}
+
+#[test]
+#[should_panic(expected = "is void")]
+fn execute_recv_interactive_tx_affine_overuse_panics() {
+    let mut b = ProgramBuilder::new();
+    let negotiated = negotiate_channel2(&mut b);
+    let sent = send_tx_complete(&mut b, negotiated.open_channel2.inputs.temporary_channel_id);
+    recv_interactive_tx(&mut b, sent);
+    let mut program = b.build();
+
+    // The turn-based protocol earns one receive per send. `ProgramBuilder`
+    // rejects the reuse itself, so we manually append the second receive.
+    program.instructions.push(Instruction {
+        operation: Operation::RecvInteractiveTx,
+        inputs: vec![sent],
+    });
+
+    // Enough for the first receive to succeed, so the second one fails on
+    // the consumed token rather than on an empty queue.
+    v2_fixture()
+        .queue(&tx_complete_reply(sample_v2_temporary_channel_id()))
+        .run(&program);
+}
+
+#[test]
+fn execute_build_funding_transaction_v2_locates_the_funding_output() {
+    let mut b = ProgramBuilder::new();
+    v2_funding_flow(&mut b);
+
+    let mut fx = v2_flow_fixture();
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    let secp = Secp256k1::new();
+    let funding_pubkey =
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x11; 32]).unwrap());
+    let funding = pending.tx_exchange.shared_tx().build_funding(
+        &build_funding_witness_script(
+            &funding_pubkey,
+            &sample_accept_channel2(sample_v2_temporary_channel_id()).funding_pubkey,
+        )
+        .to_p2wsh(),
+        200_000,
+    );
+    // Serial 4 (funding) sorts before serial 6 (change).
+    assert_eq!(funding.vout, 0);
+    assert_eq!(funding.tx.input.len(), 1);
+    assert_eq!(funding.tx.output.len(), 2);
+    assert_eq!(funding.tx.output[0].value.to_sat(), 200_000);
+    assert_eq!(funding.tx.lock_time.to_consensus_u32(), 120);
+}
+
+#[test]
+fn execute_build_funding_transaction_v2_unknown_channel_is_empty() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = b.append(Operation::LoadChannelId([0x99; 32]), &[]);
+    let funding_tx = b.append(Operation::BuildFundingTransactionV2, &[channel_id]);
+    // The empty sentinel must flow into its consumers without panicking.
+    b.append(Operation::BroadcastTransaction, &[funding_tx]);
+
+    // An unknown channel_id is not a harness error.
+    Fixture::new().run(&b.build());
+}
+
+#[test]
+fn execute_recv_interactive_tx_stops_once_the_exchange_concludes() {
+    // The exchange from a real Eclair run: the peer, contributing nothing,
+    // answers each of our messages with tx_complete. Our own tx_complete
+    // then makes two consecutive ones, concluding the exchange, and the
+    // peer moves straight on to commitment_signed.
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    // Each send is followed by the peer's reply, as the turn-based
+    // protocol and the generator both require.
+    let sent = send_tx_add_input(&mut b, channel_id, 2, 0);
+    recv_interactive_tx(&mut b, sent);
+    let sent = send_tx_add_output(&mut b, channel_id, 2000, TxOutputRole::Funding);
+    recv_interactive_tx(&mut b, sent);
+    let sent = send_tx_add_output(&mut b, channel_id, 2002, TxOutputRole::Change);
+    recv_interactive_tx(&mut b, sent);
+    let sent = send_tx_complete(&mut b, channel_id);
+    recv_interactive_tx(&mut b, sent);
+
+    // One tx_complete per message we send before our own tx_complete, then
+    // what the peer sends next, which the concluded exchange must not eat.
+    let mut fx = v2_flow_fixture().queue(&commitment_signed_reply(v2_channel_id()));
+    fx.run(&b.build());
+
+    assert_eq!(
+        fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .tx_exchange
+            .outstanding_replies(),
+        0,
+    );
+    // The commitment_signed is still queued for whoever asks for it next.
+    // Consuming it here would leave every later operation one message
+    // behind, and the program would fail on a message it never expected.
+    assert_eq!(fx.queued_types(), vec![MessageType::COMMITMENT_SIGNED]);
+}
+
+#[test]
+fn execute_recv_interactive_tx_settles_a_backlog_left_by_a_dropped_receive() {
+    // A mutated program: the first tx_add_input has no paired receive, so
+    // every later receive is answering an earlier message. The peer still
+    // replies to all five contributions and stays silent after the
+    // tx_complete that concludes the exchange, leaving one reply owed.
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    // The receive after this first send is the one a mutator dropped.
+    send_tx_add_input(&mut b, channel_id, 2, 0);
+    let sent = send_tx_add_input(&mut b, channel_id, 4, 1);
+    recv_interactive_tx(&mut b, sent);
+    let sent = send_tx_add_output(&mut b, channel_id, 2000, TxOutputRole::Funding);
+    recv_interactive_tx(&mut b, sent);
+    let sent = send_tx_add_output(&mut b, channel_id, 2002, TxOutputRole::Change);
+    recv_interactive_tx(&mut b, sent);
+    let sent = send_tx_complete(&mut b, channel_id);
+    // The receive after our tx_complete is the one that must settle the
+    // backlog rather than skip: the exchange has concluded, but a reply to
+    // an earlier message is still owed.
+    recv_interactive_tx(&mut b, sent);
+
+    // One reply per contribution; none for the concluding tx_complete.
+    let mut fx = v2_fixture()
+        .queue_repeated(&tx_complete_reply(v2_channel_id()), 4)
+        .queue(&commitment_signed_reply(v2_channel_id()));
+    fx.run(&b.build());
+
+    // Every owed reply was read, so the commitment_signed is still there
+    // for the operation that actually wants it.
+    assert_eq!(
+        fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .tx_exchange
+            .outstanding_replies(),
+        0,
+    );
+    assert_eq!(fx.queued_types(), vec![MessageType::COMMITMENT_SIGNED]);
+}
+
+#[test]
+fn execute_recv_interactive_tx_drops_contributions_sent_after_the_conclusion() {
+    // A mutated program from a real CLN run: three inputs go out, with the
+    // last two replies left unread, then the funding output, a tx_complete
+    // and a change output. From the peer's side its tx_complete answering
+    // the funding output and our tx_complete are consecutive, so the
+    // exchange concludes without the change output. Our transaction must
+    // agree, or the peer's perfectly good commitment signature reads as
+    // invalid.
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    let sent = send_tx_add_input(&mut b, channel_id, 2, 0);
+    recv_interactive_tx(&mut b, sent);
+    let sent = send_tx_add_input(&mut b, channel_id, 4, 1);
+    recv_interactive_tx(&mut b, sent);
+    let third_input = send_tx_add_input(&mut b, channel_id, 6, 2);
+    send_tx_add_output(&mut b, channel_id, 2000, TxOutputRole::Funding);
+    let complete = send_tx_complete(&mut b, channel_id);
+    let change = send_tx_add_output(&mut b, channel_id, 2002, TxOutputRole::Change);
+    recv_interactive_tx(&mut b, change);
+    recv_interactive_tx(&mut b, complete);
+    // The exchange has concluded, so this one has nothing to read.
+    recv_interactive_tx(&mut b, third_input);
+
+    // One tx_complete per message before our own tx_complete; the peer then
+    // moves straight on to commitment_signed.
+    let mut fx = v2_fixture()
+        .queue_repeated(&tx_complete_reply(v2_channel_id()), 4)
+        .queue(&commitment_signed_reply(v2_channel_id()));
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert!(pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 0);
+    let inputs: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .inputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(inputs, vec![2, 4, 6]);
+    let outputs: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        outputs,
+        vec![2000],
+        "the late change output is not the peer's"
+    );
+    assert_eq!(fx.queued_types(), vec![MessageType::COMMITMENT_SIGNED]);
+}
+
+#[test]
+fn execute_send_after_a_known_conclusion_is_not_recorded() {
+    // The peer's tx_complete has been read, so ours concludes the exchange
+    // on the spot and a later contribution is neither recorded nor waited on.
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    let sent = send_tx_add_output(&mut b, channel_id, 2000, TxOutputRole::Funding);
+    recv_interactive_tx(&mut b, sent);
+    let complete = send_tx_complete(&mut b, channel_id);
+    let change = send_tx_add_output(&mut b, channel_id, 2002, TxOutputRole::Change);
+    recv_interactive_tx(&mut b, change);
+    recv_interactive_tx(&mut b, complete);
+
+    let mut fx = v2_fixture().queue(&tx_complete_reply(v2_channel_id()));
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert!(pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 0);
+    let outputs: Vec<u64> = pending
+        .tx_exchange
+        .shared_tx()
+        .outputs()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(outputs, vec![2000]);
+    assert_eq!(fx.queued_len(), 0);
+}
+
+#[test]
+fn execute_recv_interactive_tx_still_reads_mid_exchange() {
+    // Three contributions go out and only one reply is read. The peer's
+    // tx_complete answered our first send, not our latest, so the exchange
+    // is not concluded and the receive must not be skipped.
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b);
+    send_tx_add_input(&mut b, channel_id, 2, 0);
+    send_tx_add_input(&mut b, channel_id, 4, 1);
+    let sent = send_tx_add_input(&mut b, channel_id, 6, 2);
+    recv_interactive_tx(&mut b, sent);
+
+    let mut fx = v2_fixture().queue(&tx_complete_reply(v2_channel_id()));
+    fx.run(&b.build());
+
+    assert_eq!(fx.queued_len(), 0, "the reply was not read");
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    // The peer still owes two replies and the next receive must not skip
+    // either.
+    assert!(!pending.tx_exchange.concluded());
+    assert_eq!(pending.tx_exchange.outstanding_replies(), 2);
+}
+
+#[test]
+fn execute_recv_interactive_tx_records_a_peer_abort() {
+    let mut b = ProgramBuilder::new();
+    let negotiated = negotiate_channel2(&mut b);
+    let sent = send_tx_complete(&mut b, negotiated.open_channel2.inputs.temporary_channel_id);
+    recv_interactive_tx(&mut b, sent);
+
+    // An abort is normal protocol behaviour, not a harness error.
+    let mut fx = v2_fixture().queue(&Message::TxAbort(TxAbort::new(
+        sample_v2_temporary_channel_id(),
+        "funding output not to spec",
+    )));
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert!(pending.tx_exchange.aborted());
+    // An abort is not a tx_complete, so the negotiation has not concluded.
+    assert!(!pending.tx_exchange.concluded());
 }

@@ -5,17 +5,18 @@
 
 use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-use bitcoin::{OutPoint, ScriptBuf, Txid};
+use bitcoin::{OutPoint, ScriptBuf, TxOut, Txid};
 use smite::bitcoin::{BitcoinCli, TxBlockPosition, Utxo};
 use smite::bolt::{
     AcceptChannel, AcceptChannel2, AnnouncementSignatures, ChannelAnnouncement, ChannelId,
     ChannelReady, ChannelReadyTlvs, ChannelUpdate, Features, FromMessage, FundingCreated,
     FundingSigned, Message, MessageType, NodeAnnouncement, OpenChannel, OpenChannel2,
     OpenChannel2Tlvs, OpenChannelTlvs, Pong, ShortChannelId, Shutdown, TemporaryChannelId,
+    TxAddInput, TxAddInputTlvs, TxAddOutput, TxComplete, TxRemoveInput, TxRemoveOutput,
 };
 use smite::channel_tx::{
-    ChannelConfig, ChannelPartyConfig, ChannelState, FundingTransaction, HolderIdentity, Side,
-    build_funding_transaction,
+    ChannelConfig, ChannelPartyConfig, ChannelState, Contributor, FundingTransaction,
+    HolderIdentity, SharedInput, SharedOutput, Side, Step, build_funding_transaction,
 };
 use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{AcceptChannelContext, AcceptChannelOracle, Oracle};
@@ -23,7 +24,7 @@ use smite::pending_channel::{PendingChannel, V2Negotiations};
 use smite::violation::Violation;
 
 use super::targets::TargetRpc;
-use smite_ir::operation::{AcceptChannel2Field, AcceptChannelField};
+use smite_ir::operation::{AcceptChannel2Field, AcceptChannelField, TxOutputRole};
 use smite_ir::{Operation, Program, Variable, VariableType};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -74,6 +75,11 @@ pub trait BitcoinRpc {
     #[must_use]
     fn get_new_address_script_pubkey(&mut self) -> ScriptBuf;
 
+    /// Returns the consensus-serialized transaction with the given txid, or
+    /// `None` if it is unknown to the node. Used for `tx_add_input`'s `prevtx`.
+    #[must_use]
+    fn get_raw_transaction(&mut self, txid: Txid) -> Option<Vec<u8>>;
+
     /// Signs and broadcasts a transaction. Returns hex-encoded raw transaction
     /// if it is consensus-valid but rejected by mempool policy, so it can be
     /// added to the `private_mempool`; returns `None` if it was broadcast or is
@@ -107,6 +113,10 @@ impl BitcoinRpc for BitcoinCli {
 
     fn get_new_address_script_pubkey(&mut self) -> ScriptBuf {
         BitcoinCli::get_new_address_script_pubkey(self)
+    }
+
+    fn get_raw_transaction(&mut self, txid: Txid) -> Option<Vec<u8>> {
+        BitcoinCli::get_raw_transaction(self, txid)
     }
 
     fn sign_and_broadcast_tx(&mut self, tx: &bitcoin::Transaction) -> Option<String> {
@@ -652,11 +662,167 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     self.negotiations_v2.record_accept(&ac);
                     Some(Variable::AcceptChannel2(ac))
                 }
+
+                Operation::SendTxAddInput {
+                    serial_id,
+                    utxo_index,
+                    sequence,
+                } => {
+                    let msg = build_tx_add_input(
+                        &variables,
+                        &instr.inputs,
+                        *serial_id,
+                        *utxo_index,
+                        *sequence,
+                        &mut self.bitcoin_cli,
+                        &mut self.negotiations_v2,
+                    );
+                    let channel_id = msg.channel_id;
+                    let encoded = Message::TxAddInput(msg).encode();
+                    log::debug!(
+                        "[{:?}] SendTxAddInput: serial_id={serial_id}, {} bytes",
+                        start.elapsed(),
+                        encoded.len(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
+
+                Operation::SendTxAddOutput { serial_id, role } => {
+                    let msg = build_tx_add_output(
+                        &variables,
+                        &instr.inputs,
+                        *serial_id,
+                        *role,
+                        &mut self.bitcoin_cli,
+                        &mut self.negotiations_v2,
+                    );
+                    let channel_id = msg.channel_id;
+                    let encoded = Message::TxAddOutput(msg).encode();
+                    log::debug!(
+                        "[{:?}] SendTxAddOutput: serial_id={serial_id}, role={role}, {} bytes",
+                        start.elapsed(),
+                        encoded.len(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
+
+                Operation::SendTxRemoveInput { serial_id } => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    record_sent_step(
+                        &mut self.negotiations_v2,
+                        channel_id,
+                        Step::RemoveInput(*serial_id),
+                    );
+                    let encoded = Message::TxRemoveInput(TxRemoveInput {
+                        channel_id,
+                        serial_id: *serial_id,
+                    })
+                    .encode();
+                    log::debug!(
+                        "[{:?}] SendTxRemoveInput: serial_id={serial_id}",
+                        start.elapsed(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
+
+                Operation::SendTxRemoveOutput { serial_id } => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    record_sent_step(
+                        &mut self.negotiations_v2,
+                        channel_id,
+                        Step::RemoveOutput(*serial_id),
+                    );
+                    let encoded = Message::TxRemoveOutput(TxRemoveOutput {
+                        channel_id,
+                        serial_id: *serial_id,
+                    })
+                    .encode();
+                    log::debug!(
+                        "[{:?}] SendTxRemoveOutput: serial_id={serial_id}",
+                        start.elapsed(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
+
+                Operation::SendTxComplete => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    record_sent_step(&mut self.negotiations_v2, channel_id, Step::Complete);
+                    let encoded = Message::TxComplete(TxComplete { channel_id }).encode();
+                    log::debug!("[{:?}] SendTxComplete", start.elapsed());
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
+
+                Operation::RecvInteractiveTx => {
+                    let channel_id = consume_sent_interactive_tx(&mut variables, instr.inputs[0]);
+                    if is_interactive_tx_expected(&self.negotiations_v2, channel_id) {
+                        log::debug!("[{:?}] RecvInteractiveTx: waiting", start.elapsed());
+                        let msg = self.recv_interactive_tx()?;
+                        log::debug!("[{:?}] RecvInteractiveTx: got {msg}", start.elapsed());
+                    } else {
+                        log::debug!(
+                            "[{:?}] RecvInteractiveTx: negotiation concluded, nothing to receive",
+                            start.elapsed(),
+                        );
+                    }
+                    None
+                }
+
+                Operation::BuildFundingTransactionV2 => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    self.settle_negotiation(channel_id)?;
+                    let ft = build_funding_transaction_v2(&self.negotiations_v2, channel_id);
+                    log::debug!(
+                        "[{:?}] BuildFundingTransactionV2: txid={} vout={}",
+                        start.elapsed(),
+                        ft.tx.compute_txid(),
+                        ft.vout,
+                    );
+                    Some(Variable::FundingTransaction(ft))
+                }
             };
 
             variables.push(result);
         }
 
+        Ok(())
+    }
+
+    /// Reads the peer's next interactive transaction message and applies it
+    /// to the negotiation it names.
+    fn recv_interactive_tx(&mut self) -> Result<Message, ExecuteError> {
+        let msg = recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)?;
+        apply_interactive_tx(&mut self.negotiations_v2, &msg)?;
+        Ok(msg)
+    }
+
+    /// Reads every reply the peer still owes on `channel_id`, so what is
+    /// built from the negotiation next is what the peer negotiated.
+    ///
+    /// A program may send several messages before reading any reply, and
+    /// whether our `tx_complete` concluded the exchange is only known from
+    /// the reply to the message before it. Building the funding transaction
+    /// or signing over it while replies are owed would use a transaction the
+    /// peer may never have agreed to, and its perfectly good signatures
+    /// would then read as invalid. The replies are already on their way, so
+    /// reading them costs nothing, and a later `RecvInteractiveTx` finds
+    /// nothing owed and reads nothing.
+    ///
+    /// The count of owed replies is exact, so this never reads into whatever
+    /// the peer moved on to after the exchange.
+    fn settle_negotiation(&mut self, channel_id: ChannelId) -> Result<(), ExecuteError> {
+        while self
+            .negotiations_v2
+            .get(channel_id)
+            .is_some_and(|pending| pending.tx_exchange.expects_reply())
+        {
+            let msg = self.recv_interactive_tx()?;
+            log::debug!("settling negotiation {channel_id}: got {msg}");
+        }
         Ok(())
     }
 }
@@ -749,6 +915,17 @@ fn consume_affine(variables: &mut [Option<Variable>], index: usize, expected: Va
         type_mismatch(index, expected, actual);
     }
     variables[index] = None;
+}
+
+/// Consumes the affine `SentInteractiveTx`, returning the `channel_id` the
+/// message it stands for was sent on.
+fn consume_sent_interactive_tx(variables: &mut [Option<Variable>], index: usize) -> ChannelId {
+    let channel_id = match resolve(variables, index) {
+        Variable::SentInteractiveTx(channel_id) => *channel_id,
+        other => type_mismatch(index, VariableType::SentInteractiveTx, other.var_type()),
+    };
+    variables[index] = None;
+    channel_id
 }
 
 // -- Operation handlers --
@@ -863,6 +1040,275 @@ fn build_open_channel2(
             require_confirmed_inputs,
         },
     }
+}
+
+/// Records a step we sent on `channel_id` in its negotiation.
+///
+/// A negotiation we do not track records nothing: the message still goes out
+/// for the peer to judge, as does anything sent after the exchange concluded.
+fn record_sent_step(negotiations: &mut V2Negotiations, channel_id: ChannelId, step: Step) {
+    if let Some(pending) = negotiations.get_mut(channel_id) {
+        pending.tx_exchange.send(step);
+    }
+}
+
+/// Builds a `tx_add_input` proposing one of our wallet UTXOs, and records it in
+/// the negotiation so the shared transaction can be rebuilt later.
+///
+/// `utxo_index` selects modulo the spendable set, so any index is meaningful
+/// and reusing one proposes the same outpoint twice, which the peer must
+/// reject. An empty wallet or a previous transaction the node does not know
+/// yields an empty `prevtx`, which is likewise the peer's to reject.
+fn build_tx_add_input(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+    serial_id: u64,
+    utxo_index: u8,
+    sequence: u32,
+    cli: &mut impl BitcoinRpc,
+    negotiations: &mut V2Negotiations,
+) -> TxAddInput {
+    let channel_id = resolve_channel_id(variables, inputs[0]);
+
+    let utxos = cli.get_utxos();
+    let selected = (!utxos.is_empty()).then(|| {
+        let index = usize::from(utxo_index) % utxos.len();
+        utxos[index].clone()
+    });
+
+    let (prevtx, prevtx_vout) = match &selected {
+        Some(utxo) => (
+            cli.get_raw_transaction(utxo.outpoint.txid)
+                .unwrap_or_default(),
+            utxo.outpoint.vout,
+        ),
+        None => (Vec::new(), 0),
+    };
+
+    if let Some(utxo) = &selected {
+        // Locking keeps a later selection from proposing the same coin, which
+        // the peer would reject as a duplicate input.
+        cli.lock_utxos(&[utxo.outpoint]);
+    }
+
+    let mut input = SharedInput::from_prevtx(&prevtx, prevtx_vout, sequence, Contributor::Local);
+    if let Some(utxo) = &selected {
+        // Prefer what the wallet told us: a missing `prevtx` still leaves
+        // us knowing exactly what we are spending.
+        input.outpoint = utxo.outpoint;
+        input.prevout = Some(TxOut {
+            value: utxo.amount,
+            script_pubkey: utxo.script_pubkey.clone(),
+        });
+    }
+    record_sent_step(
+        negotiations,
+        channel_id,
+        Step::AddInput { serial_id, input },
+    );
+
+    TxAddInput {
+        channel_id,
+        serial_id,
+        prevtx,
+        prevtx_vout,
+        sequence,
+        tlvs: TxAddInputTlvs::default(),
+    }
+}
+
+/// Builds a `tx_add_output` and records it in the negotiation.
+///
+/// The funding and change roles derive their value and script from the
+/// negotiation; without one to derive from they fall back to the value and
+/// script inputs, so the message still goes out and the peer still gets to
+/// judge it.
+fn build_tx_add_output(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+    serial_id: u64,
+    role: TxOutputRole,
+    cli: &mut impl BitcoinRpc,
+    negotiations: &mut V2Negotiations,
+) -> TxAddOutput {
+    let channel_id = resolve_channel_id(variables, inputs[0]);
+    let explicit_sats = resolve_amount(variables, inputs[1]);
+    let explicit_script = ScriptBuf::from(resolve_bytes(variables, inputs[2]).to_vec());
+
+    let derived = match role {
+        TxOutputRole::Explicit => None,
+        TxOutputRole::Funding => negotiations.get(channel_id).and_then(|pending| {
+            Some((pending.total_funding_satoshis(), pending.funding_script()?))
+        }),
+        TxOutputRole::Change => {
+            let change_script = cli.get_new_address_script_pubkey();
+            negotiations.get(channel_id).map(|pending| {
+                let feerate = pending.open_channel2.funding_feerate_perkw;
+                let fee = pending
+                    .tx_exchange
+                    .shared_tx()
+                    .local_fee_sat(feerate, &[change_script.len()]);
+                // Whatever our inputs cover beyond our funding contribution and
+                // our share of the fee. Saturating: an under-funded selection
+                // yields a zero-value output the peer rejects, rather than a
+                // panic.
+                let value = pending
+                    .tx_exchange
+                    .shared_tx()
+                    .contributed_input_value(Contributor::Local)
+                    .saturating_sub(pending.open_channel2.funding_satoshis)
+                    .saturating_sub(fee);
+                (value, change_script)
+            })
+        }
+    };
+
+    let (sats, script) = derived.unwrap_or((explicit_sats, explicit_script));
+    let script = script.into_bytes();
+
+    record_sent_step(
+        negotiations,
+        channel_id,
+        Step::AddOutput {
+            serial_id,
+            output: SharedOutput {
+                value: sats,
+                script_pubkey: ScriptBuf::from(script.clone()),
+                contributor: Contributor::Local,
+            },
+        },
+    );
+
+    TxAddOutput {
+        channel_id,
+        serial_id,
+        sats,
+        script,
+    }
+}
+
+/// Applies one received interactive transaction message to the negotiation it
+/// names.
+///
+/// A message for an unknown negotiation is logged and dropped rather than
+/// reported: only the peer can tell whether it is consistent with its own
+/// view, and it will fail the negotiation if not.
+fn apply_interactive_tx(
+    negotiations: &mut V2Negotiations,
+    msg: &Message,
+) -> Result<(), ExecuteError> {
+    let (channel_id, step) = match msg {
+        Message::TxAddInput(m) => (
+            m.channel_id,
+            Step::AddInput {
+                serial_id: m.serial_id,
+                input: SharedInput::from_prevtx(
+                    &m.prevtx,
+                    m.prevtx_vout,
+                    m.sequence,
+                    Contributor::Remote,
+                ),
+            },
+        ),
+        Message::TxAddOutput(m) => (
+            m.channel_id,
+            Step::AddOutput {
+                serial_id: m.serial_id,
+                output: SharedOutput {
+                    value: m.sats,
+                    script_pubkey: ScriptBuf::from(m.script.clone()),
+                    contributor: Contributor::Remote,
+                },
+            },
+        ),
+        Message::TxRemoveInput(m) => (m.channel_id, Step::RemoveInput(m.serial_id)),
+        Message::TxRemoveOutput(m) => (m.channel_id, Step::RemoveOutput(m.serial_id)),
+        Message::TxComplete(m) => (m.channel_id, Step::Complete),
+        Message::TxAbort(m) => {
+            log::debug!(
+                "peer aborted the negotiation: {}",
+                m.message().unwrap_or("<non-utf8>"),
+            );
+            if let Some(pending) = negotiations.get_mut(m.channel_id) {
+                pending.tx_exchange.abort();
+            }
+            return Ok(());
+        }
+        other => {
+            return Err(ExecuteError::UnexpectedMessage {
+                expected: MessageType::TX_COMPLETE,
+                got: other.msg_type(),
+            });
+        }
+    };
+
+    match negotiations.get_mut(channel_id) {
+        Some(pending) => pending.tx_exchange.receive(step),
+        None => {
+            log::debug!("interactive tx message for unknown channel_id {channel_id}, ignoring");
+        }
+    }
+
+    Ok(())
+}
+
+/// Reconstructs the shared funding transaction from a negotiation.
+///
+/// An unknown `channel_id` yields an empty transaction rather than an error:
+/// a mutated program may point this at a channel that was never opened, and
+/// every consumer already has to cope with a funding output that does not
+/// match.
+fn build_funding_transaction_v2(
+    negotiations: &V2Negotiations,
+    channel_id: ChannelId,
+) -> FundingTransaction {
+    let Some(pending) = negotiations.get(channel_id) else {
+        log::debug!("no v2 negotiation for channel_id {channel_id}, building an empty transaction");
+        return FundingTransaction {
+            tx: bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: Vec::new(),
+                output: Vec::new(),
+            },
+            vout: 0,
+        };
+    };
+
+    match pending.funding_script() {
+        Some(script) => pending
+            .tx_exchange
+            .shared_tx()
+            .build_funding(&script, pending.total_funding_satoshis()),
+        // Without `accept_channel2` the funding script is unknown, so there is
+        // nothing to locate; `vout` 0 keeps the result well-typed.
+        None => FundingTransaction {
+            tx: pending.tx_exchange.shared_tx().build(),
+            vout: 0,
+        },
+    }
+}
+
+/// Returns whether the peer owes us a reply in the interactive transaction
+/// exchange.
+///
+/// The exchange is turn-based, so the peer answers every message we send until
+/// the one that concludes it on two consecutive `tx_complete`s. Reading when
+/// nothing is owed would consume whatever the peer moved on to, usually its
+/// `commitment_signed`, and leave every later operation a message behind.
+///
+/// This counts what is owed rather than asking whether the exchange concluded.
+/// A mutator that drops one receive leaves the program permanently short of a
+/// reply, and the count lets the next receive settle the backlog instead of
+/// stranding it.
+///
+/// A negotiation we do not track still reads. A mutated program may have sent
+/// on a channel we never opened, and the peer's rejection of it is worth
+/// surfacing.
+fn is_interactive_tx_expected(negotiations: &V2Negotiations, channel_id: ChannelId) -> bool {
+    negotiations
+        .get(channel_id)
+        .is_none_or(|pending| pending.tx_exchange.expects_reply())
 }
 
 /// Builds a `funding_created` message from 3 input variables.
