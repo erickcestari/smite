@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use bitcoin::ScriptBuf;
+use bitcoin::{ScriptBuf, Witness};
 
 use crate::bolt::{
     AcceptChannel, AcceptChannel2, ChannelId, OpenChannel, OpenChannel2, TemporaryChannelId,
@@ -38,6 +38,33 @@ pub struct PendingChannelV2 {
     pub channel_id: Option<ChannelId>,
     /// The interactive transaction exchange and the transaction it builds.
     pub tx_exchange: TxExchange,
+    /// Progress through the commitment and signature exchange that follows it.
+    pub commitment_exchange: CommitmentExchange,
+    /// Witnesses from the peer's `tx_signatures`
+    pub peer_witnesses: Vec<Witness>,
+}
+
+/// Progress through a two-way exchange of one message type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Exchange {
+    /// Whether we have sent ours.
+    pub sent: bool,
+    /// Whether the peer's has arrived.
+    pub received: bool,
+}
+
+/// How far the commitment and signature exchange has progressed.
+///
+/// BOLT 2 gates each half on the other: `tx_signatures` may only be sent once
+/// both peers' `commitment_signed`s have been exchanged, and the peer owes us
+/// its `tx_signatures` once it has received ours.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitmentExchange {
+    /// Progress through the `commitment_signed` exchange for this funding
+    /// transaction. `received` means arrived *and* verified.
+    pub commitment_signed: Exchange,
+    /// Progress through the `tx_signatures` exchange.
+    pub tx_signatures: Exchange,
 }
 
 impl PendingChannelV2 {
@@ -51,6 +78,8 @@ impl PendingChannelV2 {
             accept_channel2: None,
             channel_id: None,
             tx_exchange,
+            commitment_exchange: CommitmentExchange::default(),
+            peer_witnesses: Vec::new(),
         }
     }
 

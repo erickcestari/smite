@@ -71,6 +71,8 @@ pub enum Variable {
     /// Carries the `channel_id` it was sent on, so the receive can tell whether
     /// that negotiation is still expecting a reply.
     SentInteractiveTx(ChannelId),
+    /// `commitment_signed` has been sent, so the peer's may now be received.
+    SentCommitmentSigned,
     /// `funding_created` has been sent, so `funding_signed` may now be received.
     SentFundingCreated,
     /// `shutdown` has been sent, so the counterparty's `shutdown` may now be
@@ -106,6 +108,7 @@ impl Variable {
             Self::SentOpenChannel => VariableType::SentOpenChannel,
             Self::SentOpenChannel2 => VariableType::SentOpenChannel2,
             Self::SentInteractiveTx(_) => VariableType::SentInteractiveTx,
+            Self::SentCommitmentSigned => VariableType::SentCommitmentSigned,
             Self::SentFundingCreated => VariableType::SentFundingCreated,
             Self::SentShutdown => VariableType::SentShutdown,
         }
@@ -139,6 +142,7 @@ pub enum VariableType {
     SentOpenChannel,
     SentOpenChannel2,
     SentInteractiveTx,
+    SentCommitmentSigned,
     SentFundingCreated,
     SentShutdown,
 }
@@ -150,6 +154,7 @@ impl VariableType {
             Self::SentOpenChannel
             | Self::SentOpenChannel2
             | Self::SentInteractiveTx
+            | Self::SentCommitmentSigned
             | Self::SentFundingCreated
             | Self::SentShutdown => true,
 
