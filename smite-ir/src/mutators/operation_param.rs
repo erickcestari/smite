@@ -145,7 +145,11 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
         | Operation::RecvAcceptChannel2
         | Operation::SendTxComplete
         | Operation::RecvInteractiveTx
-        | Operation::BuildFundingTransactionV2 => {
+        | Operation::BuildFundingTransactionV2
+        | Operation::SendCommitmentSigned
+        | Operation::RecvCommitmentSigned
+        | Operation::RecvTxSignatures
+        | Operation::SendTxSignatures => {
             unreachable!("is_param_mutable returned true for {op:?}")
         }
     }

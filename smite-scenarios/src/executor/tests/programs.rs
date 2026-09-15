@@ -375,6 +375,9 @@ pub struct OpenChannel2Inputs {
     pub channel_flags: usize,
     pub upfront_shutdown_script: usize,
     pub channel_type: usize,
+    /// The key behind `funding_pubkey`, which `SendCommitmentSigned` signs
+    /// with.
+    pub funding_privkey: usize,
 }
 
 impl OpenChannel2Inputs {
@@ -410,6 +413,7 @@ impl OpenChannel2Inputs {
 /// `temporary_channel_id` from our revocation basepoint (the `[0x22; 32]`
 /// key) as BOLT 2 requires.
 pub fn load_open_channel2_inputs(b: &mut ProgramBuilder) -> OpenChannel2Inputs {
+    let funding_privkey = b.append(Operation::LoadPrivateKey([0x11; 32]), &[]);
     let revocation_basepoint = load_point(b, [0x22; 32]);
 
     OpenChannel2Inputs {
@@ -427,7 +431,7 @@ pub fn load_open_channel2_inputs(b: &mut ProgramBuilder) -> OpenChannel2Inputs {
         to_self_delay: b.append(Operation::LoadU16(144), &[]),
         max_accepted_htlcs: b.append(Operation::LoadU16(483), &[]),
         locktime: b.append(Operation::LoadBlockHeight(120), &[]),
-        funding_pubkey: load_point(b, [0x11; 32]),
+        funding_pubkey: b.append(Operation::DerivePoint, &[funding_privkey]),
         revocation_basepoint,
         payment_basepoint: load_point(b, [0x33; 32]),
         delayed_payment_basepoint: load_point(b, [0x44; 32]),
@@ -437,6 +441,7 @@ pub fn load_open_channel2_inputs(b: &mut ProgramBuilder) -> OpenChannel2Inputs {
         channel_flags: b.append(Operation::LoadU8(0), &[]),
         upfront_shutdown_script: b.append(Operation::LoadBytes(vec![]), &[]),
         channel_type: b.append(Operation::LoadChannelType(ChannelTypeVariant::Anchors), &[]),
+        funding_privkey,
     }
 }
 
@@ -501,23 +506,30 @@ pub fn negotiate_channel2_program() -> Program {
     b.build()
 }
 
-/// Negotiates `sample_open_channel2` and returns the v2 `channel_id` derived
-/// from both revocation basepoints, which every later message on the channel
-/// carries.
-pub fn negotiate_v2_channel(b: &mut ProgramBuilder) -> usize {
+/// The variables a v2 negotiation with its `channel_id` derived produces.
+#[derive(Clone, Copy)]
+pub struct V2Channel {
+    pub inputs: OpenChannel2Inputs,
+    /// The `DeriveChannelIdV2` result, which every later message on the
+    /// channel carries.
+    pub channel_id: usize,
+}
+
+/// Negotiates `sample_open_channel2` and derives the v2 `channel_id` from
+/// both revocation basepoints.
+pub fn negotiate_v2_channel(b: &mut ProgramBuilder) -> V2Channel {
     let negotiated = negotiate_channel2(b);
+    let inputs = negotiated.open_channel2.inputs;
     let peer_revocation_basepoint = b.append(
         Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
         &[negotiated.accept_channel2],
     );
-
-    b.append(
+    let channel_id = b.append(
         Operation::DeriveChannelIdV2,
-        &[
-            negotiated.open_channel2.inputs.revocation_basepoint,
-            peer_revocation_basepoint,
-        ],
-    )
+        &[inputs.revocation_basepoint, peer_revocation_basepoint],
+    );
+
+    V2Channel { inputs, channel_id }
 }
 
 // -- Interactive transaction construction --
@@ -571,17 +583,103 @@ pub fn recv_interactive_tx(b: &mut ProgramBuilder, sent: usize) {
     b.append(Operation::RecvInteractiveTx, &[sent]);
 }
 
+/// The variables the v2 funding flow produces.
+#[derive(Clone, Copy)]
+pub struct V2FundingFlow {
+    pub inputs: OpenChannel2Inputs,
+    /// The v2 `channel_id`.
+    pub channel_id: usize,
+    /// The `BuildFundingTransactionV2` result.
+    pub funding_tx: usize,
+}
+
 /// Negotiates the v2 channel, contributes an input, the funding output and a
-/// change output, and builds the funding transaction from them, returning the
-/// `BuildFundingTransactionV2` result. The peer's replies come from
-/// `v2_flow_fixture`.
-pub fn v2_funding_flow(b: &mut ProgramBuilder) -> usize {
-    let channel_id = negotiate_v2_channel(b);
+/// change output, and builds the funding transaction from them. The peer's
+/// replies come from `v2_flow_fixture`.
+pub fn v2_funding_flow(b: &mut ProgramBuilder) -> V2FundingFlow {
+    let V2Channel { inputs, channel_id } = negotiate_v2_channel(b);
     send_tx_add_input(b, channel_id, 2, 0);
     send_tx_add_output(b, channel_id, 4, TxOutputRole::Funding);
     send_tx_add_output(b, channel_id, 6, TxOutputRole::Change);
+    let funding_tx = b.append(Operation::BuildFundingTransactionV2, &[channel_id]);
 
-    b.append(Operation::BuildFundingTransactionV2, &[channel_id])
+    V2FundingFlow {
+        inputs,
+        channel_id,
+        funding_tx,
+    }
+}
+
+// -- Commitment and signature exchange --
+
+/// Sends our `commitment_signed` over `flow`'s funding transaction, signed
+/// with the funding key the open advertised.
+pub fn send_commitment_signed(b: &mut ProgramBuilder, flow: &V2FundingFlow) -> usize {
+    b.append(
+        Operation::SendCommitmentSigned,
+        &[
+            flow.funding_tx,
+            flow.inputs.funding_privkey,
+            flow.channel_id,
+        ],
+    )
+}
+
+/// Sends our `tx_signatures` over `flow`'s funding transaction.
+pub fn send_tx_signatures(b: &mut ProgramBuilder, flow: &V2FundingFlow) {
+    b.append(
+        Operation::SendTxSignatures,
+        &[flow.channel_id, flow.funding_tx],
+    );
+}
+
+/// A program that runs the v2 funding flow and sends our `commitment_signed`.
+pub fn send_commitment_signed_program() -> Program {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    send_commitment_signed(&mut b, &flow);
+
+    b.build()
+}
+
+/// A program that runs the v2 funding flow, sends our `commitment_signed`, and
+/// receives the peer's.
+pub fn exchange_commitment_signed_program() -> Program {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    let sent = send_commitment_signed(&mut b, &flow);
+    b.append(Operation::RecvCommitmentSigned, &[sent]);
+
+    b.build()
+}
+
+/// The program from a real CLN run: four contributions go out with three
+/// replies unread, then a `tx_complete` and a change output. The peer's
+/// `tx_complete` answering the last input and ours are consecutive, so the
+/// exchange concluded without the change output, but the program builds the
+/// funding transaction and signs over it before reading the reply that says
+/// so. Returns the `SendCommitmentSigned` result; the peer's replies come from
+/// `settle_before_build_fixture`.
+pub fn settle_before_build(b: &mut ProgramBuilder) -> usize {
+    let V2Channel { inputs, channel_id } = negotiate_v2_channel(b);
+    let first_input = send_tx_add_input(b, channel_id, 2, 0);
+    send_tx_add_output(b, channel_id, 2000, TxOutputRole::Funding);
+    send_tx_add_input(b, channel_id, 4, 1);
+    let last_input = send_tx_add_input(b, channel_id, 6, 2);
+    recv_interactive_tx(b, first_input);
+    let complete = send_tx_complete(b, channel_id);
+    let change = send_tx_add_output(b, channel_id, 2002, TxOutputRole::Change);
+    recv_interactive_tx(b, change);
+    recv_interactive_tx(b, complete);
+    // The reply to the last input is still unread here.
+    let funding_tx = b.append(Operation::BuildFundingTransactionV2, &[channel_id]);
+    let sent = b.append(
+        Operation::SendCommitmentSigned,
+        &[funding_tx, inputs.funding_privkey, channel_id],
+    );
+    recv_interactive_tx(b, last_input);
+
+    sent
 }
 
 // -- Malformed programs --
