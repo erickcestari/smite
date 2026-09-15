@@ -62,6 +62,11 @@ pub struct MockBitcoinCli {
     /// Serialized transactions the node knows about, keyed by txid, as
     /// `getrawtransaction` would return them.
     raw_transactions: HashMap<Txid, Vec<u8>>,
+    /// Outpoints the wallet can sign. `sign_tx` attaches a witness only to
+    /// these, the way bitcoind signs only what it owns.
+    signable_outpoints: Vec<OutPoint>,
+    /// When set, `sign_tx` fails outright.
+    signing_fails: bool,
 }
 
 impl BitcoinRpc for MockBitcoinCli {
@@ -81,6 +86,24 @@ impl BitcoinRpc for MockBitcoinCli {
 
     fn get_raw_transaction(&mut self, txid: Txid) -> Option<Vec<u8>> {
         self.raw_transactions.get(&txid).cloned()
+    }
+
+    fn sign_tx(&mut self, tx: &bitcoin::Transaction) -> Option<bitcoin::Transaction> {
+        if self.signing_fails {
+            return None;
+        }
+        let mut signed = tx.clone();
+        for txin in &mut signed.input {
+            if self.signable_outpoints.contains(&txin.previous_output) {
+                // A distinguishable two-element witness, so tests can tell
+                // which input a witness came from.
+                txin.witness = bitcoin::Witness::from_slice(&[
+                    vec![0xaa; 72],
+                    txin.previous_output.txid.to_string().into_bytes(),
+                ]);
+            }
+        }
+        Some(signed)
     }
 
     fn sign_and_broadcast_tx(&mut self, tx: &bitcoin::Transaction) -> Option<String> {
@@ -164,6 +187,26 @@ impl Fixture {
         self
     }
 
+    /// Adds `utxo` to the wallet.
+    pub fn with_utxo(mut self, utxo: Utxo) -> Self {
+        self.executor.bitcoin_cli.utxos.push(utxo);
+        self
+    }
+
+    /// Lets the wallet sign every coin it holds, so `tx_signatures` has
+    /// witnesses to carry.
+    pub fn with_signable_wallet(mut self) -> Self {
+        let cli = &mut self.executor.bitcoin_cli;
+        cli.signable_outpoints = cli.utxos.iter().map(|u| u.outpoint).collect();
+        self
+    }
+
+    /// Makes every signing attempt fail outright.
+    pub fn with_signing_failure(mut self) -> Self {
+        self.executor.bitcoin_cli.signing_fails = true;
+        self
+    }
+
     /// Funds the wallet with one spendable output of [`sample_prevtx`], with
     /// that transaction available to `getrawtransaction`.
     pub fn with_v2_wallet(mut self) -> Self {
@@ -201,6 +244,15 @@ impl Fixture {
             self.executor.conn.recv_queue.push_back(msg.encode());
         }
         self
+    }
+
+    /// Queues the peer's side of `v2_funding_flow`: `accept`, then a
+    /// `tx_complete` answering each of the three contributions, which
+    /// `BuildFundingTransactionV2` reads to settle the negotiation before
+    /// building.
+    pub fn queue_v2_flow_replies(self, accept: AcceptChannel2) -> Self {
+        self.queue(&Message::AcceptChannel2(accept))
+            .queue_repeated(&tx_complete_reply(v2_channel_id()), 3)
     }
 
     /// Returns the number of queued peer replies the executor has not read.
@@ -254,6 +306,15 @@ impl Fixture {
         self.executor
             .channel_states
             .get(id)
+            .expect("channel state recorded")
+    }
+
+    /// Returns the channel state recorded for `id`, for a test to tamper
+    /// with.
+    pub fn channel_state_mut(&mut self, id: &ChannelId) -> &mut ChannelState {
+        self.executor
+            .channel_states
+            .get_mut(id)
             .expect("channel state recorded")
     }
 
@@ -331,6 +392,7 @@ pub fn sample_pubkey(byte: u8) -> PublicKey {
 pub fn sample_context() -> ProgramContext {
     ProgramContext {
         target_pubkey: sample_pubkey(1),
+        local_pubkey: sample_pubkey(2),
         chain_hash: [0xcc; 32],
         block_height: 800_000,
         target_features: vec![],
@@ -736,17 +798,47 @@ pub fn v2_fixture() -> Fixture {
         .queue(&accept_channel2_reply())
 }
 
-/// A [`v2_fixture`] with the peer's side of `v2_funding_flow` queued: a
-/// `tx_complete` answering each of the three contributions, which
-/// `BuildFundingTransactionV2` reads to settle the negotiation before
-/// building.
+/// A fixture with the v2 wallet and the peer's side of `v2_funding_flow`
+/// queued, answered with the sample `accept_channel2`.
 pub fn v2_flow_fixture() -> Fixture {
-    v2_fixture().queue_repeated(&tx_complete_reply(v2_channel_id()), 3)
+    Fixture::new()
+        .with_v2_wallet()
+        .queue_v2_flow_replies(sample_accept_channel2(sample_v2_temporary_channel_id()))
 }
+
+/// A [`v2_fixture`] with the peer's side of `settle_before_build` queued: one
+/// `tx_complete` per contribution before our own `tx_complete`, then whatever
+/// the peer moved on to.
+pub fn settle_before_build_fixture(then: &Message) -> Fixture {
+    v2_fixture()
+        .queue_repeated(&tx_complete_reply(v2_channel_id()), 4)
+        .queue(then)
+}
+
+// -- Commitment and signature exchange --
 
 pub fn v2_channel_id() -> ChannelId {
     ChannelId::v2_from_revocation_basepoints(
         &sample_v2_revocation_basepoint(),
         &sample_accept_channel2(sample_v2_temporary_channel_id()).revocation_basepoint,
     )
+}
+
+/// A plausible P2WPKH witness from the peer: signature and pubkey.
+pub fn sample_peer_witness() -> Witness {
+    Witness::from_slice(&[vec![0xbb; 71], vec![0xcc; 33]])
+}
+
+/// [`sample_peer_witness`] encoded the way `tx_signatures` carries
+/// `witness_data`.
+pub fn sample_peer_witness_data() -> Vec<u8> {
+    bitcoin::consensus::encode::serialize(&sample_peer_witness())
+}
+
+/// The private key behind [`sample_accept_channel2`]'s `funding_pubkey`,
+/// which is `sample_pubkey(11)`.
+pub fn sample_acceptor_funding_privkey() -> SecretKey {
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes[31] = 11;
+    SecretKey::from_slice(&sk_bytes).expect("valid secret key")
 }
