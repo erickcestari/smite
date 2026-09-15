@@ -12,6 +12,7 @@ use crate::executor::*;
 use smite::bolt::ChannelTypeVariant;
 use smite_ir::Instruction;
 use smite_ir::builder::ProgramBuilder;
+use smite_ir::operation::{AcceptChannel2Field, TxOutputRole};
 
 /// Loads the private key `sk` and derives its point.
 fn load_point(b: &mut ProgramBuilder, sk: [u8; 32]) -> usize {
@@ -439,37 +440,43 @@ pub fn load_open_channel2_inputs(b: &mut ProgramBuilder) -> OpenChannel2Inputs {
     }
 }
 
-/// Emits `sample_open_channel2` and sends it, returning the
-/// `SendOpenChannel2` result: an affine variable a single `RecvAcceptChannel2`
-/// may consume.
-pub fn send_open_channel2(b: &mut ProgramBuilder) -> usize {
+/// The variables a sent `open_channel2` produces.
+#[derive(Clone, Copy)]
+pub struct SentOpenChannel2 {
+    pub inputs: OpenChannel2Inputs,
+    /// The `SendOpenChannel2` result, an affine variable a single
+    /// `RecvAcceptChannel2` may consume.
+    pub sent: usize,
+}
+
+/// Emits `sample_open_channel2` and sends it.
+pub fn send_open_channel2(b: &mut ProgramBuilder) -> SentOpenChannel2 {
     let inputs = load_open_channel2_inputs(b);
 
     send_open_channel2_with(b, inputs, false)
 }
 
-/// Builds `open_channel2` from `inputs` and sends it, returning the
-/// `SendOpenChannel2` result.
+/// Builds `open_channel2` from `inputs` and sends it.
 pub fn send_open_channel2_with(
     b: &mut ProgramBuilder,
     inputs: OpenChannel2Inputs,
     require_confirmed_inputs: bool,
-) -> usize {
+) -> SentOpenChannel2 {
     let built = b.append(
         Operation::BuildOpenChannel2 {
             require_confirmed_inputs,
         },
         &inputs.build_inputs(),
     );
+    let sent = b.append(Operation::SendOpenChannel2, &[built]);
 
-    b.append(Operation::SendOpenChannel2, &[built])
+    SentOpenChannel2 { inputs, sent }
 }
 
 /// The variables a v2 channel negotiation produces.
 #[derive(Clone, Copy)]
 pub struct NegotiatedChannel2 {
-    /// The `SendOpenChannel2` result.
-    pub sent_open_channel2: usize,
+    pub open_channel2: SentOpenChannel2,
     /// The `RecvAcceptChannel2` result.
     pub accept_channel2: usize,
 }
@@ -477,11 +484,11 @@ pub struct NegotiatedChannel2 {
 /// Emits `sample_open_channel2`, sends it, and receives the peer's
 /// `accept_channel2`.
 pub fn negotiate_channel2(b: &mut ProgramBuilder) -> NegotiatedChannel2 {
-    let sent_open_channel2 = send_open_channel2(b);
-    let accept_channel2 = b.append(Operation::RecvAcceptChannel2, &[sent_open_channel2]);
+    let open_channel2 = send_open_channel2(b);
+    let accept_channel2 = b.append(Operation::RecvAcceptChannel2, &[open_channel2.sent]);
 
     NegotiatedChannel2 {
-        sent_open_channel2,
+        open_channel2,
         accept_channel2,
     }
 }
@@ -492,6 +499,89 @@ pub fn negotiate_channel2_program() -> Program {
     negotiate_channel2(&mut b);
 
     b.build()
+}
+
+/// Negotiates `sample_open_channel2` and returns the v2 `channel_id` derived
+/// from both revocation basepoints, which every later message on the channel
+/// carries.
+pub fn negotiate_v2_channel(b: &mut ProgramBuilder) -> usize {
+    let negotiated = negotiate_channel2(b);
+    let peer_revocation_basepoint = b.append(
+        Operation::ExtractAcceptChannel2(AcceptChannel2Field::RevocationBasepoint),
+        &[negotiated.accept_channel2],
+    );
+
+    b.append(
+        Operation::DeriveChannelIdV2,
+        &[
+            negotiated.open_channel2.inputs.revocation_basepoint,
+            peer_revocation_basepoint,
+        ],
+    )
+}
+
+// -- Interactive transaction construction --
+
+/// The `sequence` our `tx_add_input`s carry, opting into RBF.
+const TX_ADD_INPUT_SEQUENCE: u32 = 0xffff_fffd;
+
+/// Sends a `tx_add_input` spending the wallet's `utxo_index`th coin on the
+/// `ChannelId` variable `channel_id`.
+pub fn send_tx_add_input(
+    b: &mut ProgramBuilder,
+    channel_id: usize,
+    serial_id: u64,
+    utxo_index: u8,
+) -> usize {
+    b.append(
+        Operation::SendTxAddInput {
+            serial_id,
+            utxo_index,
+            sequence: TX_ADD_INPUT_SEQUENCE,
+        },
+        &[channel_id],
+    )
+}
+
+/// Sends a `tx_add_output` of `role` on `channel_id`. The value and script
+/// inputs only matter for [`TxOutputRole::Explicit`], so placeholders are
+/// loaded for them.
+pub fn send_tx_add_output(
+    b: &mut ProgramBuilder,
+    channel_id: usize,
+    serial_id: u64,
+    role: TxOutputRole,
+) -> usize {
+    let sats = b.append(Operation::LoadAmount(0), &[]);
+    let script = b.append(Operation::LoadBytes(vec![]), &[]);
+
+    b.append(
+        Operation::SendTxAddOutput { serial_id, role },
+        &[channel_id, sats, script],
+    )
+}
+
+/// Sends a `tx_complete` on `channel_id`.
+pub fn send_tx_complete(b: &mut ProgramBuilder, channel_id: usize) -> usize {
+    b.append(Operation::SendTxComplete, &[channel_id])
+}
+
+/// Reads the peer's reply to the `SentInteractiveTx` variable `sent`.
+pub fn recv_interactive_tx(b: &mut ProgramBuilder, sent: usize) {
+    b.append(Operation::RecvInteractiveTx, &[sent]);
+}
+
+/// Negotiates the v2 channel, contributes an input, the funding output and a
+/// change output, and builds the funding transaction from them, returning the
+/// `BuildFundingTransactionV2` result. The peer's replies come from
+/// `v2_flow_fixture`.
+pub fn v2_funding_flow(b: &mut ProgramBuilder) -> usize {
+    let channel_id = negotiate_v2_channel(b);
+    send_tx_add_input(b, channel_id, 2, 0);
+    send_tx_add_output(b, channel_id, 4, TxOutputRole::Funding);
+    send_tx_add_output(b, channel_id, 6, TxOutputRole::Change);
+
+    b.append(Operation::BuildFundingTransactionV2, &[channel_id])
 }
 
 // -- Malformed programs --
