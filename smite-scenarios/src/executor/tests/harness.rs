@@ -2,7 +2,10 @@
 
 use crate::executor::*;
 use bitcoin::{Amount, Transaction};
-use smite::bolt::{AcceptChannel2Tlvs, AcceptChannelTlvs, ChannelTypeVariant, FromMessage};
+use smite::bolt::{
+    AcceptChannel2Tlvs, AcceptChannelTlvs, ChannelTypeVariant, CommitmentSigned,
+    CommitmentSignedTlvs, FromMessage,
+};
 use smite::pending_channel::PendingChannelV2;
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -52,9 +55,13 @@ pub struct MockBitcoinCli {
     pub mined_private_mempool: Vec<String>,
     pub broadcast_calls: Vec<Transaction>,
     pub block_position_lookups: Vec<Txid>,
+    pub locked_outpoints: Vec<OutPoint>,
     utxos: Vec<Utxo>,
     change_spk: ScriptBuf,
     confirmations: u32,
+    /// Serialized transactions the node knows about, keyed by txid, as
+    /// `getrawtransaction` would return them.
+    raw_transactions: HashMap<Txid, Vec<u8>>,
 }
 
 impl BitcoinRpc for MockBitcoinCli {
@@ -70,6 +77,10 @@ impl BitcoinRpc for MockBitcoinCli {
 
     fn get_new_address_script_pubkey(&mut self) -> ScriptBuf {
         self.change_spk.clone()
+    }
+
+    fn get_raw_transaction(&mut self, txid: Txid) -> Option<Vec<u8>> {
+        self.raw_transactions.get(&txid).cloned()
     }
 
     fn sign_and_broadcast_tx(&mut self, tx: &bitcoin::Transaction) -> Option<String> {
@@ -90,6 +101,7 @@ impl BitcoinRpc for MockBitcoinCli {
     }
 
     fn lock_utxos(&mut self, outpoints: &[OutPoint]) {
+        self.locked_outpoints.extend_from_slice(outpoints);
         self.utxos.retain(|u| !outpoints.contains(&u.outpoint));
     }
 
@@ -152,6 +164,23 @@ impl Fixture {
         self
     }
 
+    /// Funds the wallet with one spendable output of [`sample_prevtx`], with
+    /// that transaction available to `getrawtransaction`.
+    pub fn with_v2_wallet(mut self) -> Self {
+        let prevtx = sample_prevtx();
+        let txid = prevtx.compute_txid();
+        self.executor.bitcoin_cli.utxos = vec![Utxo {
+            amount: prevtx.output[0].value,
+            outpoint: OutPoint { txid, vout: 0 },
+            script_pubkey: prevtx.output[0].script_pubkey.clone(),
+        }];
+        self.executor
+            .bitcoin_cli
+            .raw_transactions
+            .insert(txid, bitcoin::consensus::encode::serialize(&prevtx));
+        self
+    }
+
     /// Records `pending` as the negotiation for its `temporary_channel_id`.
     pub fn with_negotiation(mut self, pending: PendingChannel) -> Self {
         self.executor
@@ -166,9 +195,27 @@ impl Fixture {
         self
     }
 
+    /// Queues `msg` as the peer's next `count` replies.
+    pub fn queue_repeated(mut self, msg: &Message, count: usize) -> Self {
+        for _ in 0..count {
+            self.executor.conn.recv_queue.push_back(msg.encode());
+        }
+        self
+    }
+
     /// Returns the number of queued peer replies the executor has not read.
     pub fn queued_len(&self) -> usize {
         self.executor.conn.recv_queue.len()
+    }
+
+    /// Returns the type of each queued peer reply the executor has not read.
+    pub fn queued_types(&self) -> Vec<MessageType> {
+        self.executor
+            .conn
+            .recv_queue
+            .iter()
+            .map(|bytes| Message::decode(bytes).expect("valid message").msg_type())
+            .collect()
     }
 
     /// Runs `program` against the target, panicking if execution fails.
@@ -249,6 +296,26 @@ impl Fixture {
         let got = msg.to_string();
         M::from_message(msg).unwrap_or_else(|| panic!("expected {}, got {got}", M::TYPE))
     }
+
+    /// Decodes the last message the executor sent, panicking if it is not an
+    /// `M`.
+    pub fn last_sent<M: FromMessage>(&self) -> M {
+        let last = self
+            .sent_len()
+            .checked_sub(1)
+            .expect("at least one sent message");
+        self.sent(last)
+    }
+
+    /// Returns the type of each message the executor sent, in order.
+    pub fn sent_types(&self) -> Vec<MessageType> {
+        self.executor
+            .conn
+            .sent
+            .iter()
+            .map(|bytes| Message::decode(bytes).expect("valid message").msg_type())
+            .collect()
+    }
 }
 
 // -- Helpers --
@@ -289,7 +356,7 @@ pub fn sample_utxo() -> Utxo {
     }
 }
 
-fn sample_change_spk() -> ScriptBuf {
+pub fn sample_change_spk() -> ScriptBuf {
     ScriptBuf::from(
         hex::decode("00142e532c12351a5c81e23c8a76d19345ca7b6de57a")
             .expect("valid P2WPKH scriptpubkey hex"),
@@ -589,6 +656,95 @@ pub fn sample_v2_revocation_basepoint() -> PublicKey {
 
 pub fn sample_v2_temporary_channel_id() -> TemporaryChannelId {
     ChannelId::v2_temporary_from_revocation_basepoint(&sample_v2_revocation_basepoint())
+}
+
+// -- Interactive transaction construction --
+
+/// A minimal previous transaction paying one 1 BTC P2WPKH output, used as
+/// the `prevtx` a `tx_add_input` carries.
+pub fn sample_prevtx() -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn::default()],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000_000),
+            script_pubkey: sample_change_spk(),
+        }],
+    }
+}
+
+/// The peer's `accept_channel2` answering `send_open_channel2`.
+pub fn accept_channel2_reply() -> Message {
+    Message::AcceptChannel2(sample_accept_channel2(sample_v2_temporary_channel_id()))
+}
+
+/// A `tx_add_input` from the peer spending the output of [`sample_prevtx`].
+pub fn tx_add_input_reply(channel_id: ChannelId, serial_id: u64) -> Message {
+    Message::TxAddInput(TxAddInput {
+        channel_id,
+        serial_id,
+        prevtx: bitcoin::consensus::encode::serialize(&sample_prevtx()),
+        prevtx_vout: 0,
+        sequence: 0xffff_fffd,
+        tlvs: TxAddInputTlvs::default(),
+    })
+}
+
+/// A `tx_add_output` from the peer paying 50,000 sat to [`sample_change_spk`].
+pub fn tx_add_output_reply(channel_id: ChannelId, serial_id: u64) -> Message {
+    Message::TxAddOutput(TxAddOutput {
+        channel_id,
+        serial_id,
+        sats: 50_000,
+        script: sample_change_spk().into_bytes(),
+    })
+}
+
+pub fn tx_remove_input_reply(channel_id: ChannelId, serial_id: u64) -> Message {
+    Message::TxRemoveInput(TxRemoveInput {
+        channel_id,
+        serial_id,
+    })
+}
+
+pub fn tx_remove_output_reply(channel_id: ChannelId, serial_id: u64) -> Message {
+    Message::TxRemoveOutput(TxRemoveOutput {
+        channel_id,
+        serial_id,
+    })
+}
+
+pub fn tx_complete_reply(channel_id: ChannelId) -> Message {
+    Message::TxComplete(TxComplete { channel_id })
+}
+
+/// A `commitment_signed` with a zero signature, standing for whatever the
+/// peer sends once the interactive transaction exchange concludes.
+pub fn commitment_signed_reply(channel_id: ChannelId) -> Message {
+    Message::CommitmentSigned(CommitmentSigned {
+        channel_id,
+        signature: Signature::from_compact(&[0u8; 64]).expect("zero signature"),
+        htlc_signatures: Vec::new(),
+        tlvs: CommitmentSignedTlvs::default(),
+    })
+}
+
+/// A fixture with the v2 wallet and the peer's `accept_channel2` queued, ready
+/// for a program that negotiates the v2 channel and exchanges interactive
+/// transaction messages on it.
+pub fn v2_fixture() -> Fixture {
+    Fixture::new()
+        .with_v2_wallet()
+        .queue(&accept_channel2_reply())
+}
+
+/// A [`v2_fixture`] with the peer's side of `v2_funding_flow` queued: a
+/// `tx_complete` answering each of the three contributions, which
+/// `BuildFundingTransactionV2` reads to settle the negotiation before
+/// building.
+pub fn v2_flow_fixture() -> Fixture {
+    v2_fixture().queue_repeated(&tx_complete_reply(v2_channel_id()), 3)
 }
 
 pub fn v2_channel_id() -> ChannelId {
