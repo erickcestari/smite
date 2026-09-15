@@ -600,6 +600,7 @@ impl_from_message! {
     TxRemoveInput => TX_REMOVE_INPUT,
     TxRemoveOutput => TX_REMOVE_OUTPUT,
     TxComplete => TX_COMPLETE,
+    TxSignatures => TX_SIGNATURES,
     TxInitRbf => TX_INIT_RBF,
     TxAckRbf => TX_ACK_RBF,
     TxAbort => TX_ABORT,
