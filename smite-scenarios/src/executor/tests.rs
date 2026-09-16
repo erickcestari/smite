@@ -1120,6 +1120,27 @@ fn execute_send_shutdown_empty_scriptpubkey() {
 }
 
 #[test]
+fn execute_send_error() {
+    let channel_id = ChannelId::new([0x7a; 32]);
+    // Non-printable bytes are allowed so the fuzzer can probe the target's
+    // handling of data that violates BOLT 1's printable-ASCII requirement.
+    let data = vec![0x00, b'b', b'a', b'd', 0xff];
+
+    let mut b = ProgramBuilder::new();
+    let channel_id_var = b.append(Operation::LoadChannelId(channel_id.0), &[]);
+    let data_var = b.append(Operation::LoadBytes(data.clone()), &[]);
+    b.append(Operation::SendError, &[channel_id_var, data_var]);
+
+    let mut fx = Fixture::new();
+    fx.run(&b.build());
+
+    assert_eq!(fx.sent_len(), 1);
+    let err: smite::bolt::Error = fx.sent(0);
+    assert_eq!(err.channel_id, channel_id);
+    assert_eq!(err.data, data);
+}
+
+#[test]
 fn execute_recv_channel_ready_invalid_funding_outpoint_is_noop() {
     // Corrupt the negotiated acceptor funding pubkey so the broadcast funding
     // transaction's output no longer pays the negotiated 2-of-2 script,

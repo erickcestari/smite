@@ -494,6 +494,14 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     Some(Variable::SentShutdown)
                 }
 
+                Operation::SendError => {
+                    let err = build_error(&variables, &instr.inputs);
+                    let encoded = Message::Error(err).encode();
+                    log::debug!("[{:?}] SendError: {} bytes", start.elapsed(), encoded.len());
+                    self.conn.send_message(&encoded)?;
+                    None
+                }
+
                 Operation::RecvAcceptChannel => {
                     consume_affine(
                         &mut variables,
@@ -951,6 +959,14 @@ fn build_shutdown(variables: &[Option<Variable>], inputs: &[usize]) -> Shutdown 
     let channel_id = resolve_channel_id(variables, inputs[0]);
     let scriptpubkey = resolve_bytes(variables, inputs[1]).to_vec();
     Shutdown::for_channel(channel_id, scriptpubkey)
+}
+
+/// Builds an `Error` message from 2 input variables (wire order).
+fn build_error(variables: &[Option<Variable>], inputs: &[usize]) -> smite::bolt::Error {
+    smite::bolt::Error {
+        channel_id: resolve_channel_id(variables, inputs[0]),
+        data: resolve_bytes(variables, inputs[1]).to_vec(),
+    }
 }
 
 /// Builds a signed `ChannelAnnouncement` from 7 input variables.
