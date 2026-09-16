@@ -1141,6 +1141,25 @@ fn execute_send_error() {
 }
 
 #[test]
+fn execute_send_warning() {
+    let channel_id = ChannelId::ALL;
+    let data = b"not channel-specific".to_vec();
+
+    let mut b = ProgramBuilder::new();
+    let channel_id_var = b.append(Operation::LoadChannelId(channel_id.0), &[]);
+    let data_var = b.append(Operation::LoadBytes(data.clone()), &[]);
+    b.append(Operation::SendWarning, &[channel_id_var, data_var]);
+
+    let mut fx = Fixture::new();
+    fx.run(&b.build());
+
+    assert_eq!(fx.sent_len(), 1);
+    let warning: Warning = fx.sent(0);
+    assert_eq!(warning.channel_id, channel_id);
+    assert_eq!(warning.data, data);
+}
+
+#[test]
 fn execute_recv_channel_ready_invalid_funding_outpoint_is_noop() {
     // Corrupt the negotiated acceptor funding pubkey so the broadcast funding
     // transaction's output no longer pays the negotiated 2-of-2 script,

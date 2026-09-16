@@ -11,7 +11,7 @@ use smite::bolt::{
     AcceptChannel, AnnouncementSignatures, ChannelAnnouncement, ChannelId, ChannelReady,
     ChannelReadyTlvs, ChannelUpdate, Features, FromMessage, FundingCreated, FundingSigned, Message,
     MessageType, NodeAnnouncement, OpenChannel, OpenChannelTlvs, Pong, ShortChannelId, Shutdown,
-    TemporaryChannelId,
+    TemporaryChannelId, Warning,
 };
 use smite::channel_tx::{
     ChannelConfig, ChannelPartyConfig, ChannelState, FundingTransaction, HolderIdentity, Side,
@@ -502,6 +502,18 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     None
                 }
 
+                Operation::SendWarning => {
+                    let warning = build_warning(&variables, &instr.inputs);
+                    let encoded = Message::Warning(warning).encode();
+                    log::debug!(
+                        "[{:?}] SendWarning: {} bytes",
+                        start.elapsed(),
+                        encoded.len()
+                    );
+                    self.conn.send_message(&encoded)?;
+                    None
+                }
+
                 Operation::RecvAcceptChannel => {
                     consume_affine(
                         &mut variables,
@@ -964,6 +976,14 @@ fn build_shutdown(variables: &[Option<Variable>], inputs: &[usize]) -> Shutdown 
 /// Builds an `Error` message from 2 input variables (wire order).
 fn build_error(variables: &[Option<Variable>], inputs: &[usize]) -> smite::bolt::Error {
     smite::bolt::Error {
+        channel_id: resolve_channel_id(variables, inputs[0]),
+        data: resolve_bytes(variables, inputs[1]).to_vec(),
+    }
+}
+
+/// Builds a `Warning` message from 2 input variables (wire order).
+fn build_warning(variables: &[Option<Variable>], inputs: &[usize]) -> Warning {
+    Warning {
         channel_id: resolve_channel_id(variables, inputs[0]),
         data: resolve_bytes(variables, inputs[1]).to_vec(),
     }
