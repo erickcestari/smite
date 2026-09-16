@@ -10,7 +10,7 @@ use super::*;
 use generators::{
     AnyGenerator, ChannelAnnouncementGenerator, ChannelReadyGenerator, ChannelUpdateGenerator,
     FundingCreatedGenerator, FundingFlowGenerator, NodeAnnouncementGenerator, OpenChannelGenerator,
-    SendErrorGenerator,
+    SendErrorGenerator, SendWarningGenerator,
 };
 use minimizers::{CommonSubexpressionEliminator, DeadCodeEliminator, Minimizer};
 use mutators::{
@@ -983,7 +983,8 @@ fn any_generator_all_is_complete() {
             | AnyGenerator::FundingCreated(_)
             | AnyGenerator::ChannelReady(_)
             | AnyGenerator::FundingFlow(_)
-            | AnyGenerator::SendError(_) => 8,
+            | AnyGenerator::SendError(_)
+            | AnyGenerator::SendWarning(_) => 9,
         }
     };
     assert_eq!(AnyGenerator::ALL.len(), variant_count(AnyGenerator::ALL[0]));
@@ -1742,6 +1743,41 @@ fn generated_send_error_program_varies_channel_id_scope() {
     );
 }
 
+fn generate_send_warning_program(seed: u64) -> Program {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut builder = ProgramBuilder::new();
+    SendWarningGenerator.generate(&mut builder, &mut rng);
+    builder.build()
+}
+
+// If SendWarningGenerator completes without panicking, every instruction has
+// correct input types (enforced by ProgramBuilder::append).
+#[test]
+fn generated_send_warning_program_is_type_correct() {
+    for seed in 0..100 {
+        generate_send_warning_program(seed);
+    }
+}
+
+#[test]
+fn generated_send_warning_program_structure() {
+    let program = generate_send_warning_program(0);
+    assert_send_error_like_structure(&program, |op| matches!(op, Operation::SendWarning));
+}
+
+#[test]
+fn generated_send_warning_program_varies_channel_id_scope() {
+    let programs: Vec<_> = (0..100).map(generate_send_warning_program).collect();
+    assert!(
+        programs.iter().any(targets_all_channels),
+        "never targets all channels"
+    );
+    assert!(
+        !programs.iter().all(targets_all_channels),
+        "always targets all channels"
+    );
+}
+
 #[test]
 fn generated_open_channel_program_postcard_roundtrip() {
     let program = generate_open_channel_program(42);
@@ -1801,6 +1837,14 @@ fn generated_channel_update_program_postcard_roundtrip() {
 #[test]
 fn generated_send_error_program_postcard_roundtrip() {
     let program = generate_send_error_program(42);
+    let bytes = postcard::to_allocvec(&program).expect("postcard serialization");
+    let decoded: Program = postcard::from_bytes(&bytes).expect("postcard deserialization");
+    assert_eq!(program, decoded);
+}
+
+#[test]
+fn generated_send_warning_program_postcard_roundtrip() {
+    let program = generate_send_warning_program(42);
     let bytes = postcard::to_allocvec(&program).expect("postcard serialization");
     let decoded: Program = postcard::from_bytes(&bytes).expect("postcard deserialization");
     assert_eq!(program, decoded);

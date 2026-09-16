@@ -13,6 +13,7 @@ mod funding_created;
 mod funding_flow;
 mod node_announcement;
 mod open_channel;
+mod warning;
 
 pub use channel_announcement::ChannelAnnouncementGenerator;
 pub use channel_ready::ChannelReadyGenerator;
@@ -22,6 +23,7 @@ pub use funding_created::FundingCreatedGenerator;
 pub use funding_flow::FundingFlowGenerator;
 pub use node_announcement::NodeAnnouncementGenerator;
 pub use open_channel::OpenChannelGenerator;
+pub use warning::SendWarningGenerator;
 
 use rand::Rng;
 
@@ -45,6 +47,7 @@ pub enum AnyGenerator {
     ChannelReady(ChannelReadyGenerator),
     FundingFlow(FundingFlowGenerator),
     SendError(SendErrorGenerator),
+    SendWarning(SendWarningGenerator),
 }
 
 impl AnyGenerator {
@@ -58,6 +61,7 @@ impl AnyGenerator {
         Self::ChannelReady(ChannelReadyGenerator),
         Self::FundingFlow(FundingFlowGenerator),
         Self::SendError(SendErrorGenerator),
+        Self::SendWarning(SendWarningGenerator),
     ];
 }
 
@@ -72,6 +76,7 @@ impl Generator for AnyGenerator {
             Self::ChannelReady(generator) => generator.generate(builder, rng),
             Self::FundingFlow(generator) => generator.generate(builder, rng),
             Self::SendError(generator) => generator.generate(builder, rng),
+            Self::SendWarning(generator) => generator.generate(builder, rng),
         }
     }
 }
