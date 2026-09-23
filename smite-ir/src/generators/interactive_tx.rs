@@ -28,7 +28,7 @@ pub(super) const RBF_DELAY_BLOCKS: u8 = 3;
 /// `nSequence` for the inputs we contribute. BOLT 2 caps it at `0xfffffffd` so
 /// every input signals replaceability, and recommends one shared value across
 /// implementations to avoid fingerprinting.
-const SEQUENCE: u32 = 0xffff_fffd;
+pub(super) const SEQUENCE: u32 = 0xffff_fffd;
 
 /// The `index`th input we contribute from the wallet.
 pub(super) fn wallet_input(index: u8) -> Operation {
@@ -60,14 +60,21 @@ pub(super) fn min_rbf_feerate(previous: u32) -> u32 {
     (previous.saturating_mul(25) / 24).max(previous.saturating_add(25))
 }
 
+/// What [`sign_and_broadcast`] produces.
+pub(super) struct Signed {
+    /// The `channel_id` the peer's `commitment_signed` carries.
+    pub channel_id: usize,
+    /// The transaction the session built.
+    pub funding_transaction: usize,
+}
+
 /// Exchanges `commitment_signed` and `tx_signatures` over the transaction the
-/// session on `channel_id` built, then broadcasts it. Returns the
-/// `channel_id` the peer's `commitment_signed` carries.
+/// session on `channel_id` built, then broadcasts it.
 pub(super) fn sign_and_broadcast(
     builder: &mut ProgramBuilder,
     channel_id: usize,
     funding_privkey: usize,
-) -> usize {
+) -> Signed {
     let funding_transaction = builder.append(Operation::BuildFundingTransactionV2, &[channel_id]);
     let sent_commitment_signed = builder.append(
         Operation::SendCommitmentSigned,
@@ -86,7 +93,10 @@ pub(super) fn sign_and_broadcast(
     builder.append(Operation::RecvTxSignatures, &[channel_id]);
 
     builder.append(Operation::BroadcastTransaction, &[funding_transaction]);
-    funded_channel_id
+    Signed {
+        channel_id: funded_channel_id,
+        funding_transaction,
+    }
 }
 
 /// The variables an interactive transaction construction session draws on.

@@ -18,11 +18,12 @@
 //!   commit eddb2701b022351fb34b696ccf923bb856e9d953.
 //!
 //! Optionally:
-//! - `SMITE_IR_GENERATORS=v1|v2|all` -- which generators to draw from. BOLT 2
-//!   makes the two channel establishment flows mutually exclusive on one
-//!   connection, so a campaign against an `ir` scenario wants `v1` and one
-//!   against `ir_v2` wants `v2`; the other flow's programs would only ever be
-//!   rejected. Defaults to `all`, which draws from both.
+//! - `SMITE_IR_GENERATORS=v1|v2|v1-splice|v2-splice|all` -- which generators
+//!   to draw from. BOLT 2 makes the two channel establishment flows mutually
+//!   exclusive on one connection, so a campaign against an `ir` scenario wants
+//!   `v1` and one against `ir_v2` wants `v2`; the other flow's programs would
+//!   only ever be rejected. The `-splice` sets add splicing, for targets that
+//!   support `option_splice`. Defaults to `all`, which draws from every one.
 //!
 //! # Logging
 //!
@@ -77,6 +78,8 @@ fn generators_from_env() -> &'static [AnyGenerator] {
     match std::env::var("SMITE_IR_GENERATORS").as_deref() {
         Ok("v1") => AnyGenerator::V1,
         Ok("v2") => AnyGenerator::V2,
+        Ok("v1-splice") => AnyGenerator::V1_SPLICE,
+        Ok("v2-splice") => AnyGenerator::V2_SPLICE,
         Ok("all") | Err(_) => AnyGenerator::ALL,
         Ok(other) => {
             eprintln!(

@@ -9,8 +9,8 @@ use smite::bolt::{MAX_MESSAGE_SIZE, ShortChannelId};
 use super::*;
 use generators::{
     AnyGenerator, ChannelAnnouncementGenerator, ChannelReadyGenerator, ChannelUpdateGenerator,
-    DualFundingFlowGenerator, FundingCreatedGenerator, FundingFlowGenerator,
-    NodeAnnouncementGenerator, OpenChannelGenerator,
+    DualFundedSpliceFlowGenerator, DualFundingFlowGenerator, FundingCreatedGenerator,
+    FundingFlowGenerator, NodeAnnouncementGenerator, OpenChannelGenerator, SpliceFlowGenerator,
 };
 use minimizers::{CommonSubexpressionEliminator, DeadCodeEliminator, Minimizer};
 use mutators::{
@@ -1185,7 +1185,9 @@ fn any_generator_all_is_complete() {
             | AnyGenerator::FundingCreated(_)
             | AnyGenerator::ChannelReady(_)
             | AnyGenerator::FundingFlow(_)
-            | AnyGenerator::DualFundingFlow(_) => 8,
+            | AnyGenerator::DualFundingFlow(_)
+            | AnyGenerator::SpliceFlow(_)
+            | AnyGenerator::DualFundedSpliceFlow(_) => 10,
         }
     };
     assert_eq!(AnyGenerator::ALL.len(), variant_count(AnyGenerator::ALL[0]));
@@ -1197,7 +1199,13 @@ fn any_generator_all_is_complete() {
 // programs the target rejects outright.
 #[test]
 fn per_flow_generator_sets_are_disjoint_subsets() {
-    for (name, set) in [("V1", AnyGenerator::V1), ("V2", AnyGenerator::V2)] {
+    let sets = [
+        ("V1", AnyGenerator::V1),
+        ("V2", AnyGenerator::V2),
+        ("V1_SPLICE", AnyGenerator::V1_SPLICE),
+        ("V2_SPLICE", AnyGenerator::V2_SPLICE),
+    ];
+    for (name, set) in sets {
         for (i, generator) in set.iter().enumerate() {
             assert!(
                 AnyGenerator::ALL
@@ -1208,19 +1216,57 @@ fn per_flow_generator_sets_are_disjoint_subsets() {
         }
     }
 
-    let v1_has_v2_flow = AnyGenerator::V1
-        .iter()
-        .any(|g| matches!(g, AnyGenerator::DualFundingFlow(_)));
-    let v2_has_v1_flow = AnyGenerator::V2.iter().any(|g| {
+    let is_v2_flow = |g: &AnyGenerator| {
+        matches!(
+            g,
+            AnyGenerator::DualFundingFlow(_) | AnyGenerator::DualFundedSpliceFlow(_)
+        )
+    };
+    let is_v1_flow = |g: &AnyGenerator| {
         matches!(
             g,
             AnyGenerator::FundingFlow(_)
                 | AnyGenerator::OpenChannel(_)
                 | AnyGenerator::FundingCreated(_)
+                | AnyGenerator::SpliceFlow(_)
         )
-    });
-    assert!(!v1_has_v2_flow, "V1 draws a dual-funded generator");
-    assert!(!v2_has_v1_flow, "V2 draws a single-funded generator");
+    };
+    for (name, set) in [
+        ("V1", AnyGenerator::V1),
+        ("V1_SPLICE", AnyGenerator::V1_SPLICE),
+    ] {
+        assert!(
+            !set.iter().any(is_v2_flow),
+            "{name} draws a dual-funded generator"
+        );
+    }
+    for (name, set) in [
+        ("V2", AnyGenerator::V2),
+        ("V2_SPLICE", AnyGenerator::V2_SPLICE),
+    ] {
+        assert!(
+            !set.iter().any(is_v1_flow),
+            "{name} draws a single-funded generator"
+        );
+    }
+}
+
+// Splicing is opt-in per target: LND does not support `option_splice`, and
+// its campaigns draw the plain sets.
+#[test]
+fn only_the_splice_sets_splice() {
+    let splices = |set: &[AnyGenerator]| {
+        set.iter().any(|g| {
+            matches!(
+                g,
+                AnyGenerator::SpliceFlow(_) | AnyGenerator::DualFundedSpliceFlow(_)
+            )
+        })
+    };
+    assert!(!splices(AnyGenerator::V1));
+    assert!(!splices(AnyGenerator::V2));
+    assert!(splices(AnyGenerator::V1_SPLICE));
+    assert!(splices(AnyGenerator::V2_SPLICE));
 }
 
 // -- ShutdownScriptVariant tests --
@@ -3873,4 +3919,212 @@ fn cse_does_not_merge_send_message() {
     };
     assert!(CommonSubexpressionEliminator.minimize(&mut program));
     assert_eq!(program, expected, "SendMessage must not be deduplicated");
+}
+
+// -- Splice flow generators --
+
+fn generate_splice_flow_program(seed: u64, dual_funded: bool) -> Program {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut builder = ProgramBuilder::new();
+    if dual_funded {
+        DualFundedSpliceFlowGenerator.generate(&mut builder, &mut rng);
+    } else {
+        SpliceFlowGenerator.generate(&mut builder, &mut rng);
+    }
+    builder.build()
+}
+
+/// The operations of each generated splice program over `seeds` seeds, for
+/// both open flows.
+fn generated_splice_programs(seeds: u64) -> Vec<(u64, Vec<Operation>)> {
+    (0..seeds)
+        .flat_map(|seed| {
+            [false, true].map(|dual_funded| {
+                let program = generate_splice_flow_program(seed, dual_funded);
+                let ops = program.instructions.into_iter().map(|i| i.operation);
+                (seed, ops.collect())
+            })
+        })
+        .collect()
+}
+
+// If the splice generators complete without panicking, every instruction has
+// correct input types and every affine variable is consumed exactly once.
+#[test]
+fn generated_splice_flow_programs_are_type_correct() {
+    generated_splice_programs(100);
+}
+
+#[test]
+fn generated_splice_flow_follows_the_bolt2_order() {
+    for (seed, ops) in generated_splice_programs(20) {
+        let position = |pred: fn(&Operation) -> bool| {
+            ops.iter()
+                .position(pred)
+                .unwrap_or_else(|| panic!("seed {seed}: operation missing"))
+        };
+        let recv_ready = position(|op| matches!(op, Operation::RecvChannelReady));
+        let send_stfu = position(|op| matches!(op, Operation::SendStfu { .. }));
+        let splice_init = position(|op| matches!(op, Operation::SendSpliceInit { .. }));
+        let shared_input = position(|op| matches!(op, Operation::SendTxAddSharedInput { .. }));
+        let send_locked = position(|op| matches!(op, Operation::SendSpliceLocked));
+        // The splice's own signing and broadcast, after the open's.
+        let after = |from: usize, pred: fn(&Operation) -> bool| {
+            from + ops[from..]
+                .iter()
+                .position(pred)
+                .unwrap_or_else(|| panic!("seed {seed}: operation missing after {from}"))
+        };
+        let funding_output = after(shared_input, |op| {
+            matches!(
+                op,
+                Operation::SendTxAddOutput {
+                    role: TxOutputRole::Funding,
+                    ..
+                }
+            )
+        });
+        let tx_complete = after(funding_output, |op| matches!(op, Operation::SendTxComplete));
+        let send_commitment = after(tx_complete, |op| {
+            matches!(op, Operation::SendCommitmentSigned)
+        });
+        let send_signatures = after(send_commitment, |op| {
+            matches!(op, Operation::SendTxSignatures)
+        });
+        let broadcast = after(send_signatures, |op| {
+            matches!(op, Operation::BroadcastTransaction)
+        });
+
+        let order = [
+            recv_ready,
+            send_stfu,
+            splice_init,
+            shared_input,
+            funding_output,
+            tx_complete,
+            send_commitment,
+            send_signatures,
+            broadcast,
+            send_locked,
+        ];
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "seed {seed}: instructions are out of protocol order: {order:?}",
+        );
+        assert!(
+            matches!(ops[ops.len() - 1], Operation::RecvSpliceLocked),
+            "seed {seed}: last instruction should be RecvSpliceLocked",
+        );
+    }
+}
+
+#[test]
+fn generated_splice_flow_pairs_every_send_with_a_receive() {
+    for (seed, ops) in generated_splice_programs(20) {
+        let sends = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Operation::SendTxAddInput { .. }
+                        | Operation::SendTxAddPreviousInput { .. }
+                        | Operation::SendTxAddSharedInput { .. }
+                        | Operation::SendTxAddOutput { .. }
+                        | Operation::SendTxRemoveInput { .. }
+                        | Operation::SendTxRemoveOutput { .. }
+                        | Operation::SendTxComplete
+                        | Operation::SendTxInitRbf { .. }
+                        | Operation::SendSpliceInit { .. }
+                )
+            })
+            .count();
+        let receives = ops
+            .iter()
+            .filter(|op| matches!(op, Operation::RecvInteractiveTx))
+            .count();
+        assert_eq!(
+            sends, receives,
+            "seed {seed}: unpaired interactive tx messages"
+        );
+
+        let stfus = ops
+            .iter()
+            .filter(|op| matches!(op, Operation::SendStfu { .. }))
+            .count();
+        let stfu_replies = ops
+            .iter()
+            .filter(|op| matches!(op, Operation::RecvStfu))
+            .count();
+        assert_eq!(stfus, stfu_replies, "seed {seed}: unpaired stfu");
+    }
+}
+
+#[test]
+fn generated_splice_flow_splices_out_from_the_shared_input_alone() {
+    let mut splice_outs = 0;
+    for (seed, ops) in generated_splice_programs(20) {
+        let init = ops
+            .iter()
+            .position(|op| matches!(op, Operation::SendSpliceInit { .. }))
+            .expect("splice_init");
+        let Some(Operation::LoadContribution(contribution)) = ops[..init]
+            .iter()
+            .rev()
+            .find(|op| matches!(op, Operation::LoadContribution(_)))
+        else {
+            panic!("seed {seed}: no contribution loaded");
+        };
+        if *contribution >= 0 {
+            continue;
+        }
+        splice_outs += 1;
+        // Taking funds out needs no wallet input; the only one added is a
+        // decoy, removed again.
+        let adds = ops[init..]
+            .iter()
+            .filter(|op| matches!(op, Operation::SendTxAddInput { .. }))
+            .count();
+        let removes = ops[init..]
+            .iter()
+            .filter(|op| matches!(op, Operation::SendTxRemoveInput { .. }))
+            .count();
+        assert_eq!(adds, removes, "seed {seed}: splice-out spends the wallet");
+    }
+    assert!(splice_outs > 0, "no seed spliced out");
+}
+
+#[test]
+fn generated_splice_rbf_quiesces_again_and_re_adds_the_shared_input() {
+    let mut rbfs = 0;
+    for (seed, ops) in generated_splice_programs(50) {
+        let init = ops
+            .iter()
+            .position(|op| matches!(op, Operation::SendSpliceInit { .. }))
+            .expect("splice_init");
+        let Some(rbf) = ops[init..]
+            .iter()
+            .position(|op| matches!(op, Operation::SendTxInitRbf { .. }))
+            .map(|at| init + at)
+        else {
+            continue;
+        };
+        rbfs += 1;
+        let last_broadcast = ops[..rbf]
+            .iter()
+            .rposition(|op| matches!(op, Operation::BroadcastTransaction))
+            .expect("the splice was broadcast");
+        assert!(
+            ops[last_broadcast..rbf]
+                .iter()
+                .any(|op| matches!(op, Operation::SendStfu { .. })),
+            "seed {seed}: RBF of a splice without quiescing again",
+        );
+        assert!(
+            ops[rbf..]
+                .iter()
+                .any(|op| matches!(op, Operation::SendTxAddSharedInput { .. })),
+            "seed {seed}: RBF of a splice without the shared input",
+        );
+    }
+    assert!(rbfs > 0, "no seed replaced a splice");
 }
