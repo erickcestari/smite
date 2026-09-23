@@ -23,7 +23,8 @@ use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{
     AcceptChannelContext, AcceptChannelOracle, FundingSignedContext, FundingSignedOracle, Oracle,
 };
-use smite::pending_channel::{Exchange, PendingChannel, PendingChannelV2, V2Negotiations};
+use smite::pending_channel::{Exchange, FundingNegotiation, PendingChannel};
+use smite::pending_splice::Negotiations;
 use smite::violation::Violation;
 
 use super::targets::TargetRpc;
@@ -297,9 +298,10 @@ pub struct Executor<C, B, R> {
     /// `temporary_channel_id`, so the funding flow can build commitments from
     /// the parameters actually sent on the wire.
     negotiations: HashMap<TemporaryChannelId, PendingChannel>,
-    /// Channel establishment v2 negotiation state, addressable by either the
-    /// `temporary_channel_id` or the derived `channel_id` a message carries.
-    negotiations_v2: V2Negotiations,
+    /// Interactive funding negotiations: v2 opens, addressable by either the
+    /// `temporary_channel_id` or the derived `channel_id` a message carries,
+    /// and splices of live channels.
+    funding_negotiations: Negotiations,
     /// Transactions stored outside Bitcoin Core's mempool, typically because they
     /// were rejected by mempool policy, to be included in the next `MineBlocks`
     /// operation.
@@ -327,7 +329,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
             context,
             channel_states: HashMap::new(),
             negotiations: HashMap::new(),
-            negotiations_v2: V2Negotiations::default(),
+            funding_negotiations: Negotiations::default(),
             private_mempool: Vec::new(),
             unmined_txids: HashSet::new(),
             mined_txids: HashSet::new(),
@@ -624,7 +626,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     // A channel establishment v2 funding transaction carries the
                     // peer's inputs, which our wallet cannot sign. Its
                     // `tx_signatures` is the only thing that can witness them.
-                    let tx = apply_peer_witnesses(&self.negotiations_v2, &ft.tx);
+                    let tx = apply_peer_witnesses(&self.funding_negotiations, &ft.tx);
                     evict_double_spends(&mut self.private_mempool, &mut self.unmined_txids, &tx);
                     // Queue transactions rejected by the mempool in the private
                     // mempool so they can be mined later. Dedup on txid so the
@@ -707,7 +709,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
 
                 Operation::SendOpenChannel2 => {
                     let oc = resolve_open_channel2_message(&variables, instr.inputs[0]);
-                    self.negotiations_v2.record_open(oc);
+                    self.funding_negotiations.opens.record_open(oc);
                     let encoded = Message::OpenChannel2(oc.clone()).encode();
                     log::debug!(
                         "[{:?}] SendOpenChannel2: {} bytes",
@@ -727,7 +729,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     log::debug!("[{:?}] RecvAcceptChannel2: waiting", start.elapsed());
                     let ac: AcceptChannel2 = recv_bolt(&mut self.conn, RECV_IDLE_TIMEOUT)?;
                     log::debug!("[{:?}] RecvAcceptChannel2: received", start.elapsed());
-                    self.negotiations_v2.record_accept(&ac);
+                    self.funding_negotiations.opens.record_accept(&ac);
                     Some(Variable::AcceptChannel2(ac))
                 }
 
@@ -743,7 +745,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         *utxo_index,
                         *sequence,
                         &mut self.bitcoin_cli,
-                        &mut self.negotiations_v2,
+                        &mut self.funding_negotiations,
                     );
                     let channel_id = msg.channel_id;
                     let encoded = Message::TxAddInput(msg).encode();
@@ -763,7 +765,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         *serial_id,
                         *role,
                         &mut self.bitcoin_cli,
-                        &mut self.negotiations_v2,
+                        &mut self.funding_negotiations,
                     );
                     let channel_id = msg.channel_id;
                     let encoded = Message::TxAddOutput(msg).encode();
@@ -779,7 +781,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                 Operation::SendTxRemoveInput { serial_id } => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
                     record_sent_step(
-                        &mut self.negotiations_v2,
+                        &mut self.funding_negotiations,
                         channel_id,
                         Step::RemoveInput(*serial_id),
                     );
@@ -799,7 +801,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                 Operation::SendTxRemoveOutput { serial_id } => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
                     record_sent_step(
-                        &mut self.negotiations_v2,
+                        &mut self.funding_negotiations,
                         channel_id,
                         Step::RemoveOutput(*serial_id),
                     );
@@ -818,7 +820,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
 
                 Operation::SendTxComplete => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
-                    record_sent_step(&mut self.negotiations_v2, channel_id, Step::Complete);
+                    record_sent_step(&mut self.funding_negotiations, channel_id, Step::Complete);
                     let encoded = Message::TxComplete(TxComplete { channel_id }).encode();
                     log::debug!("[{:?}] SendTxComplete", start.elapsed());
                     self.conn.send_message(&encoded)?;
@@ -827,7 +829,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
 
                 Operation::RecvInteractiveTx => {
                     let channel_id = consume_sent_interactive_tx(&mut variables, instr.inputs[0]);
-                    if is_interactive_tx_expected(&self.negotiations_v2, channel_id) {
+                    if is_interactive_tx_expected(&self.funding_negotiations, channel_id) {
                         log::debug!("[{:?}] RecvInteractiveTx: waiting", start.elapsed());
                         let msg = self.recv_interactive_tx()?;
                         log::debug!("[{:?}] RecvInteractiveTx: got {msg}", start.elapsed());
@@ -843,7 +845,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                 Operation::BuildFundingTransactionV2 => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
                     self.settle_negotiation(channel_id)?;
-                    let ft = build_funding_transaction_v2(&self.negotiations_v2, channel_id);
+                    let ft = build_funding_transaction_v2(&self.funding_negotiations, channel_id);
                     log::debug!(
                         "[{:?}] BuildFundingTransactionV2: txid={} vout={}",
                         start.elapsed(),
@@ -859,7 +861,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         &variables,
                         &instr.inputs,
                         &mut self.channel_states,
-                        &mut self.negotiations_v2,
+                        &mut self.funding_negotiations,
                         &self.mined_txids,
                     )?;
                     let encoded = Message::CommitmentSigned(cs).encode();
@@ -881,13 +883,21 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     log::debug!("[{:?}] RecvCommitmentSigned: waiting", start.elapsed());
                     let cs: CommitmentSigned = recv_bolt(&mut self.conn, RECV_IDLE_TIMEOUT)?;
                     log::debug!("[{:?}] RecvCommitmentSigned: received", start.elapsed());
-                    verify_commitment_signed(&cs, &self.channel_states, &mut self.negotiations_v2)?;
+                    verify_commitment_signed(
+                        &cs,
+                        &self.channel_states,
+                        &mut self.funding_negotiations,
+                    )?;
                     Some(Variable::ChannelId(cs.channel_id))
                 }
 
                 Operation::RecvTxSignatures => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
-                    if is_tx_signatures_expected(&self.negotiations_v2, channel_id, &self.context) {
+                    if is_tx_signatures_expected(
+                        &self.funding_negotiations,
+                        channel_id,
+                        &self.context,
+                    ) {
                         log::debug!("[{:?}] RecvTxSignatures: waiting", start.elapsed());
                         let ts: TxSignatures = recv_bolt(&mut self.conn, RECV_IDLE_TIMEOUT)?;
                         log::debug!(
@@ -895,16 +905,17 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                             start.elapsed(),
                             ts.witnesses.len(),
                         );
-                        let contributed = self.negotiations_v2.get(ts.channel_id).map(|pending| {
-                            pending
-                                .attempt()
-                                .tx_exchange
-                                .shared_tx()
-                                .witness_positions(Contributor::Remote)
-                                .len()
-                        });
+                        let contributed =
+                            self.funding_negotiations.get(ts.channel_id).map(|pending| {
+                                pending
+                                    .attempt()
+                                    .tx_exchange
+                                    .shared_tx()
+                                    .witness_positions(Contributor::Remote)
+                                    .len()
+                            });
                         let witnesses = validate_peer_witnesses(&ts, contributed)?;
-                        if let Some(pending) = self.negotiations_v2.get_mut(ts.channel_id) {
+                        if let Some(pending) = self.funding_negotiations.get_mut(ts.channel_id) {
                             let attempt = pending.attempt_mut();
                             attempt.commitment_exchange.tx_signatures.received = true;
                             attempt.peer_witnesses = witnesses;
@@ -920,7 +931,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         &variables,
                         &instr.inputs,
                         &mut self.bitcoin_cli,
-                        &self.negotiations_v2,
+                        &self.funding_negotiations,
                     );
                     let encoded = Message::TxSignatures(ts).encode();
                     log::debug!(
@@ -931,7 +942,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     self.conn.send_message(&encoded)?;
                     // BOLT 2 has the peer reply with its own once it has ours,
                     // so this is what makes a later receive expect one.
-                    if let Some(pending) = self.negotiations_v2.get_mut(channel_id) {
+                    if let Some(pending) = self.funding_negotiations.get_mut(channel_id) {
                         pending.attempt_mut().commitment_exchange.tx_signatures.sent = true;
                     }
                     None
@@ -948,7 +959,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         &variables,
                         &instr.inputs,
                         *require_confirmed_inputs,
-                        &mut self.negotiations_v2,
+                        &mut self.funding_negotiations,
                     );
                     let encoded = Message::TxInitRbf(msg).encode();
                     log::debug!(
@@ -991,7 +1002,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         *input_index,
                         *sequence,
                         &mut self.bitcoin_cli,
-                        &mut self.negotiations_v2,
+                        &mut self.funding_negotiations,
                     );
                     let channel_id = msg.channel_id;
                     let encoded = Message::TxAddInput(msg).encode();
@@ -1025,7 +1036,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                 self.record_stfu(stfu)?;
                 continue;
             }
-            apply_interactive_tx(&mut self.negotiations_v2, &msg)?;
+            apply_interactive_tx(&mut self.funding_negotiations, &msg)?;
             return Ok(msg);
         }
     }
@@ -1065,7 +1076,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
         while self.is_stfu_owed(channel_id) {
             match recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)? {
                 Message::Stfu(stfu) => self.record_stfu(&stfu)?,
-                other => apply_interactive_tx(&mut self.negotiations_v2, &other)?,
+                other => apply_interactive_tx(&mut self.funding_negotiations, &other)?,
             }
         }
         Ok(())
@@ -1088,9 +1099,9 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
     fn settle_negotiation(&mut self, channel_id: ChannelId) -> Result<(), ExecuteError> {
         self.settle_quiescence(channel_id)?;
         while self
-            .negotiations_v2
+            .funding_negotiations
             .get(channel_id)
-            .is_some_and(PendingChannelV2::expects_reply)
+            .is_some_and(FundingNegotiation::expects_reply)
         {
             let msg = self.recv_interactive_tx()?;
             log::debug!("settling negotiation {channel_id}: got {msg}");
@@ -1328,7 +1339,7 @@ fn build_open_channel2(
 ///
 /// A negotiation we do not track records nothing: the message still goes out
 /// for the peer to judge, as does anything sent after the exchange concluded.
-fn record_sent_step(negotiations: &mut V2Negotiations, channel_id: ChannelId, step: Step) {
+fn record_sent_step(negotiations: &mut Negotiations, channel_id: ChannelId, step: Step) {
     if let Some(pending) = negotiations.get_mut(channel_id) {
         pending.attempt_mut().tx_exchange.send(step);
     }
@@ -1348,7 +1359,7 @@ fn build_tx_add_input(
     utxo_index: u8,
     sequence: u32,
     cli: &mut impl BitcoinRpc,
-    negotiations: &mut V2Negotiations,
+    negotiations: &mut Negotiations,
 ) -> TxAddInput {
     let channel_id = resolve_channel_id(variables, inputs[0]);
 
@@ -1413,7 +1424,7 @@ fn build_tx_add_previous_input(
     input_index: u8,
     sequence: u32,
     cli: &mut impl BitcoinRpc,
-    negotiations: &mut V2Negotiations,
+    negotiations: &mut Negotiations,
 ) -> TxAddInput {
     let channel_id = resolve_channel_id(variables, inputs[0]);
 
@@ -1467,7 +1478,7 @@ fn build_tx_init_rbf(
     variables: &[Option<Variable>],
     inputs: &[usize],
     require_confirmed_inputs: bool,
-    negotiations: &mut V2Negotiations,
+    negotiations: &mut Negotiations,
 ) -> TxInitRbf {
     let channel_id = resolve_channel_id(variables, inputs[0]);
     let locktime = resolve_block_height(variables, inputs[1]);
@@ -1475,7 +1486,7 @@ fn build_tx_init_rbf(
     let contribution = resolve_amount(variables, inputs[3]);
 
     if let Some(pending) = negotiations.get_mut(channel_id)
-        && pending.accept_channel2.is_some()
+        && pending.is_accepted()
     {
         pending.funding_attempts_mut().start_rbf(
             locktime,
@@ -1507,7 +1518,7 @@ fn build_tx_add_output(
     serial_id: u64,
     role: TxOutputRole,
     cli: &mut impl BitcoinRpc,
-    negotiations: &mut V2Negotiations,
+    negotiations: &mut Negotiations,
 ) -> TxAddOutput {
     let channel_id = resolve_channel_id(variables, inputs[0]);
     let explicit_sats = resolve_amount(variables, inputs[1]);
@@ -1562,7 +1573,7 @@ fn build_tx_add_output(
 /// reported: only the peer can tell whether it is consistent with its own
 /// view, and it will fail the negotiation if not.
 fn apply_interactive_tx(
-    negotiations: &mut V2Negotiations,
+    negotiations: &mut Negotiations,
     msg: &Message,
 ) -> Result<(), ExecuteError> {
     let (channel_id, step) = match msg {
@@ -1641,7 +1652,7 @@ fn apply_interactive_tx(
 /// every consumer already has to cope with a funding output that does not
 /// match.
 fn build_funding_transaction_v2(
-    negotiations: &V2Negotiations,
+    negotiations: &Negotiations,
     channel_id: ChannelId,
 ) -> FundingTransaction {
     let Some(pending) = negotiations.get(channel_id) else {
@@ -1689,7 +1700,7 @@ fn build_commitment_signed(
     variables: &[Option<Variable>],
     inputs: &[usize],
     channel_states: &mut HashMap<ChannelId, ChannelState>,
-    negotiations: &mut V2Negotiations,
+    negotiations: &mut Negotiations,
     mined_txids: &HashSet<Txid>,
 ) -> Result<CommitmentSigned, ExecuteError> {
     let funding_tx = resolve_funding_transaction(variables, inputs[0]).clone();
@@ -1703,7 +1714,7 @@ fn build_commitment_signed(
         tlvs: CommitmentSignedTlvs::default(),
     };
 
-    let Some(pending) = negotiations.get_mut(channel_id) else {
+    let Some(pending) = negotiations.opens.get_mut(channel_id) else {
         return Ok(unsigned(channel_id));
     };
     let Some(accept_channel2) = pending.accept_channel2.clone() else {
@@ -1861,7 +1872,7 @@ fn track_channel_state(
 fn verify_commitment_signed(
     cs: &CommitmentSigned,
     channel_states: &HashMap<ChannelId, ChannelState>,
-    negotiations: &mut V2Negotiations,
+    negotiations: &mut Negotiations,
 ) -> Result<(), ExecuteError> {
     if !cs.htlc_signatures.is_empty() {
         return Err(Violation::UnexpectedHtlcSignatures(cs.channel_id).into());
@@ -1920,10 +1931,10 @@ fn verify_commitment_signed(
 /// A negotiation we do not track still reads. A mutated program may have sent
 /// on a channel we never opened, and the peer's rejection of it is worth
 /// surfacing.
-fn is_interactive_tx_expected(negotiations: &V2Negotiations, channel_id: ChannelId) -> bool {
+fn is_interactive_tx_expected(negotiations: &Negotiations, channel_id: ChannelId) -> bool {
     negotiations
         .get(channel_id)
-        .is_none_or(PendingChannelV2::expects_reply)
+        .is_none_or(FundingNegotiation::expects_reply)
 }
 
 /// Returns whether the peer owes us a `tx_signatures` for this negotiation.
@@ -1935,7 +1946,7 @@ fn is_interactive_tx_expected(negotiations: &V2Negotiations, channel_id: Channel
 /// Waiting outside those two cases would block on a message the peer is itself
 /// waiting on us to send.
 fn is_tx_signatures_expected(
-    negotiations: &V2Negotiations,
+    negotiations: &Negotiations,
     channel_id: ChannelId,
     context: &ProgramContext,
 ) -> bool {
@@ -1970,7 +1981,7 @@ fn build_tx_signatures(
     variables: &[Option<Variable>],
     inputs: &[usize],
     cli: &mut impl BitcoinRpc,
-    negotiations: &V2Negotiations,
+    negotiations: &Negotiations,
 ) -> TxSignatures {
     let channel_id = resolve_channel_id(variables, inputs[0]);
     let funding_tx = resolve_funding_transaction(variables, inputs[1]);
@@ -2111,21 +2122,17 @@ fn evict_double_spends(
 /// negotiation over when the message arrived, so every witness held here is
 /// well-formed and there is one per input the peer added.
 fn apply_peer_witnesses(
-    negotiations: &V2Negotiations,
+    negotiations: &Negotiations,
     tx: &bitcoin::Transaction,
 ) -> bitcoin::Transaction {
     let txid = tx.compute_txid();
     let mut tx = tx.clone();
     // Any attempt may be the one broadcast, not only the latest: BOLT 2 lets
     // whichever confirms fund the channel.
-    let Some(attempt) = negotiations
-        .iter()
-        .flat_map(|pending| pending.funding_attempts().all())
-        .find(|attempt| {
-            !attempt.peer_witnesses.is_empty()
-                && attempt.tx_exchange.shared_tx().build().compute_txid() == txid
-        })
-    else {
+    let Some(attempt) = negotiations.all_attempts().find(|attempt| {
+        !attempt.peer_witnesses.is_empty()
+            && attempt.tx_exchange.shared_tx().build().compute_txid() == txid
+    }) else {
         return tx;
     };
 

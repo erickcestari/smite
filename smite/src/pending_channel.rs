@@ -208,6 +208,7 @@ impl FundingAttempts {
     /// negotiation.
     pub fn abort(&mut self) {
         if self.rbf.pop().is_none() {
+            self.first.ack_pending = false;
             self.first.tx_exchange.abort();
         }
     }
@@ -253,47 +254,23 @@ impl PendingChannelV2 {
             attempts: FundingAttempts::new(first_attempt),
         }
     }
+}
 
-    /// The attempts at the funding transaction.
-    #[must_use]
-    pub fn funding_attempts(&self) -> &FundingAttempts {
+impl FundingNegotiation for PendingChannelV2 {
+    fn funding_attempts(&self) -> &FundingAttempts {
         &self.attempts
     }
 
-    /// Mutable sibling of [`Self::funding_attempts`].
-    pub fn funding_attempts_mut(&mut self) -> &mut FundingAttempts {
+    fn funding_attempts_mut(&mut self) -> &mut FundingAttempts {
         &mut self.attempts
     }
 
-    /// The latest attempt at the funding transaction.
-    #[must_use]
-    pub fn attempt(&self) -> &FundingAttempt {
-        self.attempts.latest()
+    fn prior_capacity(&self) -> u64 {
+        0
     }
 
-    /// Mutable sibling of [`Self::attempt`].
-    pub fn attempt_mut(&mut self) -> &mut FundingAttempt {
-        self.attempts.latest_mut()
-    }
-
-    /// Whether the peer owes us a reply in the latest attempt.
-    #[must_use]
-    pub fn expects_reply(&self) -> bool {
-        self.attempts.expects_reply()
-    }
-
-    /// Records the peer's `tx_ack_rbf` and its contribution, read as nothing
-    /// when negative: an open has no channel balance to take funds out of.
-    ///
-    /// Returns `false`, recording nothing, when no `tx_init_rbf` awaits one.
-    pub fn record_ack_rbf(&mut self, remote_contribution: i64) -> bool {
-        self.attempts.record_ack_rbf(remote_contribution.max(0))
-    }
-
-    /// The funding output's `scriptPubKey`, once `accept_channel2` has
-    /// revealed the peer's funding pubkey.
-    #[must_use]
-    pub fn funding_script(&self) -> Option<ScriptBuf> {
+    /// Known once `accept_channel2` reveals the peer's funding pubkey.
+    fn funding_script(&self) -> Option<ScriptBuf> {
         let accept = self.accept_channel2.as_ref()?;
         Some(
             build_funding_witness_script(
@@ -304,11 +281,60 @@ impl PendingChannelV2 {
         )
     }
 
-    /// Funding output value of the latest attempt: the sum of both peers'
-    /// contributions, per BOLT 2.
-    #[must_use]
-    pub fn total_funding_satoshis(&self) -> u64 {
-        self.attempt().funding_output_value(0)
+    fn is_accepted(&self) -> bool {
+        self.accept_channel2.is_some()
+    }
+
+    /// A negative contribution reads as nothing: an open has no channel
+    /// balance to take funds out of.
+    fn record_ack_rbf(&mut self, remote_contribution: i64) -> bool {
+        self.attempts.record_ack_rbf(remote_contribution.max(0))
+    }
+}
+
+/// A negotiation building a channel's funding transaction through interactive
+/// construction: a v2 open, or a splice.
+pub trait FundingNegotiation {
+    /// The attempts at the funding transaction.
+    fn funding_attempts(&self) -> &FundingAttempts;
+
+    /// Mutable sibling of [`Self::funding_attempts`].
+    fn funding_attempts_mut(&mut self) -> &mut FundingAttempts;
+
+    /// Value of the funding output the transaction replaces: 0 for an open.
+    fn prior_capacity(&self) -> u64;
+
+    /// The funding output's `scriptPubKey`, once both funding pubkeys are
+    /// known.
+    fn funding_script(&self) -> Option<ScriptBuf>;
+
+    /// Whether the peer accepted the negotiation, so RBF may replace its
+    /// transaction.
+    fn is_accepted(&self) -> bool;
+
+    /// Records the peer's `tx_ack_rbf` and its contribution.
+    ///
+    /// Returns `false`, recording nothing, when no `tx_init_rbf` awaits one.
+    fn record_ack_rbf(&mut self, remote_contribution: i64) -> bool;
+
+    /// The latest attempt at the funding transaction.
+    fn attempt(&self) -> &FundingAttempt {
+        self.funding_attempts().latest()
+    }
+
+    /// Mutable sibling of [`Self::attempt`].
+    fn attempt_mut(&mut self) -> &mut FundingAttempt {
+        self.funding_attempts_mut().latest_mut()
+    }
+
+    /// Whether the peer owes us a reply in the latest attempt.
+    fn expects_reply(&self) -> bool {
+        self.funding_attempts().expects_reply()
+    }
+
+    /// Funding output value of the latest attempt, per BOLT 2.
+    fn total_funding_satoshis(&self) -> u64 {
+        self.attempt().funding_output_value(self.prior_capacity())
     }
 }
 

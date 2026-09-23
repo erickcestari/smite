@@ -1496,7 +1496,7 @@ fn execute_recv_accept_channel2_unknown_temporary_channel_id_is_ignored() {
 #[test]
 fn record_open_forgets_the_replaced_negotiations_channel_id() {
     let temporary_channel_id = sample_v2_temporary_channel_id();
-    let mut negotiations = V2Negotiations::default();
+    let mut negotiations = smite::pending_channel::V2Negotiations::default();
 
     negotiations.record_open(&sample_open_channel2());
     negotiations.record_accept(&sample_accept_channel2(temporary_channel_id));
@@ -2574,7 +2574,7 @@ fn recv_commitment_signed_without_any_v2_exchange_is_ignored() {
         tlvs: CommitmentSignedTlvs::default(),
     };
 
-    let result = verify_commitment_signed(&cs, &HashMap::new(), &mut V2Negotiations::default());
+    let result = verify_commitment_signed(&cs, &HashMap::new(), &mut Negotiations::default());
 
     assert!(result.is_ok(), "expected no violation, got {result:?}");
 }
@@ -2701,10 +2701,12 @@ fn execute_recv_tx_signatures_is_a_noop_before_the_commitment_exchange() {
 
 /// A negotiation that has exchanged both `commitment_signed`s, with the
 /// given input values contributed by each side.
-fn negotiation_awaiting_tx_signatures(local_value: u64, remote_value: u64) -> V2Negotiations {
-    let mut negotiations = V2Negotiations::default();
-    negotiations.record_open(&sample_open_channel2());
-    negotiations.record_accept(&sample_accept_channel2(sample_v2_temporary_channel_id()));
+fn negotiation_awaiting_tx_signatures(local_value: u64, remote_value: u64) -> Negotiations {
+    let mut negotiations = Negotiations::default();
+    negotiations.opens.record_open(&sample_open_channel2());
+    negotiations
+        .opens
+        .record_accept(&sample_accept_channel2(sample_v2_temporary_channel_id()));
 
     {
         let pending = negotiations
@@ -2872,7 +2874,7 @@ fn tx_signatures_expected_once_the_peer_has_received_ours() {
 
 /// A negotiation contributing one input each way, with `witnesses` standing
 /// in for the peer's `tx_signatures`.
-fn negotiation_with_peer_witnesses(witnesses: Vec<Witness>) -> V2Negotiations {
+fn negotiation_with_peer_witnesses(witnesses: Vec<Witness>) -> Negotiations {
     let mut negotiations = negotiation_awaiting_tx_signatures(50_000, 60_000);
     negotiations
         .get_mut(sample_v2_temporary_channel_id())
