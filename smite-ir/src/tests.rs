@@ -701,6 +701,16 @@ fn displays_mine_blocks_program() {
 }
 
 #[test]
+fn mine_empty_blocks_operation() {
+    let op = Operation::MineEmptyBlocks(3);
+    assert_eq!(op.input_types(), vec![]);
+    assert_eq!(op.output_type(), None);
+    assert!(op.is_param_mutable());
+    assert!(op.has_side_effects());
+    assert_eq!(op.to_string(), "MineEmptyBlocks(3)");
+}
+
+#[test]
 fn create_and_broadcast_tx_operation() {
     let op = Operation::CreateFundingTransaction;
     assert_eq!(
@@ -2203,6 +2213,26 @@ fn param_mutator_changes_mined_num_blocks() {
         diff_count > 90,
         "OperationParamMutator has an unexpected bias"
     );
+}
+
+#[test]
+fn param_mutator_keeps_mined_empty_blocks_small() {
+    let mut program = Program {
+        instructions: vec![Instruction {
+            operation: Operation::MineEmptyBlocks(3),
+            inputs: vec![],
+        }],
+    };
+    let mutator = OperationParamMutator;
+    let mut rng = SmallRng::seed_from_u64(0);
+
+    for _ in 0..100 {
+        mutator.mutate(&mut program, &mut rng);
+        let Operation::MineEmptyBlocks(num_blocks) = program.instructions[0].operation else {
+            panic!("OperationParamMutator changed the operation type");
+        };
+        assert!(num_blocks <= 8);
+    }
 }
 
 #[test]

@@ -70,6 +70,9 @@ pub trait BitcoinRpc {
     /// `private_mempool` in the first block.
     fn mine_blocks(&mut self, num_blocks: u8, private_mempool: &[String]);
 
+    /// Mines the given number of blocks holding only their coinbase.
+    fn mine_empty_blocks(&mut self, num_blocks: u8);
+
     /// Returns the wallet's spendable UTXOs.
     #[must_use]
     fn get_utxos(&mut self) -> Vec<Utxo>;
@@ -114,6 +117,10 @@ pub trait BitcoinRpc {
 impl BitcoinRpc for BitcoinCli {
     fn mine_blocks(&mut self, num_blocks: u8, private_mempool: &[String]) {
         BitcoinCli::mine_blocks(self, num_blocks, private_mempool);
+    }
+
+    fn mine_empty_blocks(&mut self, num_blocks: u8) {
+        BitcoinCli::mine_empty_blocks(self, num_blocks);
     }
 
     fn get_utxos(&mut self) -> Vec<Utxo> {
@@ -588,6 +595,17 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     self.rpc.chain_sync();
                     self.mined_txids.extend(self.unmined_txids.drain());
                     log::debug!("[{:?}] MineBlocks: mined {} block(s)", start.elapsed(), v);
+                    None
+                }
+
+                Operation::MineEmptyBlocks(v) => {
+                    self.bitcoin_cli.mine_empty_blocks(*v);
+                    self.rpc.chain_sync();
+                    log::debug!(
+                        "[{:?}] MineEmptyBlocks: mined {} block(s)",
+                        start.elapsed(),
+                        v
+                    );
                     None
                 }
 

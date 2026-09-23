@@ -159,6 +159,34 @@ impl BitcoinCli {
         }
     }
 
+    /// Mines `num_blocks` blocks holding only their coinbase, leaving the
+    /// mempool unconfirmed.
+    ///
+    /// # Panics
+    ///
+    /// If the `bitcoin-cli getnewaddress` or `generateblock` command fails to
+    /// execute or exits non-zero.
+    pub fn mine_empty_blocks(&self, num_blocks: u8) {
+        if num_blocks == 0 {
+            return;
+        }
+        let address = self.get_new_address().to_string();
+        for _ in 0..num_blocks {
+            let gen_out = self
+                .run()
+                .arg("generateblock")
+                .arg(&address)
+                .arg("[]")
+                .output()
+                .expect("bitcoin-cli generateblock should not fail");
+            assert!(
+                gen_out.status.success(),
+                "bitcoin-cli generateblock failed: {}",
+                String::from_utf8_lossy(&gen_out.stderr)
+            );
+        }
+    }
+
     /// Mines `num_blocks` blocks from the node's mempool via
     /// `bitcoin-cli -generate`.
     fn generate(&self, num_blocks: u8) {

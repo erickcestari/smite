@@ -53,6 +53,7 @@ impl Connection for MockConnection {
 pub struct MockBitcoinCli {
     pub mine_blocks_calls: Vec<u8>,
     pub mined_private_mempool: Vec<String>,
+    pub mine_empty_blocks_calls: Vec<u8>,
     pub broadcast_calls: Vec<Transaction>,
     pub block_position_lookups: Vec<Txid>,
     pub locked_outpoints: Vec<OutPoint>,
@@ -74,6 +75,11 @@ impl BitcoinRpc for MockBitcoinCli {
         self.mine_blocks_calls.push(num_blocks);
         self.mined_private_mempool = private_mempool.to_vec();
         self.confirmations += u32::from(num_blocks);
+    }
+
+    fn mine_empty_blocks(&mut self, num_blocks: u8) {
+        // Blocks without the funding transaction add no confirmations to it.
+        self.mine_empty_blocks_calls.push(num_blocks);
     }
 
     fn get_utxos(&mut self) -> Vec<Utxo> {

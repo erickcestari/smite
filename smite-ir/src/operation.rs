@@ -417,6 +417,13 @@ pub enum Operation {
     ///   0: `channel_id` (`ChannelId`)
     ///   1: `funding_transaction` (`FundingTransaction`)
     SendTxSignatures,
+    /// Mines the given number of blocks holding only their coinbase.
+    ///
+    /// Advances the chain without confirming what the mempool holds, such as
+    /// a funding transaction an RBF attempt is about to replace: some targets
+    /// refuse RBF until blocks have passed since the last attempt, and a block
+    /// confirming the funding transaction would end RBF altogether.
+    MineEmptyBlocks(u8),
 }
 
 /// Where a `tx_add_output`'s value and script come from.
@@ -824,6 +831,7 @@ impl fmt::Display for Operation {
             Self::RecvFundingSigned => write!(f, "RecvFundingSigned"),
             Self::RecvChannelReady => write!(f, "RecvChannelReady()"),
             Self::MineBlocks(v) => write!(f, "MineBlocks({v})"),
+            Self::MineEmptyBlocks(v) => write!(f, "MineEmptyBlocks({v})"),
             Self::BroadcastTransaction => write!(f, "BroadcastTransaction"),
             Self::LookupShortChannelId => write!(f, "LookupShortChannelId"),
             Self::DeriveTemporaryChannelIdV2 => write!(f, "DeriveTemporaryChannelIdV2"),
@@ -905,6 +913,7 @@ impl Operation {
             | Self::SendChannelReady { .. }
             | Self::RecvChannelReady
             | Self::MineBlocks(_)
+            | Self::MineEmptyBlocks(_)
             | Self::BroadcastTransaction
             | Self::RecvInteractiveTx
             | Self::RecvTxSignatures
@@ -951,7 +960,8 @@ impl Operation {
             | Self::LoadTargetPubkeyFromContext
             | Self::LoadChainHashFromContext
             | Self::RecvChannelReady
-            | Self::MineBlocks(_) => vec![],
+            | Self::MineBlocks(_)
+            | Self::MineEmptyBlocks(_) => vec![],
 
             Self::DerivePoint => vec![VariableType::PrivateKey],
             Self::ExtractAcceptChannel(_) => vec![VariableType::AcceptChannel],
@@ -1144,6 +1154,7 @@ impl Operation {
             | Self::RecvFundingSigned
             | Self::RecvChannelReady
             | Self::MineBlocks(_)
+            | Self::MineEmptyBlocks(_)
             | Self::BroadcastTransaction
             | Self::LookupShortChannelId
             | Self::DeriveTemporaryChannelIdV2
@@ -1218,6 +1229,7 @@ impl Operation {
             | Self::RecvFundingSigned
             | Self::RecvChannelReady
             | Self::MineBlocks(_)
+            | Self::MineEmptyBlocks(_)
             | Self::BroadcastTransaction
             | Self::SendOpenChannel2
             | Self::RecvAcceptChannel2
@@ -1285,10 +1297,11 @@ impl Operation {
             // `SendFundingCreated` builds its message from the recorded
             // negotiation and channel state. The `Recv` operations read
             // whatever the target sends us. `MineBlocks` also mines whatever
-            // the private mempool holds, `BroadcastTransaction` dedups against
-            // it, and `LookupShortChannelId` reads chain state. The
-            // `tx_add_*` operations pick a wallet UTXO and a fresh change
-            // address, so they read the wallet too.
+            // the private mempool holds and `BroadcastTransaction` dedups
+            // against it, `MineEmptyBlocks` leaves unconfirmed whatever was
+            // broadcast before it, and `LookupShortChannelId` reads chain
+            // state. The `tx_add_*` operations pick a wallet UTXO and a fresh
+            // change address, so they read the wallet too.
             Self::CreateFundingTransaction
             | Self::SendFundingCreated
             | Self::SendTxAddInput { .. }
@@ -1304,6 +1317,7 @@ impl Operation {
             | Self::RecvFundingSigned
             | Self::RecvChannelReady
             | Self::MineBlocks(_)
+            | Self::MineEmptyBlocks(_)
             | Self::BroadcastTransaction
             | Self::LookupShortChannelId => false,
         }
@@ -1340,6 +1354,7 @@ impl Operation {
             | Self::BuildNodeAnnouncement { .. }
             | Self::SendChannelReady { .. }
             | Self::MineBlocks(_)
+            | Self::MineEmptyBlocks(_)
             | Self::ExtractAcceptChannel2(_)
             | Self::BuildOpenChannel2 { .. }
             | Self::SendTxAddInput { .. }

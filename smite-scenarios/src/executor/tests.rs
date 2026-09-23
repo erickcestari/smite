@@ -647,6 +647,23 @@ fn execute_mine_blocks_invokes_cli() {
 }
 
 #[test]
+fn execute_mine_empty_blocks_leaves_the_private_mempool_queued() {
+    // A below-dust output makes the broadcast land in the private mempool.
+    let mut b = ProgramBuilder::new();
+    let funding = create_funding_tx_with(&mut b, 200, 15_000);
+    b.append(Operation::BroadcastTransaction, &[funding.tx]);
+    b.append(Operation::MineEmptyBlocks(3), &[]);
+
+    let mut fx = Fixture::new();
+    fx.run(&b.build());
+
+    assert_eq!(fx.bitcoin().mine_empty_blocks_calls, vec![3]);
+    assert!(fx.bitcoin().mine_blocks_calls.is_empty());
+    assert_eq!(fx.private_mempool().len(), 1);
+    assert_eq!(fx.rpc().chain_syncs, 1);
+}
+
+#[test]
 #[should_panic(expected = "expected 0 inputs, got 1")]
 fn execute_mine_blocks_wrong_input() {
     // `MineBlocks` takes no inputs.

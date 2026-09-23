@@ -88,6 +88,12 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
             *v = rng.random_range(1..=16);
             true
         }
+        // Each empty block costs a `generateblock` call, so keep the count to
+        // a few past the 3 Eclair waits for between RBF attempts.
+        Operation::MineEmptyBlocks(v) => {
+            *v = rng.random_range(0..=8);
+            true
+        }
         Operation::ExtractAcceptChannel(field) => mutate_accept_channel_field(field, rng),
         Operation::BuildNodeAnnouncement { rgb_color, alias } => {
             mutate_node_announcement(rgb_color, alias, rng)
