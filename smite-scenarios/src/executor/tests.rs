@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use super::*;
 use bitcoin::Amount;
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use harness::*;
 use programs::*;
@@ -2892,6 +2893,66 @@ fn apply_peer_witnesses_leaves_an_unrelated_transaction_alone() {
     // A v1 funding transaction belongs to no v2 negotiation.
     let unrelated = sample_prevtx();
     assert_eq!(apply_peer_witnesses(&negotiations, &unrelated), unrelated);
+}
+
+/// A transaction spending `outpoints`, told apart from others spending the
+/// same ones by `value`.
+fn tx_spending(outpoints: &[OutPoint], value: u64) -> bitcoin::Transaction {
+    bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: outpoints
+            .iter()
+            .map(|&previous_output| bitcoin::TxIn {
+                previous_output,
+                ..bitcoin::TxIn::default()
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    }
+}
+
+fn queued(tx: &bitcoin::Transaction) -> PrivateTx {
+    PrivateTx {
+        txid: tx.compute_txid(),
+        spends: tx.input.iter().map(|txin| txin.previous_output).collect(),
+        hex: bitcoin::consensus::encode::serialize_hex(tx),
+    }
+}
+
+fn outpoint(byte: u8) -> OutPoint {
+    OutPoint::new(Txid::from_byte_array([byte; 32]), 0)
+}
+
+#[test]
+fn evict_double_spends_drops_what_shares_an_input() {
+    let original = tx_spending(&[outpoint(1), outpoint(2)], 1_000);
+    let unrelated = tx_spending(&[outpoint(3)], 1_000);
+    let replacement = tx_spending(&[outpoint(2)], 900);
+    let mut private_mempool = vec![queued(&original), queued(&unrelated)];
+    let mut unmined_txids = HashSet::from([original.compute_txid(), unrelated.compute_txid()]);
+
+    evict_double_spends(&mut private_mempool, &mut unmined_txids, &replacement);
+
+    let kept: Vec<Txid> = private_mempool.iter().map(|queued| queued.txid).collect();
+    assert_eq!(kept, vec![unrelated.compute_txid()]);
+    // The original will never be mined now, so it must not count as mined.
+    assert_eq!(unmined_txids, HashSet::from([unrelated.compute_txid()]));
+}
+
+#[test]
+fn evict_double_spends_keeps_a_rebroadcast_of_the_same_transaction() {
+    let tx = tx_spending(&[outpoint(1)], 1_000);
+    let mut private_mempool = vec![queued(&tx)];
+    let mut unmined_txids = HashSet::from([tx.compute_txid()]);
+
+    evict_double_spends(&mut private_mempool, &mut unmined_txids, &tx);
+
+    assert_eq!(private_mempool.len(), 1);
+    assert!(unmined_txids.contains(&tx.compute_txid()));
 }
 
 /// A `tx_signatures` carrying `witnesses` as raw `witness_data`.

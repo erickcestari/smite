@@ -334,7 +334,7 @@ impl Fixture {
     }
 
     /// Returns the transactions held outside Bitcoin Core's mempool.
-    pub fn private_mempool(&self) -> &[(Txid, String)] {
+    pub fn private_mempool(&self) -> &[PrivateTx] {
         &self.executor.private_mempool
     }
 

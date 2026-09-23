@@ -259,6 +259,18 @@ pub enum ExecuteError {
     Violation(#[from] Violation),
 }
 
+/// A transaction held outside Bitcoin Core's mempool until the next
+/// `MineBlocks`.
+struct PrivateTx {
+    /// Deduplication key: re-signing the same transaction can change its raw
+    /// hex, but not its txid.
+    txid: Txid,
+    /// The outpoints it spends, so a later broadcast spending one evicts it.
+    spends: Vec<OutPoint>,
+    /// The signed transaction, as it gets mined.
+    hex: String,
+}
+
 /// Executes IR programs against a target over an established connection.
 pub struct Executor<C, B, R> {
     /// Connection used to send and receive Lightning messages.
@@ -283,10 +295,8 @@ pub struct Executor<C, B, R> {
     negotiations_v2: V2Negotiations,
     /// Transactions stored outside Bitcoin Core's mempool, typically because they
     /// were rejected by mempool policy, to be included in the next `MineBlocks`
-    /// operation. Each is stored as `(txid, raw_hex)`: re-signing the same
-    /// transaction can change its raw hex, but the txid stays the same, so
-    /// deduplication keys on the txid while the raw hex is what gets mined.
-    private_mempool: Vec<(Txid, String)>,
+    /// operation.
+    private_mempool: Vec<PrivateTx>,
     /// Transactions broadcast but not yet mined. Unlike `private_mempool`,
     /// which only holds what Bitcoin Core's mempool rejected, this tracks every
     /// broadcast.
@@ -572,7 +582,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     // adding those transactions to the first block.
                     let private_mempool: Vec<String> = std::mem::take(&mut self.private_mempool)
                         .into_iter()
-                        .map(|(_, hex)| hex)
+                        .map(|queued| queued.hex)
                         .collect();
                     self.bitcoin_cli.mine_blocks(*v, &private_mempool);
                     self.rpc.chain_sync();
@@ -593,14 +603,22 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     // peer's inputs, which our wallet cannot sign. Its
                     // `tx_signatures` is the only thing that can witness them.
                     let tx = apply_peer_witnesses(&self.negotiations_v2, &ft.tx);
+                    evict_double_spends(&mut self.private_mempool, &mut self.unmined_txids, &tx);
                     // Queue transactions rejected by the mempool in the private
                     // mempool so they can be mined later. Dedup on txid so the
                     // same transaction broadcast again before then is queued
                     // once, regardless of any change to its signed hex.
                     if let Some(hex) = self.bitcoin_cli.sign_and_broadcast_tx(&tx)
-                        && !self.private_mempool.iter().any(|(t, _)| *t == txid)
+                        && !self
+                            .private_mempool
+                            .iter()
+                            .any(|queued| queued.txid == txid)
                     {
-                        self.private_mempool.push((txid, hex));
+                        self.private_mempool.push(PrivateTx {
+                            txid,
+                            spends: tx.input.iter().map(|txin| txin.previous_output).collect(),
+                            hex,
+                        });
                     }
                     self.unmined_txids.insert(txid);
                     None
@@ -1768,6 +1786,34 @@ fn validate_peer_witnesses(
             Ok(witness)
         })
         .collect()
+}
+
+/// Drops the queued transactions `tx` double-spends, and forgets them as
+/// broadcast.
+///
+/// An RBF attempt spends inputs of the attempt it replaces. With both queued,
+/// or the replaced one queued while the replacement reaches Bitcoin Core's
+/// mempool, the next `MineBlocks` would hand `generateblock` a double spend.
+/// The newest broadcast wins, as it does in Bitcoin Core.
+fn evict_double_spends(
+    private_mempool: &mut Vec<PrivateTx>,
+    unmined_txids: &mut HashSet<Txid>,
+    tx: &bitcoin::Transaction,
+) {
+    let txid = tx.compute_txid();
+    let spends: HashSet<OutPoint> = tx.input.iter().map(|txin| txin.previous_output).collect();
+    private_mempool.retain(|queued| {
+        let conflicts = queued.txid != txid
+            && queued
+                .spends
+                .iter()
+                .any(|outpoint| spends.contains(outpoint));
+        if conflicts {
+            log::debug!("{txid} double-spends queued {}, evicting it", queued.txid);
+            unmined_txids.remove(&queued.txid);
+        }
+        !conflicts
+    });
 }
 
 /// Attaches the witnesses from the peer's `tx_signatures` to a channel
