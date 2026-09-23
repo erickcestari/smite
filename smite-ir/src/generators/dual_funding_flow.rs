@@ -150,7 +150,7 @@ pub(super) fn append_dual_funding_flow(builder: &mut ProgramBuilder, rng: &mut i
         upfront_shutdown_script,
     };
     construct_transaction(builder, rng, &inputs, session);
-    let funded_channel_id = sign_and_broadcast(builder, channel_id, funding_privkey);
+    let funded_channel_id = sign_and_broadcast(builder, channel_id, funding_privkey).channel_id;
 
     // Fee-bump the funding transaction before it confirms.
     if rng.random() {

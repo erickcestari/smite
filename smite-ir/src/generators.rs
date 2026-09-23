@@ -14,6 +14,7 @@ mod funding_flow;
 mod interactive_tx;
 mod node_announcement;
 mod open_channel;
+mod splice_flow;
 
 pub use channel_announcement::ChannelAnnouncementGenerator;
 pub use channel_ready::ChannelReadyGenerator;
@@ -23,6 +24,7 @@ pub use funding_created::FundingCreatedGenerator;
 pub use funding_flow::FundingFlowGenerator;
 pub use node_announcement::NodeAnnouncementGenerator;
 pub use open_channel::OpenChannelGenerator;
+pub use splice_flow::{DualFundedSpliceFlowGenerator, SpliceFlowGenerator};
 
 use rand::Rng;
 
@@ -46,6 +48,8 @@ pub enum AnyGenerator {
     ChannelReady(ChannelReadyGenerator),
     FundingFlow(FundingFlowGenerator),
     DualFundingFlow(DualFundingFlowGenerator),
+    SpliceFlow(SpliceFlowGenerator),
+    DualFundedSpliceFlow(DualFundedSpliceFlowGenerator),
 }
 
 impl AnyGenerator {
@@ -76,6 +80,28 @@ impl AnyGenerator {
         Self::DualFundingFlow(DualFundingFlowGenerator),
     ];
 
+    /// [`Self::V1`] plus splicing, for targets that support `option_splice`.
+    pub const V1_SPLICE: &[Self] = &[
+        Self::ChannelAnnouncement(ChannelAnnouncementGenerator),
+        Self::ChannelUpdate(ChannelUpdateGenerator),
+        Self::NodeAnnouncement(NodeAnnouncementGenerator),
+        Self::OpenChannel(OpenChannelGenerator),
+        Self::FundingCreated(FundingCreatedGenerator),
+        Self::ChannelReady(ChannelReadyGenerator),
+        Self::FundingFlow(FundingFlowGenerator),
+        Self::SpliceFlow(SpliceFlowGenerator),
+    ];
+
+    /// [`Self::V2`] plus splicing, for targets that support `option_splice`.
+    pub const V2_SPLICE: &[Self] = &[
+        Self::ChannelAnnouncement(ChannelAnnouncementGenerator),
+        Self::ChannelUpdate(ChannelUpdateGenerator),
+        Self::NodeAnnouncement(NodeAnnouncementGenerator),
+        Self::ChannelReady(ChannelReadyGenerator),
+        Self::DualFundingFlow(DualFundingFlowGenerator),
+        Self::DualFundedSpliceFlow(DualFundedSpliceFlowGenerator),
+    ];
+
     /// All variants. Keep in sync with the enum definition.
     pub const ALL: &[Self] = &[
         Self::ChannelAnnouncement(ChannelAnnouncementGenerator),
@@ -86,6 +112,8 @@ impl AnyGenerator {
         Self::ChannelReady(ChannelReadyGenerator),
         Self::FundingFlow(FundingFlowGenerator),
         Self::DualFundingFlow(DualFundingFlowGenerator),
+        Self::SpliceFlow(SpliceFlowGenerator),
+        Self::DualFundedSpliceFlow(DualFundedSpliceFlowGenerator),
     ];
 }
 
@@ -100,6 +128,8 @@ impl Generator for AnyGenerator {
             Self::ChannelReady(generator) => generator.generate(builder, rng),
             Self::FundingFlow(generator) => generator.generate(builder, rng),
             Self::DualFundingFlow(generator) => generator.generate(builder, rng),
+            Self::SpliceFlow(generator) => generator.generate(builder, rng),
+            Self::DualFundedSpliceFlow(generator) => generator.generate(builder, rng),
         }
     }
 }
