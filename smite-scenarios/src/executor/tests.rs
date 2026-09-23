@@ -3239,12 +3239,12 @@ fn execute_send_tx_init_rbf_proposes_a_new_attempt() {
     assert_eq!(sent.tlvs.funding_output_contribution, Some(250_000));
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert_eq!(pending.attempts().count(), 2);
+    assert_eq!(pending.funding_attempts().all().count(), 2);
     let attempt = pending.attempt();
     assert_eq!(attempt.tx_exchange.shared_tx().locktime, 130);
     assert_eq!(attempt.tx_exchange.shared_tx().inputs().count(), 0);
     assert_eq!(attempt.feerate_perkw, 300);
-    assert_eq!(attempt.local_funding_satoshis, 250_000);
+    assert_eq!(attempt.local_contribution, 250_000);
     // The peer owes its tx_ack_rbf.
     assert!(pending.expects_reply());
 }
@@ -3260,7 +3260,7 @@ fn execute_recv_interactive_tx_records_the_peers_rbf_contribution() {
     fx.run(&b.build());
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert_eq!(pending.attempt().remote_funding_satoshis, 30_000);
+    assert_eq!(pending.attempt().remote_contribution, 30_000);
     assert_eq!(pending.total_funding_satoshis(), 280_000);
     assert!(!pending.expects_reply());
 }
@@ -3276,7 +3276,7 @@ fn execute_recv_interactive_tx_reads_a_negative_rbf_contribution_as_none() {
     fx.run(&b.build());
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert_eq!(pending.attempt().remote_funding_satoshis, 0);
+    assert_eq!(pending.attempt().remote_contribution, 0);
 }
 
 #[test]
@@ -3295,7 +3295,7 @@ fn execute_recv_interactive_tx_abort_of_rbf_reverts_to_the_replaced_attempt() {
     // BOLT 2 abandons only the RBF attempt: the original still funds the
     // channel.
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert_eq!(pending.attempts().count(), 1);
+    assert_eq!(pending.funding_attempts().all().count(), 1);
     assert!(!pending.attempt().tx_exchange.aborted());
     assert_eq!(pending.total_funding_satoshis(), 200_000);
     assert!(!pending.expects_reply());
@@ -3324,7 +3324,8 @@ fn execute_send_tx_add_previous_input_re_adds_our_input_without_the_wallet() {
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
     let outpoints: Vec<Vec<OutPoint>> = pending
-        .attempts()
+        .funding_attempts()
+        .all()
         .map(|attempt| {
             attempt
                 .tx_exchange
@@ -3403,7 +3404,8 @@ fn execute_recv_commitment_signed_verifies_the_rbf_replacement() {
     fx.run(&rbf_commitment_program(None, false));
     let txids: Vec<Txid> = fx
         .negotiation_v2(sample_v2_temporary_channel_id())
-        .attempts()
+        .funding_attempts()
+        .all()
         .map(|attempt| attempt.tx_exchange.shared_tx().build().compute_txid())
         .collect();
     assert_ne!(txids[0], txids[1]);
@@ -3464,7 +3466,7 @@ fn apply_peer_witnesses_fills_an_attempt_rbf_moved_past() {
         .get_mut(sample_v2_temporary_channel_id())
         .expect("negotiation");
     let original = pending.attempt().tx_exchange.shared_tx().build();
-    pending.start_rbf(0, 300, 50_000);
+    pending.funding_attempts_mut().start_rbf(0, 300, 50_000);
 
     // The original may still be the one that confirms.
     let tx = apply_peer_witnesses(&negotiations, &original);

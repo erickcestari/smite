@@ -1333,7 +1333,8 @@ fn build_tx_add_previous_input(
 
     let previous = negotiations.get(channel_id).and_then(|pending| {
         let ours: Vec<&SharedInput> = pending
-            .previous_attempt()?
+            .funding_attempts()
+            .previous()?
             .tx_exchange
             .shared_tx()
             .inputs()
@@ -1390,7 +1391,11 @@ fn build_tx_init_rbf(
     if let Some(pending) = negotiations.get_mut(channel_id)
         && pending.accept_channel2.is_some()
     {
-        pending.start_rbf(locktime, feerate, contribution);
+        pending.funding_attempts_mut().start_rbf(
+            locktime,
+            feerate,
+            i64::try_from(contribution).unwrap_or(i64::MAX),
+        );
     }
 
     TxInitRbf {
@@ -1433,15 +1438,9 @@ fn build_tx_add_output(
                 let attempt = pending.attempt();
                 let shared_tx = attempt.tx_exchange.shared_tx();
                 let fee = shared_tx.local_fee_sat(attempt.feerate_perkw, &[change_script.len()]);
-                // Whatever our inputs cover beyond our funding contribution and
-                // our share of the fee. Saturating: an under-funded selection
-                // yields a zero-value output the peer rejects, rather than a
-                // panic.
-                let value = shared_tx
-                    .contributed_input_value(Contributor::Local)
-                    .saturating_sub(attempt.local_funding_satoshis)
-                    .saturating_sub(fee);
-                (value, change_script)
+                // An under-funded selection yields a zero-value output the peer
+                // rejects, rather than a panic.
+                (attempt.local_change_value(0, fee), change_script)
             })
         }
     };
@@ -1513,17 +1512,13 @@ fn apply_interactive_tx(
                 m.message().unwrap_or("<non-utf8>"),
             );
             if let Some(pending) = negotiations.get_mut(m.channel_id) {
-                pending.abort();
+                pending.funding_attempts_mut().abort();
             }
             return Ok(());
         }
         Message::TxAckRbf(m) => {
-            // Clamped at this boundary: a funding output takes no negative
-            // contribution, and BOLT 2 reads an absent one as nothing.
-            let contribution = m
-                .tlvs
-                .funding_output_contribution
-                .map_or(0, |sats| u64::try_from(sats).unwrap_or(0));
+            // BOLT 2 reads an absent contribution as nothing.
+            let contribution = m.tlvs.funding_output_contribution.unwrap_or(0);
             if !negotiations
                 .get_mut(m.channel_id)
                 .is_some_and(|pending| pending.record_ack_rbf(contribution))
@@ -1631,9 +1626,9 @@ fn build_commitment_signed(
     let open_channel2 = pending.open_channel2.clone();
     let total_funding_satoshis = pending.total_funding_satoshis();
     let on_derived_channel_id = pending.channel_id == Some(channel_id);
-    let in_rbf = pending.in_rbf();
+    let in_rbf = pending.funding_attempts().in_rbf();
     let attempt = pending.attempt_mut();
-    let remote_funding_satoshis = attempt.remote_funding_satoshis;
+    let remote_contribution = attempt.remote_contribution;
     let already_sent = attempt.commitment_exchange.commitment_signed.sent;
     if on_derived_channel_id {
         attempt.commitment_exchange.commitment_signed.sent = true;
@@ -1673,7 +1668,9 @@ fn build_commitment_signed(
     // v2 has no `push_msat`: each side's balance is simply what it contributed
     // to the funding output. Pushing the acceptor's contribution reproduces
     // exactly that split, since the total is the sum of the two.
-    let push_msat = remote_funding_satoshis.saturating_mul(1000);
+    let push_msat = u64::try_from(remote_contribution)
+        .unwrap_or(0)
+        .saturating_mul(1000);
     let state = config.new_initial_commitment(
         push_msat,
         open_channel2.commitment_feerate_perkw,
@@ -2037,7 +2034,7 @@ fn apply_peer_witnesses(
     // whichever confirms fund the channel.
     let Some(attempt) = negotiations
         .iter()
-        .flat_map(PendingChannelV2::attempts)
+        .flat_map(|pending| pending.funding_attempts().all())
         .find(|attempt| {
             !attempt.peer_witnesses.is_empty()
                 && attempt.tx_exchange.shared_tx().build().compute_txid() == txid
