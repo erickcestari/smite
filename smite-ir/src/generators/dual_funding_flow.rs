@@ -17,6 +17,12 @@ const FUNDING_OUTPUT_SERIAL_ID: u64 = 2000;
 /// `serial_id` of our change output.
 const CHANGE_OUTPUT_SERIAL_ID: u64 = 2002;
 
+/// `serial_id` of an input we add only to remove it again.
+const DECOY_INPUT_SERIAL_ID: u64 = 1000;
+
+/// `serial_id` of an output we add only to remove it again.
+const DECOY_OUTPUT_SERIAL_ID: u64 = 2004;
+
 /// `nSequence` for the inputs we contribute. BOLT 2 caps it at `0xfffffffd` so
 /// every input signals replaceability, and recommends one shared value across
 /// implementations to avoid fingerprinting.
@@ -35,7 +41,8 @@ const LIKELY_CHANNEL_TYPES: &[ChannelTypeVariant] = &[
 /// Emits instructions to:
 /// 1. Build and send `open_channel2`, then receive `accept_channel2`
 /// 2. Contribute inputs, the funding output and a change output through
-///    interactive transaction construction, concluding with `tx_complete`
+///    interactive transaction construction, concluding with `tx_complete`;
+///    sometimes add a decoy input or output and remove it again
 /// 3. Exchange `commitment_signed`, then `tx_signatures`
 /// 4. Broadcast and confirm the funding transaction
 /// 5. Complete the `channel_ready` exchange
@@ -142,43 +149,21 @@ impl Generator for DualFundingFlowGenerator {
             &[revocation_basepoint, peer_revocation_basepoint],
         );
 
-        // Interactive transaction construction. The protocol is turn-based, so
-        // every contribution we send is followed by the peer's reply.
-        for i in 0..rng.random_range(1u8..=3) {
-            let sent = builder.append(
-                Operation::SendTxAddInput {
-                    // Even ids, as BOLT 2 requires of the initiator.
-                    serial_id: 2 * (u64::from(i) + 1),
-                    utxo_index: i,
-                    sequence: SEQUENCE,
-                },
-                &[channel_id],
-            );
-            builder.append(Operation::RecvInteractiveTx, &[sent]);
-        }
-
-        // The opener must contribute the funding output, and pays its fees.
-        for (serial_id, role) in [
-            (FUNDING_OUTPUT_SERIAL_ID, TxOutputRole::Funding),
-            (CHANGE_OUTPUT_SERIAL_ID, TxOutputRole::Change),
-        ] {
-            let sent = builder.append(
-                Operation::SendTxAddOutput { serial_id, role },
-                // The value and script are derived from the negotiation for
-                // both roles here; they matter only once a mutator switches
-                // the role to `Explicit`.
-                &[channel_id, funding_satoshis, upfront_shutdown_script],
-            );
-            builder.append(Operation::RecvInteractiveTx, &[sent]);
-        }
-
-        // The exchange ends once both sides have sent `tx_complete` back to
-        // back. If the peer already sent one, ours ends it and nothing more
-        // arrives. If the peer contributed instead, it still has to answer
-        // ours with its own `tx_complete`. The executor tells the two cases
-        // apart at runtime, so this receive reads only when a reply is owed.
-        let sent_tx_complete = builder.append(Operation::SendTxComplete, &[channel_id]);
-        builder.append(Operation::RecvInteractiveTx, &[sent_tx_complete]);
+        // Interactive transaction construction.
+        let inputs: Vec<Operation> = (0..rng.random_range(1u8..=3))
+            .map(|i| Operation::SendTxAddInput {
+                // Even ids, as BOLT 2 requires of the initiator.
+                serial_id: 2 * (u64::from(i) + 1),
+                utxo_index: i,
+                sequence: SEQUENCE,
+            })
+            .collect();
+        let session = SessionVars {
+            channel_id,
+            funding_satoshis,
+            upfront_shutdown_script,
+        };
+        construct_transaction(builder, rng, &inputs, session);
 
         // Exchange commitment signatures over the negotiated transaction.
         let funding_transaction =
@@ -219,4 +204,110 @@ impl Generator for DualFundingFlowGenerator {
         );
         builder.append(Operation::RecvChannelReady, &[]);
     }
+}
+
+/// The variables an interactive transaction construction session draws on.
+#[derive(Clone, Copy)]
+struct SessionVars {
+    channel_id: usize,
+    funding_satoshis: usize,
+    upfront_shutdown_script: usize,
+}
+
+/// Emits one interactive transaction construction session: `inputs`, the
+/// funding and change outputs, then `tx_complete`.
+///
+/// Sometimes also adds a decoy input or output and removes it again, which is
+/// the only way `tx_remove_input` and `tx_remove_output` reach the peer. Both
+/// are gone before the change output, whose value is computed from the
+/// transaction as it stands when it is sent.
+fn construct_transaction(
+    builder: &mut ProgramBuilder,
+    rng: &mut impl Rng,
+    inputs: &[Operation],
+    session: SessionVars,
+) {
+    let channel_id = session.channel_id;
+    // `SendTxAddOutput` takes the value and script alongside the channel.
+    let output_inputs = [
+        channel_id,
+        session.funding_satoshis,
+        session.upfront_shutdown_script,
+    ];
+    for input in inputs {
+        send_turn(builder, input.clone(), &[channel_id]);
+    }
+
+    if rng.random_range(0..4) == 0 {
+        send_turn(
+            builder,
+            Operation::SendTxAddInput {
+                serial_id: DECOY_INPUT_SERIAL_ID,
+                utxo_index: u8::try_from(inputs.len()).unwrap_or(u8::MAX),
+                sequence: SEQUENCE,
+            },
+            &[channel_id],
+        );
+        send_turn(
+            builder,
+            Operation::SendTxRemoveInput {
+                serial_id: DECOY_INPUT_SERIAL_ID,
+            },
+            &[channel_id],
+        );
+    }
+
+    // The opener must contribute the funding output, and pays its fees. The
+    // value and script inputs are derived from the negotiation for both
+    // roles here; they matter only once a mutator switches the role to
+    // `Explicit`.
+    send_turn(
+        builder,
+        Operation::SendTxAddOutput {
+            serial_id: FUNDING_OUTPUT_SERIAL_ID,
+            role: TxOutputRole::Funding,
+        },
+        &output_inputs,
+    );
+
+    if rng.random_range(0..4) == 0 {
+        send_turn(
+            builder,
+            Operation::SendTxAddOutput {
+                serial_id: DECOY_OUTPUT_SERIAL_ID,
+                role: TxOutputRole::Change,
+            },
+            &output_inputs,
+        );
+        send_turn(
+            builder,
+            Operation::SendTxRemoveOutput {
+                serial_id: DECOY_OUTPUT_SERIAL_ID,
+            },
+            &[channel_id],
+        );
+    }
+
+    send_turn(
+        builder,
+        Operation::SendTxAddOutput {
+            serial_id: CHANGE_OUTPUT_SERIAL_ID,
+            role: TxOutputRole::Change,
+        },
+        &output_inputs,
+    );
+
+    // The exchange ends once both sides have sent `tx_complete` back to back.
+    // If the peer already sent one, ours ends it and nothing more arrives. If
+    // the peer contributed instead, it still has to answer ours with its own
+    // `tx_complete`. The executor tells the two cases apart at runtime, so
+    // this receive reads only when a reply is owed.
+    send_turn(builder, Operation::SendTxComplete, &[channel_id]);
+}
+
+/// Appends a send followed by the receive of the peer's reply. The protocol is
+/// turn-based, so every message we send earns one.
+fn send_turn(builder: &mut ProgramBuilder, operation: Operation, inputs: &[usize]) {
+    let sent = builder.append(operation, inputs);
+    builder.append(Operation::RecvInteractiveTx, &[sent]);
 }

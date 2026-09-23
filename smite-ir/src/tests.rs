@@ -1489,6 +1489,8 @@ fn generated_dual_funding_flow_pairs_every_send_with_a_receive() {
                     op,
                     Operation::SendTxAddInput { .. }
                         | Operation::SendTxAddOutput { .. }
+                        | Operation::SendTxRemoveInput { .. }
+                        | Operation::SendTxRemoveOutput { .. }
                         | Operation::SendTxComplete
                 )
             })
@@ -1511,7 +1513,9 @@ fn generated_dual_funding_flow_uses_even_serial_ids() {
         for instr in &program.instructions {
             // BOLT 2 requires the initiator to use even serial ids.
             let (Operation::SendTxAddInput { serial_id, .. }
-            | Operation::SendTxAddOutput { serial_id, .. }) = instr.operation
+            | Operation::SendTxAddOutput { serial_id, .. }
+            | Operation::SendTxRemoveInput { serial_id }
+            | Operation::SendTxRemoveOutput { serial_id }) = instr.operation
             else {
                 continue;
             };
@@ -1522,6 +1526,57 @@ fn generated_dual_funding_flow_uses_even_serial_ids() {
             );
         }
     }
+}
+
+#[test]
+fn generated_dual_funding_flow_removes_only_what_it_added_before_the_change() {
+    let mut removals = 0;
+    for seed in 0..50 {
+        let program = generate_dual_funding_flow_program(seed);
+        let ops: Vec<_> = program.instructions.iter().map(|i| &i.operation).collect();
+
+        for (at, op) in ops.iter().enumerate() {
+            let (removed, is_input) = match op {
+                Operation::SendTxRemoveInput { serial_id } => (*serial_id, true),
+                Operation::SendTxRemoveOutput { serial_id } => (*serial_id, false),
+                _ => continue,
+            };
+            removals += 1;
+
+            // BOLT 2 only lets a peer remove what it added in this session.
+            let added = ops[..at].iter().rposition(|op| match op {
+                Operation::SendTxAddInput { serial_id, .. } => is_input && *serial_id == removed,
+                Operation::SendTxAddOutput { serial_id, .. } => !is_input && *serial_id == removed,
+                _ => false,
+            });
+            let added = added.unwrap_or_else(|| panic!("seed {seed}: removed {removed} unadded"));
+            assert!(
+                !ops[added..at]
+                    .iter()
+                    .any(|op| matches!(op, Operation::SendTxComplete)),
+                "seed {seed}: removed {removed} in a later session than it was added",
+            );
+
+            // The change output is sized from the transaction as sent, so it
+            // must come after the removal, within the same session.
+            let complete = at
+                + ops[at..]
+                    .iter()
+                    .position(|op| matches!(op, Operation::SendTxComplete))
+                    .expect("session ends with tx_complete");
+            assert!(
+                ops[at..complete].iter().any(|op| matches!(
+                    op,
+                    Operation::SendTxAddOutput {
+                        role: TxOutputRole::Change,
+                        ..
+                    }
+                )),
+                "seed {seed}: removed {removed} after the change output",
+            );
+        }
+    }
+    assert!(removals > 0, "no seed emitted a removal");
 }
 
 #[test]
