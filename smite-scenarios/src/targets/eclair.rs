@@ -8,7 +8,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1;
 use serde::Deserialize;
@@ -64,14 +64,39 @@ impl EclairConfig {
     }
 }
 
+/// How long [`EclairRpc::chain_sync`] waits for Eclair to see the tip.
+const CHAIN_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often [`EclairRpc::chain_sync`] asks Eclair for its height.
+const CHAIN_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// RPC handle for interacting with eclair node target.
 #[derive(Debug, Clone)]
-pub struct EclairRpc;
+pub struct EclairRpc {
+    api_port: u16,
+    bitcoin_cli: BitcoinCli,
+}
 
 impl TargetRpc for EclairRpc {
-    /// Eclair receives new blocks directly from bitcoind over ZMQ, so no manual
-    /// chain synchronization is required.
-    fn chain_sync(&mut self) {}
+    /// Waits until Eclair's height reaches bitcoind's tip.
+    ///
+    /// Eclair learns of blocks over ZMQ, asynchronously, and judges some
+    /// messages by its height: it refuses `tx_init_rbf` until blocks have
+    /// passed since the previous attempt. Without waiting, a message sent
+    /// right after mining races the notification.
+    fn chain_sync(&mut self) {
+        let tip = self.bitcoin_cli.get_block_count();
+        let deadline = Instant::now() + CHAIN_SYNC_TIMEOUT;
+        while Instant::now() < deadline {
+            if EclairTarget::query_info(self.api_port).is_ok_and(|(_, height)| height >= tip) {
+                return;
+            }
+            std::thread::sleep(CHAIN_SYNC_POLL_INTERVAL);
+        }
+        // An unreachable Eclair has crashed or hung, which check_alive and
+        // ping-pong report at the end.
+        log::warn!("eclair did not reach block {tip} within {CHAIN_SYNC_TIMEOUT:?}");
+    }
 }
 
 /// Eclair Lightning node target.
@@ -84,6 +109,7 @@ pub struct EclairTarget {
     bitcoind: ManagedProcess,
     pubkey: secp256k1::PublicKey,
     addr: SocketAddr,
+    api_port: u16,
     bitcoin_cli: BitcoinCli,
     #[allow(dead_code)] // TempDir auto-cleans on drop
     temp_dir: Option<tempfile::TempDir>,
@@ -146,9 +172,9 @@ impl EclairTarget {
         // until blockHeight matches the initial blocks we generated.
         log::info!("Waiting for eclair to be ready and synced...");
         for _ in 0..120 {
-            if let Ok((pubkey, blockheight)) = Self::query_info(config) {
+            if let Ok((pubkey, blockheight)) = Self::query_info(config.eclair_api_port) {
                 if blockheight >= bitcoind::INITIAL_BLOCKS {
-                    log::info!("eclair synced (blockheight={blockheight})");
+                    log::info!("eclair synced (nodeId={pubkey}, blockheight={blockheight})");
                     return Ok((eclair, pubkey));
                 }
                 log::debug!("eclair not yet synced (blockheight={blockheight})");
@@ -162,7 +188,7 @@ impl EclairTarget {
     }
 
     /// Queries Eclair's identity public key and block height via the REST API.
-    fn query_info(config: &EclairConfig) -> Result<(secp256k1::PublicKey, u64), TargetError> {
+    fn query_info(api_port: u16) -> Result<(secp256k1::PublicKey, u64), TargetError> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct GetInfoResponse {
@@ -176,10 +202,7 @@ impl EclairTarget {
             .arg("POST")
             .arg("-u")
             .arg(format!(":{API_PASSWORD}"))
-            .arg(format!(
-                "http://127.0.0.1:{}/getinfo",
-                config.eclair_api_port
-            ))
+            .arg(format!("http://127.0.0.1:{api_port}/getinfo"))
             .output()?;
 
         if !output.status.success() || output.stdout.is_empty() {
@@ -189,12 +212,6 @@ impl EclairTarget {
         let info: GetInfoResponse = serde_json::from_slice(&output.stdout).map_err(|e| {
             TargetError::StartFailed(format!("failed to parse getinfo output: {e}"))
         })?;
-
-        log::info!(
-            "Eclair nodeId: {}, blockHeight: {}",
-            info.node_id,
-            info.block_height
-        );
 
         let pubkey_bytes = hex::decode(&info.node_id)
             .map_err(|e| TargetError::StartFailed(format!("failed to decode pubkey hex: {e}")))?;
@@ -224,6 +241,7 @@ impl Target for EclairTarget {
             bitcoind,
             pubkey,
             addr,
+            api_port: config.eclair_api_port,
             bitcoin_cli,
             temp_dir,
         })
@@ -238,7 +256,10 @@ impl Target for EclairTarget {
     }
 
     fn rpc(&self) -> Self::Rpc {
-        EclairRpc
+        EclairRpc {
+            api_port: self.api_port,
+            bitcoin_cli: self.bitcoin_cli.clone(),
+        }
     }
 
     fn bitcoin_cli(&self) -> &BitcoinCli {

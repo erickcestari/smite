@@ -187,6 +187,30 @@ impl BitcoinCli {
         }
     }
 
+    /// Returns the height of the chain tip.
+    ///
+    /// # Panics
+    ///
+    /// If `bitcoin-cli getblockcount` fails to execute, exits non-zero, or
+    /// prints something other than a height.
+    #[must_use]
+    pub fn get_block_count(&self) -> u64 {
+        let out = self
+            .run()
+            .arg("getblockcount")
+            .output()
+            .expect("bitcoin-cli getblockcount should not fail");
+        assert!(
+            out.status.success(),
+            "bitcoin-cli getblockcount failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("getblockcount should return a height")
+    }
+
     /// Mines `num_blocks` blocks from the node's mempool via
     /// `bitcoin-cli -generate`.
     fn generate(&self, num_blocks: u8) {
