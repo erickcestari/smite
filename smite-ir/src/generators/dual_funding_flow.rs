@@ -23,6 +23,10 @@ const DECOY_INPUT_SERIAL_ID: u64 = 1000;
 /// `serial_id` of an output we add only to remove it again.
 const DECOY_OUTPUT_SERIAL_ID: u64 = 2004;
 
+/// Blocks that must pass after an attempt is signed before Eclair accepts
+/// `tx_init_rbf` replacing it (its `attempt-delta-blocks`).
+const RBF_DELAY_BLOCKS: u8 = 3;
+
 /// `nSequence` for the inputs we contribute. BOLT 2 caps it at `0xfffffffd` so
 /// every input signals replaceability, and recommends one shared value across
 /// implementations to avoid fingerprinting.
@@ -43,9 +47,11 @@ const LIKELY_CHANNEL_TYPES: &[ChannelTypeVariant] = &[
 /// 2. Contribute inputs, the funding output and a change output through
 ///    interactive transaction construction, concluding with `tx_complete`;
 ///    sometimes add a decoy input or output and remove it again
-/// 3. Exchange `commitment_signed`, then `tx_signatures`
-/// 4. Broadcast and confirm the funding transaction
-/// 5. Complete the `channel_ready` exchange
+/// 3. Exchange `commitment_signed`, then `tx_signatures`, and broadcast the
+///    funding transaction
+/// 4. Sometimes replace it through RBF, once or twice, repeating steps 2 and 3
+/// 5. Confirm the funding transaction and complete the `channel_ready`
+///    exchange
 #[derive(Clone, Copy)]
 pub struct DualFundingFlowGenerator;
 
@@ -76,10 +82,9 @@ impl Generator for DualFundingFlowGenerator {
             Operation::LoadAmount(rng.random_range(100_000..=1_000_000)),
             &[],
         );
-        let funding_feerate_perkw = builder.append(
-            Operation::LoadFeeratePerKw(rng.random_range(253..=2_000)),
-            &[],
-        );
+        let funding_feerate = rng.random_range(253..=2_000);
+        let funding_feerate_perkw =
+            builder.append(Operation::LoadFeeratePerKw(funding_feerate), &[]);
         let commitment_feerate_perkw = builder.append(
             Operation::LoadFeeratePerKw(rng.random_range(253..=5_000)),
             &[],
@@ -150,41 +155,48 @@ impl Generator for DualFundingFlowGenerator {
         );
 
         // Interactive transaction construction.
-        let inputs: Vec<Operation> = (0..rng.random_range(1u8..=3))
-            .map(|i| Operation::SendTxAddInput {
-                // Even ids, as BOLT 2 requires of the initiator.
-                serial_id: 2 * (u64::from(i) + 1),
-                utxo_index: i,
-                sequence: SEQUENCE,
-            })
-            .collect();
+        let mut num_inputs = rng.random_range(1u8..=3);
+        let inputs: Vec<Operation> = (0..num_inputs).map(wallet_input).collect();
         let session = SessionVars {
             channel_id,
             funding_satoshis,
             upfront_shutdown_script,
         };
         construct_transaction(builder, rng, &inputs, session);
+        let funded_channel_id = sign_and_broadcast(builder, channel_id, funding_privkey);
 
-        // Exchange commitment signatures over the negotiated transaction.
-        let funding_transaction =
-            builder.append(Operation::BuildFundingTransactionV2, &[channel_id]);
-        let sent_commitment_signed = builder.append(
-            Operation::SendCommitmentSigned,
-            &[funding_transaction, funding_privkey, channel_id],
-        );
-        let funded_channel_id =
-            builder.append(Operation::RecvCommitmentSigned, &[sent_commitment_signed]);
+        // Fee-bump the funding transaction before it confirms.
+        if rng.random() {
+            let mut feerate = funding_feerate;
+            for _ in 0..rng.random_range(1..=2) {
+                feerate = min_rbf_feerate(feerate) + rng.random_range(0..=500);
+                // Empty, since a block confirming the funding transaction
+                // would end RBF.
+                builder.append(Operation::MineEmptyBlocks(RBF_DELAY_BLOCKS), &[]);
+                let rbf_feerate = builder.append(Operation::LoadFeeratePerKw(feerate), &[]);
+                send_turn(
+                    builder,
+                    Operation::SendTxInitRbf {
+                        require_confirmed_inputs: rng.random_range(0..8) == 0,
+                    },
+                    &[channel_id, locktime, rbf_feerate, funding_satoshis],
+                );
 
-        // We contribute every input, so BOLT 2 has the peer send its
-        // tx_signatures first.
-        builder.append(Operation::RecvTxSignatures, &[channel_id]);
-        builder.append(
-            Operation::SendTxSignatures,
-            &[channel_id, funding_transaction],
-        );
-        builder.append(Operation::RecvTxSignatures, &[channel_id]);
+                // Re-adding every input of the attempt being replaced keeps
+                // the first coin in every attempt, and at no less weight and
+                // a higher feerate pays a strictly higher fee, as CLN and
+                // BIP125 both require.
+                let fresh_inputs = rng.random_range(0..=1);
+                let inputs: Vec<Operation> = (0..num_inputs)
+                    .map(previous_input)
+                    .chain((num_inputs..num_inputs + fresh_inputs).map(wallet_input))
+                    .collect();
+                num_inputs += fresh_inputs;
+                construct_transaction(builder, rng, &inputs, session);
+                sign_and_broadcast(builder, channel_id, funding_privkey);
+            }
+        }
 
-        builder.append(Operation::BroadcastTransaction, &[funding_transaction]);
         builder.append(Operation::MineBlocks(rng.random_range(1..=16)), &[]);
 
         // Reuse the second_per_commitment_point already committed to in
@@ -204,6 +216,65 @@ impl Generator for DualFundingFlowGenerator {
         );
         builder.append(Operation::RecvChannelReady, &[]);
     }
+}
+
+/// The `index`th input we contribute from the wallet.
+fn wallet_input(index: u8) -> Operation {
+    Operation::SendTxAddInput {
+        serial_id: input_serial_id(index),
+        utxo_index: index,
+        sequence: SEQUENCE,
+    }
+}
+
+/// The `index`th input we contribute by re-adding one of the attempt being
+/// replaced.
+fn previous_input(index: u8) -> Operation {
+    Operation::SendTxAddPreviousInput {
+        serial_id: input_serial_id(index),
+        input_index: index,
+        sequence: SEQUENCE,
+    }
+}
+
+/// Even ids, as BOLT 2 requires of the initiator.
+fn input_serial_id(index: u8) -> u64 {
+    2 * (u64::from(index) + 1)
+}
+
+/// The lowest feerate BOLT 2 lets `tx_init_rbf` propose after `previous`:
+/// 25/24 of it, rounded down, and at least 25 sat/kw more.
+fn min_rbf_feerate(previous: u32) -> u32 {
+    (previous.saturating_mul(25) / 24).max(previous.saturating_add(25))
+}
+
+/// Exchanges `commitment_signed` and `tx_signatures` over the transaction the
+/// session on `channel_id` built, then broadcasts it. Returns the
+/// `channel_id` the peer's `commitment_signed` carries.
+fn sign_and_broadcast(
+    builder: &mut ProgramBuilder,
+    channel_id: usize,
+    funding_privkey: usize,
+) -> usize {
+    let funding_transaction = builder.append(Operation::BuildFundingTransactionV2, &[channel_id]);
+    let sent_commitment_signed = builder.append(
+        Operation::SendCommitmentSigned,
+        &[funding_transaction, funding_privkey, channel_id],
+    );
+    let funded_channel_id =
+        builder.append(Operation::RecvCommitmentSigned, &[sent_commitment_signed]);
+
+    // We contribute every input, so BOLT 2 has the peer send its
+    // tx_signatures first.
+    builder.append(Operation::RecvTxSignatures, &[channel_id]);
+    builder.append(
+        Operation::SendTxSignatures,
+        &[channel_id, funding_transaction],
+    );
+    builder.append(Operation::RecvTxSignatures, &[channel_id]);
+
+    builder.append(Operation::BroadcastTransaction, &[funding_transaction]);
+    funded_channel_id
 }
 
 /// The variables an interactive transaction construction session draws on.

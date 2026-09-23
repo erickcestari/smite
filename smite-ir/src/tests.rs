@@ -1597,10 +1597,12 @@ fn generated_dual_funding_flow_pairs_every_send_with_a_receive() {
                 matches!(
                     op,
                     Operation::SendTxAddInput { .. }
+                        | Operation::SendTxAddPreviousInput { .. }
                         | Operation::SendTxAddOutput { .. }
                         | Operation::SendTxRemoveInput { .. }
                         | Operation::SendTxRemoveOutput { .. }
                         | Operation::SendTxComplete
+                        | Operation::SendTxInitRbf { .. }
                 )
             })
             .count();
@@ -1622,6 +1624,7 @@ fn generated_dual_funding_flow_uses_even_serial_ids() {
         for instr in &program.instructions {
             // BOLT 2 requires the initiator to use even serial ids.
             let (Operation::SendTxAddInput { serial_id, .. }
+            | Operation::SendTxAddPreviousInput { serial_id, .. }
             | Operation::SendTxAddOutput { serial_id, .. }
             | Operation::SendTxRemoveInput { serial_id }
             | Operation::SendTxRemoveOutput { serial_id }) = instr.operation
@@ -1686,6 +1689,148 @@ fn generated_dual_funding_flow_removes_only_what_it_added_before_the_change() {
         }
     }
     assert!(removals > 0, "no seed emitted a removal");
+}
+
+/// The operations of each generated dual funding program that has RBF rounds,
+/// for the first `seeds` seeds.
+fn generated_rbf_programs(seeds: u64) -> Vec<(u64, Vec<Operation>)> {
+    let programs: Vec<_> = (0..seeds)
+        .map(|seed| {
+            let program = generate_dual_funding_flow_program(seed);
+            let ops = program.instructions.into_iter().map(|i| i.operation);
+            (seed, ops.collect::<Vec<_>>())
+        })
+        .filter(|(_, ops)| {
+            ops.iter()
+                .any(|op| matches!(op, Operation::SendTxInitRbf { .. }))
+        })
+        .collect();
+    assert!(!programs.is_empty(), "no seed emitted an RBF round");
+    programs
+}
+
+#[test]
+fn generated_dual_funding_flow_replaces_only_a_broadcast_unconfirmed_transaction() {
+    for (seed, ops) in generated_rbf_programs(50) {
+        let position = |pred: fn(&Operation) -> bool| ops.iter().position(pred);
+        let first_broadcast =
+            position(|op| matches!(op, Operation::BroadcastTransaction)).expect("broadcast");
+        let mine = position(|op| matches!(op, Operation::MineBlocks(_))).expect("mine");
+        let send_ready =
+            position(|op| matches!(op, Operation::SendChannelReady { .. })).expect("ready");
+
+        for (at, _) in ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op, Operation::SendTxInitRbf { .. }))
+        {
+            // BOLT 2 replaces a broadcast transaction, before channel_ready,
+            // and nothing may confirm it first.
+            assert!(
+                first_broadcast < at && at < mine && mine < send_ready,
+                "seed {seed}"
+            );
+            // Eclair refuses RBF until blocks have passed since the last
+            // attempt.
+            let last_broadcast = ops[..at]
+                .iter()
+                .rposition(|op| matches!(op, Operation::BroadcastTransaction))
+                .expect("broadcast");
+            assert!(
+                ops[last_broadcast..at]
+                    .iter()
+                    .any(|op| matches!(op, Operation::MineEmptyBlocks(3..))),
+                "seed {seed}: tx_init_rbf without empty blocks since the last attempt",
+            );
+        }
+    }
+}
+
+#[test]
+fn generated_dual_funding_flow_rbf_feerates_follow_the_bump_rule() {
+    for seed in 0..50 {
+        let program = generate_dual_funding_flow_program(seed);
+        let feerate = |at: usize, input: usize| {
+            let loaded = program.instructions[at].inputs[input];
+            let Operation::LoadFeeratePerKw(feerate) = program.instructions[loaded].operation
+            else {
+                panic!("seed {seed}: feerate is not a LoadFeeratePerKw");
+            };
+            feerate
+        };
+
+        // open_channel2's funding feerate, then each tx_init_rbf's.
+        let feerates: Vec<u32> = program
+            .instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(at, instr)| match instr.operation {
+                Operation::BuildOpenChannel2 { .. } | Operation::SendTxInitRbf { .. } => {
+                    Some(feerate(at, 2))
+                }
+                _ => None,
+            })
+            .collect();
+        for pair in feerates.windows(2) {
+            let min = (pair[0] * 25 / 24).max(pair[0] + 25);
+            assert!(pair[1] >= min, "seed {seed}: feerates {feerates:?}");
+        }
+    }
+}
+
+#[test]
+fn generated_dual_funding_flow_rbf_re_adds_every_previous_input() {
+    for (seed, ops) in generated_rbf_programs(50) {
+        // Inputs each session keeps, sessions ending at tx_complete.
+        let mut kept_per_session = vec![0usize];
+        let mut previous_indexes_per_session = vec![Vec::new()];
+        for op in &ops {
+            let kept = kept_per_session.last_mut().expect("a session");
+            match op {
+                Operation::SendTxAddInput { .. } => *kept += 1,
+                Operation::SendTxRemoveInput { .. } => *kept -= 1,
+                Operation::SendTxAddPreviousInput { input_index, .. } => {
+                    *kept += 1;
+                    previous_indexes_per_session
+                        .last_mut()
+                        .expect("a session")
+                        .push(*input_index);
+                }
+                Operation::SendTxComplete => {
+                    kept_per_session.push(0);
+                    previous_indexes_per_session.push(Vec::new());
+                }
+                _ => {}
+            }
+        }
+
+        // Every replacement re-adds each input of the attempt it replaces.
+        // The entry after the last tx_complete is a session never started.
+        let sessions = kept_per_session.len() - 1;
+        assert!(sessions >= 2, "seed {seed}: RBF without a second session");
+        for session in 1..sessions {
+            let previous = u8::try_from(kept_per_session[session - 1]).expect("few inputs");
+            assert_eq!(
+                previous_indexes_per_session[session],
+                (0..previous).collect::<Vec<_>>(),
+                "seed {seed}: session {session}",
+            );
+        }
+        assert!(
+            previous_indexes_per_session[0].is_empty(),
+            "seed {seed}: first session re-adds inputs",
+        );
+    }
+}
+
+#[test]
+fn generated_dual_funding_flow_program_roundtrips_postcard() {
+    for seed in 0..20 {
+        let program = generate_dual_funding_flow_program(seed);
+        let bytes = postcard::to_allocvec(&program).expect("postcard serialization");
+        let decoded: Program = postcard::from_bytes(&bytes).expect("postcard deserialization");
+        assert_eq!(program, decoded, "seed {seed}");
+    }
 }
 
 #[test]

@@ -1759,13 +1759,14 @@ fn track_channel_state(
 /// signature does not verify, or [`Violation::UnexpectedHtlcSignatures`] if it
 /// carries HTLC signatures, which BOLT 2 forbids for a v2 open.
 ///
-/// A `commitment_signed` we have no state for is only reported when the
-/// negotiation it names is one we sent our own `commitment_signed` on. Anything
-/// else is our own doing rather than the target's: a mutated program may have
-/// dropped the `accept_channel2` that would have established the state, or
-/// pointed `SendCommitmentSigned` at a different `channel_id` than the one the
-/// peer answers on, and blaming the target for either would be a false
-/// positive.
+/// A `commitment_signed` is only judged when the attempt it answers is one we
+/// sent our own `commitment_signed` on. Anything else is our own doing rather
+/// than the target's: a mutated program may have dropped the `accept_channel2`
+/// that would have established the state, or pointed `SendCommitmentSigned` at
+/// a different `channel_id` than the one the peer answers on, and blaming the
+/// target for either would be a false positive. After an RBF, the latter also
+/// leaves the replaced attempt's state tracked, which the peer's signature
+/// over the replacement cannot verify against.
 ///
 /// The signature itself is checked only when our commitment was built over the
 /// negotiated funding outpoint. `SendCommitmentSigned` takes the funding
@@ -1796,11 +1797,6 @@ fn verify_commitment_signed(
             );
             return Ok(());
         }
-        log::debug!(
-            "commitment_signed for {} with no v2 commitment exchange in flight, ignoring",
-            cs.channel_id,
-        );
-        return Ok(());
     };
 
     if !state.is_funding_outpoint_valid {
