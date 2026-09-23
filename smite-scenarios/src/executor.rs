@@ -1180,6 +1180,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
     /// set, which BOLT 2 forbids a reply. The peer never starts quiescence
     /// here, so its `stfu` is always a reply.
     fn record_stfu(&mut self, stfu: &Stfu) -> Result<(), Violation> {
+        log::debug!("stfu on {}: initiator={}", stfu.channel_id, stfu.initiator);
         let exchange = self.quiescence.entry(stfu.channel_id).or_default();
         let answers_ours = exchange.sent && !exchange.received;
         exchange.received = true;
