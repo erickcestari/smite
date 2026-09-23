@@ -303,7 +303,8 @@ impl Fixture {
     /// derived `channel_id`.
     pub fn negotiation_v2(&self, id: ChannelId) -> &PendingChannelV2 {
         self.executor
-            .negotiations_v2
+            .funding_negotiations
+            .opens
             .get(id)
             .expect("v2 negotiation recorded")
     }

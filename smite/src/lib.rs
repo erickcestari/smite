@@ -12,6 +12,7 @@
 //! - [`noise`] - BOLT 8 `Noise_XK` encrypted transport.
 //! - [`oracles`] - Protocol invariant checks.
 //! - [`pending_channel`] - BOLT 2 channel negotiation state.
+//! - [`pending_splice`] - BOLT 2 splice negotiation state.
 //! - [`process`] - Managed subprocess utilities.
 //! - [`runners`] - Fuzz input delivery (Nyx and local modes).
 //! - [`scenarios`] - Scenario trait and the [`scenarios::smite_run`] entry point.
@@ -25,6 +26,7 @@ pub mod noise;
 pub mod nyx_log;
 pub mod oracles;
 pub mod pending_channel;
+pub mod pending_splice;
 pub mod process;
 pub mod runners;
 pub mod scenarios;
