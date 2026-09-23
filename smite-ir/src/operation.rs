@@ -506,6 +506,23 @@ pub enum Operation {
         /// See [`Self::SendTxAddInput::sequence`].
         sequence: u32,
     },
+    /// Send `splice_locked` (BOLT 2, type 77), naming the splice transaction
+    /// as locked.
+    ///
+    /// Once both peers have sent one for the same transaction, the channel
+    /// moves onto its funding output.
+    ///
+    /// Inputs (2):
+    ///   0: `channel_id` (`ChannelId`)
+    ///   1: the splice transaction (`FundingTransaction`)
+    SendSpliceLocked,
+    /// Receive the peer's `splice_locked`.
+    ///
+    /// A no-op unless the peer owes one: a splice transaction both peers
+    /// signed has the channel's `minimum_depth`.
+    ///
+    /// Input: `channel_id` (`ChannelId`).
+    RecvSpliceLocked,
 }
 
 /// Where a `tx_add_output`'s value and script come from.
@@ -985,6 +1002,8 @@ impl fmt::Display for Operation {
                 f,
                 "SendTxAddSharedInput{{serial_id={serial_id}, sequence={sequence}}}"
             ),
+            Self::SendSpliceLocked => write!(f, "SendSpliceLocked"),
+            Self::RecvSpliceLocked => write!(f, "RecvSpliceLocked"),
         }
     }
 }
@@ -1033,7 +1052,9 @@ impl Operation {
             | Self::RecvInteractiveTx
             | Self::RecvTxSignatures
             | Self::SendTxSignatures
-            | Self::RecvStfu => None,
+            | Self::RecvStfu
+            | Self::SendSpliceLocked
+            | Self::RecvSpliceLocked => None,
             Self::SendStfu { .. } => Some(VariableType::SentStfu),
             Self::SendOpenChannel => Some(VariableType::SentOpenChannel),
             Self::ExtractAcceptChannel2(field) => Some(field.output_type()),
@@ -1191,7 +1212,12 @@ impl Operation {
             | Self::SendTxRemoveOutput { .. }
             | Self::SendTxComplete
             | Self::SendStfu { .. }
-            | Self::SendTxAddSharedInput { .. } => vec![VariableType::ChannelId],
+            | Self::SendTxAddSharedInput { .. }
+            | Self::RecvSpliceLocked => vec![VariableType::ChannelId],
+            Self::SendSpliceLocked => vec![
+                VariableType::ChannelId,          // channel_id
+                VariableType::FundingTransaction, // the splice transaction
+            ],
             Self::SendSpliceInit { .. } => vec![
                 VariableType::ChannelId,    // channel_id
                 VariableType::Contribution, // funding_contribution_satoshis
@@ -1319,7 +1345,9 @@ impl Operation {
             | Self::RecvStfu
             | Self::LoadContribution(_)
             | Self::SendSpliceInit { .. }
-            | Self::SendTxAddSharedInput { .. } => vec![],
+            | Self::SendTxAddSharedInput { .. }
+            | Self::SendSpliceLocked
+            | Self::RecvSpliceLocked => vec![],
 
             Self::RecvAcceptChannel => AcceptChannelField::ALL
                 .iter()
@@ -1397,7 +1425,9 @@ impl Operation {
             | Self::SendStfu { .. }
             | Self::RecvStfu
             | Self::SendSpliceInit { .. }
-            | Self::SendTxAddSharedInput { .. } => true,
+            | Self::SendTxAddSharedInput { .. }
+            | Self::SendSpliceLocked
+            | Self::RecvSpliceLocked => true,
         }
     }
 
@@ -1447,6 +1477,7 @@ impl Operation {
             | Self::SendTxRemoveOutput { .. }
             | Self::SendTxComplete
             | Self::SendStfu { .. }
+            | Self::SendSpliceLocked
             | Self::LoadContribution(_) => true,
             // `CreateFundingTransaction` selects coins from the wallet, whose
             // contents change as transactions are created and broadcast.
@@ -1482,7 +1513,8 @@ impl Operation {
             | Self::LookupShortChannelId
             | Self::RecvStfu
             | Self::SendSpliceInit { .. }
-            | Self::SendTxAddSharedInput { .. } => false,
+            | Self::SendTxAddSharedInput { .. }
+            | Self::RecvSpliceLocked => false,
         }
     }
 
@@ -1559,7 +1591,9 @@ impl Operation {
             | Self::RecvCommitmentSigned
             | Self::RecvTxSignatures
             | Self::SendTxSignatures
-            | Self::RecvStfu => false,
+            | Self::RecvStfu
+            | Self::SendSpliceLocked
+            | Self::RecvSpliceLocked => false,
         }
     }
 }
