@@ -1640,6 +1640,7 @@ fn execute_send_tx_add_input_proposes_a_wallet_utxo() {
     // change output can be computed from it.
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
     let (serial_id, input) = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .inputs()
@@ -1737,6 +1738,27 @@ fn execute_send_tx_add_output_change_covers_the_funding_and_the_fee() {
 }
 
 #[test]
+fn execute_send_tx_add_output_funds_both_contributions_and_changes_only_ours() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b).channel_id;
+    send_tx_add_input(&mut b, channel_id, 2, 0);
+    send_tx_add_output(&mut b, channel_id, 4, TxOutputRole::Funding);
+    send_tx_add_output(&mut b, channel_id, 6, TxOutputRole::Change);
+
+    let mut accept = sample_accept_channel2(sample_v2_temporary_channel_id());
+    accept.funding_satoshis = 50_000;
+    let mut fx = Fixture::new()
+        .with_v2_wallet()
+        .queue(&Message::AcceptChannel2(accept));
+    fx.run(&b.build());
+
+    // The funding output holds both contributions, but our change gives up
+    // only ours: the peer's inputs pay for the rest.
+    assert_eq!(fx.sent::<TxAddOutput>(2).sats, 250_000);
+    assert_eq!(fx.sent::<TxAddOutput>(3).sats, 100_000_000 - 200_000 - 155);
+}
+
+#[test]
 fn execute_send_tx_add_output_explicit_uses_its_inputs() {
     let mut b = ProgramBuilder::new();
     let channel_id = negotiate_v2_channel(&mut b).channel_id;
@@ -1777,6 +1799,7 @@ fn execute_send_tx_remove_input_keeps_the_peers_input() {
     // Ours is gone, the peer's survives.
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
     let remaining: Vec<u64> = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .inputs()
@@ -1815,6 +1838,7 @@ fn execute_send_tx_remove_output_keeps_the_peers_output() {
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
     let remaining: Vec<u64> = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .outputs()
@@ -1836,6 +1860,7 @@ fn execute_recv_interactive_tx_records_peer_contributions() {
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
     let (serial_id, input) = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .inputs()
@@ -1846,7 +1871,7 @@ fn execute_recv_interactive_tx_records_peer_contributions() {
     assert_eq!(input.value(), 100_000_000);
     // The peer answered with a contribution, not a tx_complete, so our
     // tx_complete did not conclude the exchange.
-    assert!(!pending.tx_exchange.concluded());
+    assert!(!pending.attempt().tx_exchange.concluded());
 }
 
 #[test]
@@ -1869,6 +1894,7 @@ fn execute_recv_interactive_tx_remove_input_keeps_our_input() {
     // The peer's illegal removal left ours in place; its own is gone.
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
     let remaining: Vec<u64> = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .inputs()
@@ -1896,6 +1922,7 @@ fn execute_recv_interactive_tx_remove_output_keeps_our_output() {
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
     let remaining: Vec<u64> = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .outputs()
@@ -1919,8 +1946,8 @@ fn execute_recv_interactive_tx_for_an_unknown_channel_is_ignored() {
     // own view, so nothing is invented on our side: the reply to our
     // tx_complete is still owed.
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert!(!pending.tx_exchange.concluded());
-    assert_eq!(pending.tx_exchange.outstanding_replies(), 1);
+    assert!(!pending.attempt().tx_exchange.concluded());
+    assert_eq!(pending.attempt().tx_exchange.outstanding_replies(), 1);
 }
 
 #[test]
@@ -1975,7 +2002,7 @@ fn execute_build_funding_transaction_v2_locates_the_funding_output() {
     let secp = Secp256k1::new();
     let funding_pubkey =
         PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x11; 32]).unwrap());
-    let funding = pending.tx_exchange.shared_tx().build_funding(
+    let funding = pending.attempt().tx_exchange.shared_tx().build_funding(
         &build_funding_witness_script(
             &funding_pubkey,
             &sample_accept_channel2(sample_v2_temporary_channel_id()).funding_pubkey,
@@ -2029,6 +2056,7 @@ fn execute_recv_interactive_tx_stops_once_the_exchange_concludes() {
 
     assert_eq!(
         fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .tx_exchange
             .outstanding_replies(),
         0,
@@ -2071,6 +2099,7 @@ fn execute_recv_interactive_tx_settles_a_backlog_left_by_a_dropped_receive() {
     // for the operation that actually wants it.
     assert_eq!(
         fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .tx_exchange
             .outstanding_replies(),
         0,
@@ -2110,9 +2139,10 @@ fn execute_recv_interactive_tx_drops_contributions_sent_after_the_conclusion() {
     fx.run(&b.build());
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert!(pending.tx_exchange.concluded());
-    assert_eq!(pending.tx_exchange.outstanding_replies(), 0);
+    assert!(pending.attempt().tx_exchange.concluded());
+    assert_eq!(pending.attempt().tx_exchange.outstanding_replies(), 0);
     let inputs: Vec<u64> = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .inputs()
@@ -2120,6 +2150,7 @@ fn execute_recv_interactive_tx_drops_contributions_sent_after_the_conclusion() {
         .collect();
     assert_eq!(inputs, vec![2, 4, 6]);
     let outputs: Vec<u64> = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .outputs()
@@ -2150,9 +2181,10 @@ fn execute_send_after_a_known_conclusion_is_not_recorded() {
     fx.run(&b.build());
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert!(pending.tx_exchange.concluded());
-    assert_eq!(pending.tx_exchange.outstanding_replies(), 0);
+    assert!(pending.attempt().tx_exchange.concluded());
+    assert_eq!(pending.attempt().tx_exchange.outstanding_replies(), 0);
     let outputs: Vec<u64> = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .outputs()
@@ -2181,8 +2213,8 @@ fn execute_recv_interactive_tx_still_reads_mid_exchange() {
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
     // The peer still owes two replies and the next receive must not skip
     // either.
-    assert!(!pending.tx_exchange.concluded());
-    assert_eq!(pending.tx_exchange.outstanding_replies(), 2);
+    assert!(!pending.attempt().tx_exchange.concluded());
+    assert_eq!(pending.attempt().tx_exchange.outstanding_replies(), 2);
 }
 
 // -- Commitment and signature exchange --
@@ -2358,6 +2390,7 @@ fn execute_recv_commitment_signed_accepts_a_valid_signature() {
 
     assert!(
         fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .commitment_exchange
             .commitment_signed
             .received
@@ -2480,6 +2513,7 @@ fn execute_recv_commitment_signed_after_sending_on_the_temporary_id_is_ignored()
     );
     assert!(
         !fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .commitment_exchange
             .commitment_signed
             .sent
@@ -2586,6 +2620,7 @@ fn execute_send_tx_signatures_carries_our_witnesses() {
     assert_eq!(
         sent.txid,
         fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .tx_exchange
             .shared_tx()
             .build()
@@ -2639,6 +2674,7 @@ fn execute_recv_tx_signatures_is_a_noop_before_the_commitment_exchange() {
     assert_eq!(fx.queued_len(), 0);
     assert!(
         !fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .commitment_exchange
             .tx_signatures
             .received
@@ -2656,8 +2692,16 @@ fn negotiation_awaiting_tx_signatures(local_value: u64, remote_value: u64) -> V2
         let pending = negotiations
             .get_mut(v2_channel_id())
             .expect("record_accept paired the negotiation");
-        pending.commitment_exchange.commitment_signed.sent = true;
-        pending.commitment_exchange.commitment_signed.received = true;
+        pending
+            .attempt_mut()
+            .commitment_exchange
+            .commitment_signed
+            .sent = true;
+        pending
+            .attempt_mut()
+            .commitment_exchange
+            .commitment_signed
+            .received = true;
 
         let prevtx = sample_prevtx();
         let add_input = |serial_id: u64, value: u64, contributor| Step::AddInput {
@@ -2676,16 +2720,19 @@ fn negotiation_awaiting_tx_signatures(local_value: u64, remote_value: u64) -> V2
             },
         };
         // One turn each way, so nothing is left owed.
-        pending.tx_exchange.send(if local_value > 0 {
+        pending.attempt_mut().tx_exchange.send(if local_value > 0 {
             add_input(2, local_value, Contributor::Local)
         } else {
             Step::Complete
         });
-        pending.tx_exchange.receive(if remote_value > 0 {
-            add_input(3, remote_value, Contributor::Remote)
-        } else {
-            Step::Complete
-        });
+        pending
+            .attempt_mut()
+            .tx_exchange
+            .receive(if remote_value > 0 {
+                add_input(3, remote_value, Contributor::Remote)
+            } else {
+                Step::Complete
+            });
     }
 
     negotiations
@@ -2745,6 +2792,7 @@ fn tx_signatures_not_expected_once_received() {
     negotiations
         .get_mut(sample_v2_temporary_channel_id())
         .expect("negotiation")
+        .attempt_mut()
         .commitment_exchange
         .tx_signatures
         .received = true;
@@ -2762,6 +2810,7 @@ fn tx_signatures_not_expected_after_an_abort() {
     negotiations
         .get_mut(sample_v2_temporary_channel_id())
         .expect("negotiation")
+        .attempt_mut()
         .tx_exchange
         .abort();
 
@@ -2788,6 +2837,7 @@ fn tx_signatures_expected_once_the_peer_has_received_ours() {
     negotiations
         .get_mut(sample_v2_temporary_channel_id())
         .expect("negotiation")
+        .attempt_mut()
         .commitment_exchange
         .tx_signatures
         .sent = true;
@@ -2808,6 +2858,7 @@ fn negotiation_with_peer_witnesses(witnesses: Vec<Witness>) -> V2Negotiations {
     negotiations
         .get_mut(sample_v2_temporary_channel_id())
         .expect("negotiation")
+        .attempt_mut()
         .peer_witnesses = witnesses;
     negotiations
 }
@@ -2818,6 +2869,7 @@ fn apply_peer_witnesses_fills_only_the_peers_inputs() {
     let unsigned = negotiations
         .get(sample_v2_temporary_channel_id())
         .expect("negotiation")
+        .attempt()
         .tx_exchange
         .shared_tx()
         .build();
@@ -2945,6 +2997,7 @@ fn execute_recv_tx_signatures_reads_when_the_peer_signs_first() {
     // the receive is expected rather than skipped.
     assert!(
         fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .commitment_exchange
             .tx_signatures
             .received
@@ -2963,9 +3016,10 @@ fn execute_build_funding_transaction_v2_reads_owed_replies_first() {
     // dropped the change output, so the transaction we signed over is the
     // one the peer negotiated.
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert!(pending.tx_exchange.concluded());
-    assert_eq!(pending.tx_exchange.outstanding_replies(), 0);
+    assert!(pending.attempt().tx_exchange.concluded());
+    assert_eq!(pending.attempt().tx_exchange.outstanding_replies(), 0);
     let outputs: Vec<u64> = pending
+        .attempt()
         .tx_exchange
         .shared_tx()
         .outputs()
@@ -2976,7 +3030,12 @@ fn execute_build_funding_transaction_v2_reads_owed_replies_first() {
     assert!(state.is_funding_outpoint_valid);
     assert_eq!(
         state.config.funding_outpoint.txid,
-        pending.tx_exchange.shared_tx().build().compute_txid(),
+        pending
+            .attempt()
+            .tx_exchange
+            .shared_tx()
+            .build()
+            .compute_txid(),
     );
     // Only what was owed was read: the peer's commitment_signed is still
     // there for RecvCommitmentSigned, and the receive after the send found
@@ -3010,6 +3069,7 @@ fn execute_recv_commitment_signed_verifies_against_the_settled_funding_transacti
         )
         .to_p2wsh();
         let funding = pending
+            .attempt()
             .tx_exchange
             .shared_tx()
             .build_funding(&script, pending.total_funding_satoshis());
@@ -3033,6 +3093,7 @@ fn execute_recv_commitment_signed_verifies_against_the_settled_funding_transacti
 
     assert!(
         fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .commitment_exchange
             .commitment_signed
             .received
@@ -3055,6 +3116,7 @@ fn execute_send_tx_signatures_reads_owed_replies_first() {
     assert_eq!(fx.queued_len(), 0, "the reply was not read");
     assert_eq!(
         fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
             .tx_exchange
             .outstanding_replies(),
         0
@@ -3076,7 +3138,7 @@ fn execute_recv_interactive_tx_records_a_peer_abort() {
     fx.run(&b.build());
 
     let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
-    assert!(pending.tx_exchange.aborted());
+    assert!(pending.attempt().tx_exchange.aborted());
     // An abort is not a tx_complete, so the negotiation has not concluded.
-    assert!(!pending.tx_exchange.concluded());
+    assert!(!pending.attempt().tx_exchange.concluded());
 }

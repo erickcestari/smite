@@ -36,12 +36,41 @@ pub struct PendingChannelV2 {
     /// The v2 `channel_id`, known once `accept_channel2` reveals the peer's
     /// revocation basepoint.
     pub channel_id: Option<ChannelId>,
+    /// The attempt `open_channel2` and `accept_channel2` started.
+    first_attempt: FundingAttempt,
+    /// Attempts started by RBF, oldest first.
+    rbf_attempts: Vec<FundingAttempt>,
+}
+
+/// One attempt at building and signing the funding transaction.
+pub struct FundingAttempt {
     /// The interactive transaction exchange and the transaction it builds.
     pub tx_exchange: TxExchange,
     /// Progress through the commitment and signature exchange that follows it.
     pub commitment_exchange: CommitmentExchange,
     /// Witnesses from the peer's `tx_signatures`
     pub peer_witnesses: Vec<Witness>,
+    /// Feerate the funding transaction pays, in satoshis per kilo-weight.
+    pub feerate_perkw: u32,
+    /// What we contribute to the funding output.
+    pub local_funding_satoshis: u64,
+    /// What the peer contributes to the funding output; 0 until it says.
+    pub remote_funding_satoshis: u64,
+}
+
+impl FundingAttempt {
+    /// Starts an attempt whose transaction has the given `nLockTime`.
+    #[must_use]
+    pub fn new(locktime: u32, feerate_perkw: u32, local_funding_satoshis: u64) -> Self {
+        Self {
+            tx_exchange: TxExchange::new(locktime),
+            commitment_exchange: CommitmentExchange::default(),
+            peer_witnesses: Vec::new(),
+            feerate_perkw,
+            local_funding_satoshis,
+            remote_funding_satoshis: 0,
+        }
+    }
 }
 
 /// Progress through a two-way exchange of one message type.
@@ -68,19 +97,46 @@ pub struct CommitmentExchange {
 }
 
 impl PendingChannelV2 {
-    /// Starts a negotiation from the `open_channel2` we sent, taking the
-    /// shared transaction's `nLockTime` from it.
+    /// Starts a negotiation from the `open_channel2` we sent, whose first
+    /// attempt takes its `nLockTime`, feerate and contribution from it.
     #[must_use]
     pub fn new(open_channel2: OpenChannel2) -> Self {
-        let tx_exchange = TxExchange::new(open_channel2.locktime);
+        let first_attempt = FundingAttempt::new(
+            open_channel2.locktime,
+            open_channel2.funding_feerate_perkw,
+            open_channel2.funding_satoshis,
+        );
         Self {
             open_channel2,
             accept_channel2: None,
             channel_id: None,
-            tx_exchange,
-            commitment_exchange: CommitmentExchange::default(),
-            peer_witnesses: Vec::new(),
+            first_attempt,
+            rbf_attempts: Vec::new(),
         }
+    }
+
+    /// The latest attempt at the funding transaction.
+    #[must_use]
+    pub fn attempt(&self) -> &FundingAttempt {
+        self.rbf_attempts.last().unwrap_or(&self.first_attempt)
+    }
+
+    /// Mutable sibling of [`Self::attempt`].
+    pub fn attempt_mut(&mut self) -> &mut FundingAttempt {
+        self.rbf_attempts
+            .last_mut()
+            .unwrap_or(&mut self.first_attempt)
+    }
+
+    /// Every attempt at the funding transaction, oldest first.
+    pub fn attempts(&self) -> impl Iterator<Item = &FundingAttempt> {
+        std::iter::once(&self.first_attempt).chain(&self.rbf_attempts)
+    }
+
+    /// Whether the peer owes us a reply in the latest attempt.
+    #[must_use]
+    pub fn expects_reply(&self) -> bool {
+        self.attempt().tx_exchange.expects_reply()
     }
 
     /// The funding output's `scriptPubKey`, once `accept_channel2` has
@@ -97,15 +153,15 @@ impl PendingChannelV2 {
         )
     }
 
-    /// Total funding output value: the sum of both peers' contributions, per
-    /// BOLT 2. Saturates rather than overflowing on a mutated amount.
+    /// Funding output value of the latest attempt: the sum of both peers'
+    /// contributions, per BOLT 2. Saturates rather than overflowing on a
+    /// mutated amount.
     #[must_use]
     pub fn total_funding_satoshis(&self) -> u64 {
-        self.open_channel2.funding_satoshis.saturating_add(
-            self.accept_channel2
-                .as_ref()
-                .map_or(0, |ac| ac.funding_satoshis),
-        )
+        let attempt = self.attempt();
+        attempt
+            .local_funding_satoshis
+            .saturating_add(attempt.remote_funding_satoshis)
     }
 }
 
@@ -198,6 +254,7 @@ impl V2Negotiations {
         );
         pending.accept_channel2 = Some(accept_channel2.clone());
         pending.channel_id = Some(channel_id);
+        pending.first_attempt.remote_funding_satoshis = accept_channel2.funding_satoshis;
         self.temporary_ids.insert(channel_id, temporary_channel_id);
     }
 }

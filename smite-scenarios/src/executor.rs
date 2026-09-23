@@ -23,7 +23,7 @@ use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{
     AcceptChannelContext, AcceptChannelOracle, FundingSignedContext, FundingSignedOracle, Oracle,
 };
-use smite::pending_channel::{PendingChannel, V2Negotiations};
+use smite::pending_channel::{PendingChannel, PendingChannelV2, V2Negotiations};
 use smite::violation::Violation;
 
 use super::targets::TargetRpc;
@@ -857,6 +857,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         );
                         let contributed = self.negotiations_v2.get(ts.channel_id).map(|pending| {
                             pending
+                                .attempt()
                                 .tx_exchange
                                 .shared_tx()
                                 .input_positions(Contributor::Remote)
@@ -864,8 +865,9 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         });
                         let witnesses = validate_peer_witnesses(&ts, contributed)?;
                         if let Some(pending) = self.negotiations_v2.get_mut(ts.channel_id) {
-                            pending.commitment_exchange.tx_signatures.received = true;
-                            pending.peer_witnesses = witnesses;
+                            let attempt = pending.attempt_mut();
+                            attempt.commitment_exchange.tx_signatures.received = true;
+                            attempt.peer_witnesses = witnesses;
                         }
                     }
                     None
@@ -890,7 +892,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     // BOLT 2 has the peer reply with its own once it has ours,
                     // so this is what makes a later receive expect one.
                     if let Some(pending) = self.negotiations_v2.get_mut(channel_id) {
-                        pending.commitment_exchange.tx_signatures.sent = true;
+                        pending.attempt_mut().commitment_exchange.tx_signatures.sent = true;
                     }
                     None
                 }
@@ -928,7 +930,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
         while self
             .negotiations_v2
             .get(channel_id)
-            .is_some_and(|pending| pending.tx_exchange.expects_reply())
+            .is_some_and(PendingChannelV2::expects_reply)
         {
             let msg = self.recv_interactive_tx()?;
             log::debug!("settling negotiation {channel_id}: got {msg}");
@@ -1158,7 +1160,7 @@ fn build_open_channel2(
 /// for the peer to judge, as does anything sent after the exchange concluded.
 fn record_sent_step(negotiations: &mut V2Negotiations, channel_id: ChannelId, step: Step) {
     if let Some(pending) = negotiations.get_mut(channel_id) {
-        pending.tx_exchange.send(step);
+        pending.attempt_mut().tx_exchange.send(step);
     }
 }
 
@@ -1253,20 +1255,16 @@ fn build_tx_add_output(
         TxOutputRole::Change => {
             let change_script = cli.get_new_address_script_pubkey();
             negotiations.get(channel_id).map(|pending| {
-                let feerate = pending.open_channel2.funding_feerate_perkw;
-                let fee = pending
-                    .tx_exchange
-                    .shared_tx()
-                    .local_fee_sat(feerate, &[change_script.len()]);
+                let attempt = pending.attempt();
+                let shared_tx = attempt.tx_exchange.shared_tx();
+                let fee = shared_tx.local_fee_sat(attempt.feerate_perkw, &[change_script.len()]);
                 // Whatever our inputs cover beyond our funding contribution and
                 // our share of the fee. Saturating: an under-funded selection
                 // yields a zero-value output the peer rejects, rather than a
                 // panic.
-                let value = pending
-                    .tx_exchange
-                    .shared_tx()
+                let value = shared_tx
                     .contributed_input_value(Contributor::Local)
-                    .saturating_sub(pending.open_channel2.funding_satoshis)
+                    .saturating_sub(attempt.local_funding_satoshis)
                     .saturating_sub(fee);
                 (value, change_script)
             })
@@ -1340,7 +1338,7 @@ fn apply_interactive_tx(
                 m.message().unwrap_or("<non-utf8>"),
             );
             if let Some(pending) = negotiations.get_mut(m.channel_id) {
-                pending.tx_exchange.abort();
+                pending.attempt_mut().tx_exchange.abort();
             }
             return Ok(());
         }
@@ -1353,7 +1351,7 @@ fn apply_interactive_tx(
     };
 
     match negotiations.get_mut(channel_id) {
-        Some(pending) => pending.tx_exchange.receive(step),
+        Some(pending) => pending.attempt_mut().tx_exchange.receive(step),
         None => {
             log::debug!("interactive tx message for unknown channel_id {channel_id}, ignoring");
         }
@@ -1387,13 +1385,14 @@ fn build_funding_transaction_v2(
 
     match pending.funding_script() {
         Some(script) => pending
+            .attempt()
             .tx_exchange
             .shared_tx()
             .build_funding(&script, pending.total_funding_satoshis()),
         // Without `accept_channel2` the funding script is unknown, so there is
         // nothing to locate; `vout` 0 keeps the result well-typed.
         None => FundingTransaction {
-            tx: pending.tx_exchange.shared_tx().build(),
+            tx: pending.attempt().tx_exchange.shared_tx().build(),
             vout: 0,
         },
     }
@@ -1439,11 +1438,13 @@ fn build_commitment_signed(
     let open_channel2 = pending.open_channel2.clone();
     let total_funding_satoshis = pending.total_funding_satoshis();
     let on_derived_channel_id = pending.channel_id == Some(channel_id);
-    let already_sent = pending.commitment_exchange.commitment_signed.sent;
+    let attempt = pending.attempt_mut();
+    let remote_funding_satoshis = attempt.remote_funding_satoshis;
+    let already_sent = attempt.commitment_exchange.commitment_signed.sent;
     if on_derived_channel_id {
-        pending.commitment_exchange.commitment_signed.sent = true;
+        attempt.commitment_exchange.commitment_signed.sent = true;
     }
-    let negotiated_txid = pending.tx_exchange.shared_tx().build().compute_txid();
+    let negotiated_txid = attempt.tx_exchange.shared_tx().build().compute_txid();
 
     let opener_funding_privkey =
         SecretKey::from_slice(&opener_funding_privkey_bytes).expect("valid private key");
@@ -1478,7 +1479,7 @@ fn build_commitment_signed(
     // v2 has no `push_msat`: each side's balance is simply what it contributed
     // to the funding output. Pushing the acceptor's contribution reproduces
     // exactly that split, since the total is the sum of the two.
-    let push_msat = accept_channel2.funding_satoshis.saturating_mul(1000);
+    let push_msat = remote_funding_satoshis.saturating_mul(1000);
     let state = config.new_initial_commitment(
         push_msat,
         open_channel2.commitment_feerate_perkw,
@@ -1566,12 +1567,18 @@ fn verify_commitment_signed(
         return Err(Violation::UnexpectedHtlcSignatures(cs.channel_id).into());
     }
 
-    let Some(state) = channel_states.get(&cs.channel_id) else {
-        if negotiations
-            .get(cs.channel_id)
-            .is_some_and(|pending| pending.commitment_exchange.commitment_signed.sent)
-        {
-            return Err(Violation::UnknownChannel(cs.channel_id).into());
+    let signed_attempt = negotiations
+        .get(cs.channel_id)
+        .map(|pending| pending.attempt().commitment_exchange.commitment_signed.sent);
+    let state = match (channel_states.get(&cs.channel_id), signed_attempt) {
+        (None, Some(true)) => return Err(Violation::UnknownChannel(cs.channel_id).into()),
+        (Some(state), None | Some(true)) => state,
+        _ => {
+            log::debug!(
+                "commitment_signed for {} answers no commitment_signed of ours, ignoring",
+                cs.channel_id,
+            );
+            return Ok(());
         }
         log::debug!(
             "commitment_signed for {} with no v2 commitment exchange in flight, ignoring",
@@ -1595,7 +1602,8 @@ fn verify_commitment_signed(
     }
 
     if let Some(pending) = negotiations.get_mut(cs.channel_id) {
-        pending.commitment_exchange.commitment_signed.received = true;
+        let exchange = &mut pending.attempt_mut().commitment_exchange;
+        exchange.commitment_signed.received = true;
     }
 
     Ok(())
@@ -1620,7 +1628,7 @@ fn verify_commitment_signed(
 fn is_interactive_tx_expected(negotiations: &V2Negotiations, channel_id: ChannelId) -> bool {
     negotiations
         .get(channel_id)
-        .is_none_or(|pending| pending.tx_exchange.expects_reply())
+        .is_none_or(PendingChannelV2::expects_reply)
 }
 
 /// Returns whether the peer owes us a `tx_signatures` for this negotiation.
@@ -1640,24 +1648,21 @@ fn is_tx_signatures_expected(
         return false;
     };
 
+    let attempt = pending.attempt();
+    let shared_tx = attempt.tx_exchange.shared_tx();
     let peer_signs_first = signs_first(
-        pending
-            .tx_exchange
-            .shared_tx()
-            .contributed_input_value(Contributor::Remote),
-        pending
-            .tx_exchange
-            .shared_tx()
-            .contributed_input_value(Contributor::Local),
+        shared_tx.contributed_input_value(Contributor::Remote),
+        shared_tx.contributed_input_value(Contributor::Local),
         &context.target_pubkey,
         &context.local_pubkey,
     );
 
-    pending.commitment_exchange.commitment_signed.sent
-        && pending.commitment_exchange.commitment_signed.received
-        && !pending.commitment_exchange.tx_signatures.received
-        && !pending.tx_exchange.aborted()
-        && (peer_signs_first || pending.commitment_exchange.tx_signatures.sent)
+    let exchange = &attempt.commitment_exchange;
+    exchange.commitment_signed.sent
+        && exchange.commitment_signed.received
+        && !exchange.tx_signatures.received
+        && !attempt.tx_exchange.aborted()
+        && (peer_signs_first || exchange.tx_signatures.sent)
 }
 
 /// Signs the shared funding transaction and builds `tx_signatures` carrying one
@@ -1682,6 +1687,7 @@ fn build_tx_signatures(
         .get(channel_id)
         .map(|pending| {
             pending
+                .attempt()
                 .tx_exchange
                 .shared_tx()
                 .input_positions(Contributor::Local)
@@ -1787,19 +1793,25 @@ fn apply_peer_witnesses(
 ) -> bitcoin::Transaction {
     let txid = tx.compute_txid();
     let mut tx = tx.clone();
-    let Some(pending) = negotiations.iter().find(|pending| {
-        !pending.peer_witnesses.is_empty()
-            && pending.tx_exchange.shared_tx().build().compute_txid() == txid
-    }) else {
+    // Any attempt may be the one broadcast, not only the latest: BOLT 2 lets
+    // whichever confirms fund the channel.
+    let Some(attempt) = negotiations
+        .iter()
+        .flat_map(PendingChannelV2::attempts)
+        .find(|attempt| {
+            !attempt.peer_witnesses.is_empty()
+                && attempt.tx_exchange.shared_tx().build().compute_txid() == txid
+        })
+    else {
         return tx;
     };
 
-    let positions = pending
+    let positions = attempt
         .tx_exchange
         .shared_tx()
         .input_positions(Contributor::Remote);
     let mut applied = 0usize;
-    for (&position, witness) in positions.iter().zip(&pending.peer_witnesses) {
+    for (&position, witness) in positions.iter().zip(&attempt.peer_witnesses) {
         let Some(txin) = tx.input.get_mut(position) else {
             continue;
         };
@@ -1808,7 +1820,7 @@ fn apply_peer_witnesses(
     }
     log::debug!(
         "applied {applied} of {} peer witness(es) to {txid}",
-        pending.peer_witnesses.len(),
+        attempt.peer_witnesses.len(),
     );
     tx
 }
