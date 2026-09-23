@@ -978,6 +978,14 @@ pub fn live_channel_state(side: Side) -> ChannelState {
 /// The key behind the new funding pubkey our `splice_init` announces.
 pub const SPLICE_FUNDING_KEY: [u8; 32] = [0x88; 32];
 
+/// The private key behind the new funding pubkey [`splice_ack_reply`]
+/// announces, which is `sample_pubkey(21)`.
+pub fn peer_splice_funding_privkey() -> SecretKey {
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes[31] = 21;
+    SecretKey::from_slice(&sk_bytes).expect("valid secret key")
+}
+
 /// The peer's `splice_ack` on the live channel, contributing `contribution`.
 pub fn splice_ack_reply(contribution: i64) -> Message {
     Message::SpliceAck(SpliceAck {

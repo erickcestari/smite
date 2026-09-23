@@ -14,7 +14,8 @@ pub use commitment::{
     CommitmentPartyState, CommitmentState, HolderIdentity, Side, SpliceFunding,
 };
 pub use funding::{
-    FundingTransaction, InsufficientFunds, build_funding_transaction, build_funding_witness_script,
+    FundingInput, FundingTransaction, InsufficientFunds, build_funding_transaction,
+    build_funding_witness, build_funding_witness_script,
 };
 pub use interactive_tx::{
     Contributor, MAX_INPUTS, MAX_OUTPUTS, MAX_SEQUENCE, SharedInput, SharedOutput,
