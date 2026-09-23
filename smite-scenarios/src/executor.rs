@@ -2022,7 +2022,7 @@ fn build_funding_transaction_v2(
     channel_id: ChannelId,
 ) -> FundingTransaction {
     let Some(pending) = negotiations.get(channel_id) else {
-        log::debug!("no v2 negotiation for channel_id {channel_id}, building an empty transaction");
+        log::debug!("no negotiation for channel_id {channel_id}, building an empty transaction");
         return FundingTransaction {
             tx: bitcoin::Transaction {
                 version: bitcoin::transaction::Version::TWO,
@@ -2040,8 +2040,9 @@ fn build_funding_transaction_v2(
             .tx_exchange
             .shared_tx()
             .build_funding(&script, pending.total_funding_satoshis()),
-        // Without `accept_channel2` the funding script is unknown, so there is
-        // nothing to locate; `vout` 0 keeps the result well-typed.
+        // Until `accept_channel2` or `splice_ack` reveals the peer's funding
+        // pubkey the funding script is unknown, so there is nothing to locate;
+        // `vout` 0 keeps the result well-typed.
         None => FundingTransaction {
             tx: pending.attempt().tx_exchange.shared_tx().build(),
             vout: 0,
