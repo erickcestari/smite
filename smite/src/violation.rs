@@ -68,4 +68,10 @@ pub enum Violation {
     /// `witness_data` is not the bitcoin wire encoding the spec prescribes.
     #[error("invalid tx_signatures for channel_id {0}: {1}")]
     InvalidTxSignatures(ChannelId, String),
+
+    /// The target's `stfu` broke a BOLT 2 requirement: it answered ours with
+    /// `initiator` set, which the spec reserves for the node starting
+    /// quiescence.
+    #[error("invalid stfu for channel_id {0}: {1}")]
+    InvalidStfu(ChannelId, String),
 }

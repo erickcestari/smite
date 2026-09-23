@@ -456,6 +456,22 @@ pub enum Operation {
         /// See [`Self::SendTxAddInput::sequence`].
         sequence: u32,
     },
+    /// Send `stfu` (BOLT 2, type 2), asking the peer to quiesce the channel,
+    /// which splicing requires.
+    ///
+    /// Input: `channel_id` (`ChannelId`).
+    SendStfu {
+        /// The `initiator` flag. BOLT 2 has the node that starts quiescence
+        /// set it, so clearing it misrepresents who did.
+        initiator: bool,
+    },
+    /// Receive the peer's `stfu` answering ours, which quiesces the channel.
+    ///
+    /// A no-op unless the peer owes one: it answers only on a channel both
+    /// sides have sent `channel_ready` for.
+    ///
+    /// Input: `SentStfu`.
+    RecvStfu,
 }
 
 /// Where a `tx_add_output`'s value and script come from.
@@ -917,6 +933,8 @@ impl fmt::Display for Operation {
             Self::RecvCommitmentSigned => write!(f, "RecvCommitmentSigned"),
             Self::RecvTxSignatures => write!(f, "RecvTxSignatures"),
             Self::SendTxSignatures => write!(f, "SendTxSignatures"),
+            Self::SendStfu { initiator } => write!(f, "SendStfu{{initiator={initiator}}}"),
+            Self::RecvStfu => write!(f, "RecvStfu"),
         }
     }
 }
@@ -964,7 +982,9 @@ impl Operation {
             | Self::BroadcastTransaction
             | Self::RecvInteractiveTx
             | Self::RecvTxSignatures
-            | Self::SendTxSignatures => None,
+            | Self::SendTxSignatures
+            | Self::RecvStfu => None,
+            Self::SendStfu { .. } => Some(VariableType::SentStfu),
             Self::SendOpenChannel => Some(VariableType::SentOpenChannel),
             Self::ExtractAcceptChannel2(field) => Some(field.output_type()),
             Self::BuildOpenChannel2 { .. } => Some(VariableType::OpenChannel2Message),
@@ -1115,7 +1135,9 @@ impl Operation {
             | Self::SendTxAddPreviousInput { .. }
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
-            | Self::SendTxComplete => vec![VariableType::ChannelId],
+            | Self::SendTxComplete
+            | Self::SendStfu { .. } => vec![VariableType::ChannelId],
+            Self::RecvStfu => vec![VariableType::SentStfu],
             Self::SendTxInitRbf { .. } => vec![
                 VariableType::ChannelId,    // channel_id
                 VariableType::BlockHeight,  // locktime
@@ -1230,7 +1252,9 @@ impl Operation {
             | Self::SendCommitmentSigned
             | Self::RecvCommitmentSigned
             | Self::RecvTxSignatures
-            | Self::SendTxSignatures => vec![],
+            | Self::SendTxSignatures
+            | Self::SendStfu { .. }
+            | Self::RecvStfu => vec![],
 
             Self::RecvAcceptChannel => AcceptChannelField::ALL
                 .iter()
@@ -1303,7 +1327,9 @@ impl Operation {
             | Self::SendCommitmentSigned
             | Self::RecvCommitmentSigned
             | Self::RecvTxSignatures
-            | Self::SendTxSignatures => true,
+            | Self::SendTxSignatures
+            | Self::SendStfu { .. }
+            | Self::RecvStfu => true,
         }
     }
 
@@ -1351,7 +1377,8 @@ impl Operation {
             | Self::SendShutdown
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
-            | Self::SendTxComplete => true,
+            | Self::SendTxComplete
+            | Self::SendStfu { .. } => true,
             // `CreateFundingTransaction` selects coins from the wallet, whose
             // contents change as transactions are created and broadcast.
             // `SendFundingCreated` builds its message from the recorded
@@ -1383,7 +1410,8 @@ impl Operation {
             | Self::MineBlocks(_)
             | Self::MineEmptyBlocks(_)
             | Self::BroadcastTransaction
-            | Self::LookupShortChannelId => false,
+            | Self::LookupShortChannelId
+            | Self::RecvStfu => false,
         }
     }
 
@@ -1426,7 +1454,8 @@ impl Operation {
             | Self::SendTxAddPreviousInput { .. }
             | Self::SendTxAddOutput { .. }
             | Self::SendTxRemoveInput { .. }
-            | Self::SendTxRemoveOutput { .. } => true,
+            | Self::SendTxRemoveOutput { .. }
+            | Self::SendStfu { .. } => true,
 
             Self::LoadTargetPubkeyFromContext
             | Self::LoadChainHashFromContext
@@ -1455,7 +1484,8 @@ impl Operation {
             | Self::SendCommitmentSigned
             | Self::RecvCommitmentSigned
             | Self::RecvTxSignatures
-            | Self::SendTxSignatures => false,
+            | Self::SendTxSignatures
+            | Self::RecvStfu => false,
         }
     }
 }

@@ -3474,3 +3474,83 @@ fn apply_peer_witnesses_fills_an_attempt_rbf_moved_past() {
 
     assert_eq!(tx.input[1].witness.len(), 2);
 }
+
+// -- Quiescence --
+
+#[test]
+fn execute_send_stfu_carries_our_initiator_flag() {
+    let mut b = ProgramBuilder::new();
+    send_stfu(&mut b, true);
+
+    let mut fx = Fixture::new().with_live_channel();
+    fx.run(&b.build());
+
+    let sent: Stfu = fx.last_sent();
+    assert_eq!(sent.channel_id, v2_channel_id());
+    assert_eq!(sent.initiator, 1);
+    assert!(fx.quiescence(&v2_channel_id()).sent);
+}
+
+#[test]
+fn execute_recv_stfu_reads_the_reply_on_a_live_channel() {
+    let mut b = ProgramBuilder::new();
+    let sent = send_stfu(&mut b, true);
+    b.append(Operation::RecvStfu, &[sent]);
+
+    let mut fx = Fixture::new().with_live_channel().queue(&stfu_reply(0));
+    fx.run(&b.build());
+
+    assert_eq!(fx.queued_len(), 0);
+    assert!(fx.quiescence(&v2_channel_id()).received);
+}
+
+#[test]
+fn execute_recv_stfu_on_a_channel_that_is_not_live_reads_nothing() {
+    // Without channel_ready both ways the peer has nothing to quiesce, so
+    // waiting for its stfu would only time out.
+    let mut b = ProgramBuilder::new();
+    let sent = send_stfu(&mut b, true);
+    b.append(Operation::RecvStfu, &[sent]);
+
+    let mut fx = Fixture::new().queue(&stfu_reply(0));
+    fx.run(&b.build());
+
+    assert_eq!(fx.queued_len(), 1);
+}
+
+#[test]
+fn execute_recv_stfu_reply_claiming_initiator_is_a_violation() {
+    let mut b = ProgramBuilder::new();
+    let sent = send_stfu(&mut b, true);
+    b.append(Operation::RecvStfu, &[sent]);
+
+    let mut fx = Fixture::new().with_live_channel().queue(&stfu_reply(1));
+    let err = fx.run_err(&b.build());
+
+    assert!(
+        matches!(err, ExecuteError::Violation(Violation::InvalidStfu(id, _)) if id == v2_channel_id()),
+        "expected InvalidStfu, got {err:?}"
+    );
+}
+
+#[test]
+fn execute_recv_interactive_tx_records_an_stfu_ahead_of_the_reply() {
+    // Our stfu went out before the input, so its reply arrives first; reading
+    // it as the input's reply would leave every later receive a message behind.
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b).channel_id;
+    let stfu_channel_id = b.append(Operation::LoadChannelId(v2_channel_id().0), &[]);
+    b.append(Operation::SendStfu { initiator: true }, &[stfu_channel_id]);
+    let input = send_tx_add_input(&mut b, channel_id, 2, 0);
+    recv_interactive_tx(&mut b, input);
+
+    let mut fx = v2_fixture()
+        .with_live_channel()
+        .queue(&stfu_reply(0))
+        .queue(&tx_complete_reply(v2_channel_id()));
+    fx.run(&b.build());
+
+    assert_eq!(fx.queued_len(), 0);
+    assert!(fx.quiescence(&v2_channel_id()).received);
+    assert!(!fx.negotiation_v2(v2_channel_id()).expects_reply());
+}

@@ -12,7 +12,7 @@ use smite::bolt::{
     ChannelReady, ChannelReadyTlvs, ChannelUpdate, CommitmentSigned, CommitmentSignedTlvs,
     Features, FromMessage, FundingCreated, FundingSigned, Message, MessageType, NodeAnnouncement,
     OpenChannel, OpenChannel2, OpenChannel2Tlvs, OpenChannelTlvs, Pong, ShortChannelId, Shutdown,
-    TemporaryChannelId, TxAddInput, TxAddInputTlvs, TxAddOutput, TxComplete, TxInitRbf,
+    Stfu, TemporaryChannelId, TxAddInput, TxAddInputTlvs, TxAddOutput, TxComplete, TxInitRbf,
     TxInitRbfTlvs, TxRemoveInput, TxRemoveOutput, TxSignatures, TxSignaturesTlvs,
 };
 use smite::channel_tx::{
@@ -23,7 +23,7 @@ use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{
     AcceptChannelContext, AcceptChannelOracle, FundingSignedContext, FundingSignedOracle, Oracle,
 };
-use smite::pending_channel::{PendingChannel, PendingChannelV2, V2Negotiations};
+use smite::pending_channel::{Exchange, PendingChannel, PendingChannelV2, V2Negotiations};
 use smite::violation::Violation;
 
 use super::targets::TargetRpc;
@@ -310,6 +310,9 @@ pub struct Executor<C, B, R> {
     unmined_txids: HashSet<Txid>,
     /// Transactions broadcast and since mined.
     mined_txids: HashSet<Txid>,
+    /// Progress through the `stfu` exchange quiescing each channel, until
+    /// quiescence ends.
+    quiescence: HashMap<ChannelId, Exchange>,
 }
 
 impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
@@ -328,6 +331,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
             private_mempool: Vec::new(),
             unmined_txids: HashSet::new(),
             mined_txids: HashSet::new(),
+            quiescence: HashMap::new(),
         }
     }
 
@@ -956,6 +960,25 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     Some(Variable::SentInteractiveTx(channel_id))
                 }
 
+                Operation::SendStfu { initiator } => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    self.quiescence.entry(channel_id).or_default().sent = true;
+                    let encoded = Message::Stfu(Stfu {
+                        channel_id,
+                        initiator: u8::from(*initiator),
+                    })
+                    .encode();
+                    log::debug!("[{:?}] SendStfu: initiator={initiator}", start.elapsed());
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentStfu(channel_id))
+                }
+
+                Operation::RecvStfu => {
+                    let channel_id = consume_sent_stfu(&mut variables, instr.inputs[0]);
+                    self.settle_quiescence(channel_id)?;
+                    None
+                }
+
                 Operation::SendTxAddPreviousInput {
                     serial_id,
                     input_index,
@@ -990,10 +1013,62 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
 
     /// Reads the peer's next interactive transaction message and applies it
     /// to the negotiation it names.
+    ///
+    /// An owed `stfu` read on the way is recorded rather than mistaken for the
+    /// reply: it answers an `stfu` sent after the message being answered.
     fn recv_interactive_tx(&mut self) -> Result<Message, ExecuteError> {
-        let msg = recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)?;
-        apply_interactive_tx(&mut self.negotiations_v2, &msg)?;
-        Ok(msg)
+        loop {
+            let msg = recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)?;
+            if let Message::Stfu(stfu) = &msg
+                && self.is_stfu_owed(stfu.channel_id)
+            {
+                self.record_stfu(stfu)?;
+                continue;
+            }
+            apply_interactive_tx(&mut self.negotiations_v2, &msg)?;
+            return Ok(msg);
+        }
+    }
+
+    /// Whether the peer owes us an `stfu` on `channel_id`: we sent ours, and
+    /// BOLT 2 has the peer reply on a channel both sides operate.
+    fn is_stfu_owed(&self, channel_id: ChannelId) -> bool {
+        self.quiescence
+            .get(&channel_id)
+            .is_some_and(|stfu| stfu.sent && !stfu.received)
+            && self.channel_states.get(&channel_id).is_some_and(is_live)
+    }
+
+    /// Records the peer's `stfu`, which quiesces the channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Violation::InvalidStfu`] if it answers ours with `initiator`
+    /// set, which BOLT 2 forbids a reply. The peer never starts quiescence
+    /// here, so its `stfu` is always a reply.
+    fn record_stfu(&mut self, stfu: &Stfu) -> Result<(), Violation> {
+        let exchange = self.quiescence.entry(stfu.channel_id).or_default();
+        let answers_ours = exchange.sent && !exchange.received;
+        exchange.received = true;
+        if answers_ours && stfu.initiator != 0 {
+            return Err(Violation::InvalidStfu(
+                stfu.channel_id,
+                format!("replied to ours with initiator {}", stfu.initiator),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads the `stfu` the peer owes on `channel_id`, applying any
+    /// interactive transaction reply ahead of it on the wire.
+    fn settle_quiescence(&mut self, channel_id: ChannelId) -> Result<(), ExecuteError> {
+        while self.is_stfu_owed(channel_id) {
+            match recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)? {
+                Message::Stfu(stfu) => self.record_stfu(&stfu)?,
+                other => apply_interactive_tx(&mut self.negotiations_v2, &other)?,
+            }
+        }
+        Ok(())
     }
 
     /// Reads every reply the peer still owes on `channel_id`, so what is
@@ -1011,6 +1086,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
     /// The count of owed replies is exact, so this never reads into whatever
     /// the peer moved on to after the exchange.
     fn settle_negotiation(&mut self, channel_id: ChannelId) -> Result<(), ExecuteError> {
+        self.settle_quiescence(channel_id)?;
         while self
             .negotiations_v2
             .get(channel_id)
@@ -1111,6 +1187,16 @@ fn consume_affine(variables: &mut [Option<Variable>], index: usize, expected: Va
         type_mismatch(index, expected, actual);
     }
     variables[index] = None;
+}
+
+/// Consumes the affine `SentStfu`, returning the `channel_id` it was sent on.
+fn consume_sent_stfu(variables: &mut [Option<Variable>], index: usize) -> ChannelId {
+    let channel_id = match resolve(variables, index) {
+        Variable::SentStfu(channel_id) => *channel_id,
+        other => type_mismatch(index, VariableType::SentStfu, other.var_type()),
+    };
+    variables[index] = None;
+    channel_id
 }
 
 /// Consumes the affine `SentInteractiveTx`, returning the `channel_id` the
@@ -2538,6 +2624,14 @@ fn is_channel_ready_expected(
             && bitcoin_cli.get_transaction_confirmations(state.config.funding_outpoint.txid)
                 >= state.config.minimum_depth
     })
+}
+
+/// Whether both sides have sent `channel_ready` for `state`'s channel and we
+/// never sent a signature the peer had to reject, so the peer operates it.
+fn is_live(state: &ChannelState) -> bool {
+    state.next_holder_per_commitment_point().is_some()
+        && state.next_counterparty_per_commitment_point().is_some()
+        && !state.sent_invalid_signature
 }
 
 /// Whether `state` is still at its initial commitment with no `channel_ready`

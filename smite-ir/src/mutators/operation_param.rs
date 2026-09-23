@@ -133,6 +133,10 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
             *require_confirmed_inputs = !*require_confirmed_inputs;
             true
         }
+        Operation::SendStfu { initiator } => {
+            *initiator = !*initiator;
+            true
+        }
 
         // Non-mutable variants. Reaching here means `is_param_mutable` and this
         // match have drifted out of sync.
@@ -163,7 +167,8 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
         | Operation::SendCommitmentSigned
         | Operation::RecvCommitmentSigned
         | Operation::RecvTxSignatures
-        | Operation::SendTxSignatures => {
+        | Operation::SendTxSignatures
+        | Operation::RecvStfu => {
             unreachable!("is_param_mutable returned true for {op:?}")
         }
     }

@@ -7,7 +7,9 @@
 //! `raw_program` is an exception and doesn't use [`ProgramBuilder`] since its
 //! purpose is to create malformed program.
 
-use super::harness::{PointSource, SampleOpenChannel, acceptor_funding_sk, opener_funding_sk};
+use super::harness::{
+    PointSource, SampleOpenChannel, acceptor_funding_sk, opener_funding_sk, v2_channel_id,
+};
 use crate::executor::*;
 use smite::bolt::ChannelTypeVariant;
 use smite_ir::Instruction;
@@ -761,4 +763,12 @@ pub fn raw_program(instructions: &[(Operation, &[usize])]) -> Program {
             })
             .collect(),
     }
+}
+
+// -- Quiescence --
+
+/// Sends `stfu` on the live channel. Returns the `SendStfu` result.
+pub fn send_stfu(b: &mut ProgramBuilder, initiator: bool) -> usize {
+    let channel_id = b.append(Operation::LoadChannelId(v2_channel_id().0), &[]);
+    b.append(Operation::SendStfu { initiator }, &[channel_id])
 }

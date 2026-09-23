@@ -246,6 +246,9 @@ impl ProgramBuilder {
             VariableType::SentFundingCreated => {
                 panic!("cannot generate fresh SentFundingCreated: affine type")
             }
+            VariableType::SentStfu => {
+                panic!("cannot generate fresh SentStfu: affine type")
+            }
             VariableType::SentShutdown => {
                 panic!("cannot generate fresh SentShutdown: affine type")
             }

@@ -1,6 +1,7 @@
 //! Mocks and fixtures shared by the executor tests.
 
 use crate::executor::*;
+use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Transaction};
 use smite::bolt::{
     AcceptChannel2Tlvs, AcceptChannelTlvs, ChannelTypeVariant, CommitmentSigned,
@@ -305,6 +306,24 @@ impl Fixture {
             .negotiations_v2
             .get(id)
             .expect("v2 negotiation recorded")
+    }
+
+    /// Seeds the channel `v2_funding_flow` opens as live: funded, with
+    /// `channel_ready` sent and received.
+    pub fn with_live_channel(mut self) -> Self {
+        self.executor
+            .channel_states
+            .insert(v2_channel_id(), live_channel_state(Side::Opener));
+        self
+    }
+
+    /// Returns the progress of the `stfu` exchange on `id`.
+    pub fn quiescence(&self, id: &ChannelId) -> Exchange {
+        self.executor
+            .quiescence
+            .get(id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Returns the channel state recorded for `id`.
@@ -863,6 +882,88 @@ pub fn sample_peer_witness() -> Witness {
 /// `witness_data`.
 pub fn sample_peer_witness_data() -> Vec<u8> {
     bitcoin::consensus::encode::serialize(&sample_peer_witness())
+}
+
+/// The outpoint funding the channel [`live_channel_state`] describes.
+pub fn live_funding_outpoint() -> OutPoint {
+    OutPoint {
+        txid: Txid::from_byte_array([0x5f; 32]),
+        vout: 0,
+    }
+}
+
+/// The channel `v2_funding_flow` opens, once both sides sent `channel_ready`,
+/// from `side`'s view: we are the opener, the peer the acceptor, and the
+/// opener's 200k sat fund it.
+pub fn live_channel_state(side: Side) -> ChannelState {
+    let open = sample_open_channel2();
+    let accept = sample_accept_channel2(open.temporary_channel_id);
+    let party = |funding_pubkey, payment_basepoint, revocation_basepoint, delayed, dust, delay| {
+        ChannelPartyConfig {
+            funding_pubkey,
+            payment_basepoint,
+            revocation_basepoint,
+            delayed_payment_basepoint: delayed,
+            dust_limit_satoshis: dust,
+            to_self_delay: delay,
+        }
+    };
+    let config = ChannelConfig {
+        funding_outpoint: live_funding_outpoint(),
+        funding_satoshis: open.funding_satoshis,
+        channel_type: Features::from(ChannelTypeVariant::Anchors.encode()),
+        opener: party(
+            open.funding_pubkey,
+            open.payment_basepoint,
+            open.revocation_basepoint,
+            open.delayed_payment_basepoint,
+            open.dust_limit_satoshis,
+            open.to_self_delay,
+        ),
+        acceptor: party(
+            accept.funding_pubkey,
+            accept.payment_basepoint,
+            accept.revocation_basepoint,
+            accept.delayed_payment_basepoint,
+            accept.dust_limit_satoshis,
+            accept.to_self_delay,
+        ),
+        minimum_depth: accept.minimum_depth,
+    };
+    let commitment = config
+        .new_initial_commitment(
+            0,
+            open.commitment_feerate_perkw,
+            open.first_per_commitment_point,
+            accept.first_per_commitment_point,
+        )
+        .expect("valid initial commitment");
+    let funding_privkey = match side {
+        Side::Opener => SecretKey::from_slice(&[0x11; 32]).expect("valid secret key"),
+        Side::Acceptor => sample_acceptor_funding_privkey(),
+    };
+    let mut state = ChannelState::new(
+        config,
+        HolderIdentity {
+            side,
+            funding_privkey,
+        },
+        commitment,
+        true,
+        false,
+        false,
+    );
+    state.opener_next_per_commitment_point = Some(open.second_per_commitment_point);
+    state.acceptor_next_per_commitment_point = Some(accept.second_per_commitment_point);
+    state
+}
+
+/// The peer's `stfu` on the live channel.
+pub fn stfu_reply(initiator: u8) -> Message {
+    Message::Stfu(Stfu {
+        channel_id: v2_channel_id(),
+        initiator,
+    })
 }
 
 /// The private key behind [`sample_accept_channel2`]'s `funding_pubkey`,

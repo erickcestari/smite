@@ -752,6 +752,38 @@ fn send_tx_add_previous_input_operation() {
 }
 
 #[test]
+fn stfu_operations() {
+    let send = Operation::SendStfu { initiator: true };
+    assert_eq!(send.input_types(), vec![VariableType::ChannelId]);
+    assert_eq!(send.output_type(), Some(VariableType::SentStfu));
+    assert!(send.is_param_mutable());
+    assert_eq!(send.to_string(), "SendStfu{initiator=true}");
+
+    let recv = Operation::RecvStfu;
+    assert_eq!(recv.input_types(), vec![VariableType::SentStfu]);
+    assert_eq!(recv.output_type(), None);
+    // It reads whatever the peer sent, so it can be neither merged nor moved.
+    assert!(!recv.is_pure());
+    assert!(VariableType::SentStfu.is_affine());
+}
+
+#[test]
+fn param_mutator_toggles_stfu_initiator() {
+    let mut program = Program {
+        instructions: vec![Instruction {
+            operation: Operation::SendStfu { initiator: true },
+            inputs: vec![],
+        }],
+    };
+    OperationParamMutator.mutate(&mut program, &mut SmallRng::seed_from_u64(0));
+
+    assert_eq!(
+        program.instructions[0].operation,
+        Operation::SendStfu { initiator: false },
+    );
+}
+
+#[test]
 fn param_mutator_toggles_tx_init_rbf_confirmed_inputs() {
     let mut program = Program {
         instructions: vec![Instruction {

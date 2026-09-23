@@ -78,6 +78,9 @@ pub enum Variable {
     /// `shutdown` has been sent, so the counterparty's `shutdown` may now be
     /// received.
     SentShutdown,
+    /// `stfu` has been sent on the carried `channel_id`, so the peer's may now
+    /// be received.
+    SentStfu(ChannelId),
 }
 
 impl Variable {
@@ -111,6 +114,7 @@ impl Variable {
             Self::SentCommitmentSigned => VariableType::SentCommitmentSigned,
             Self::SentFundingCreated => VariableType::SentFundingCreated,
             Self::SentShutdown => VariableType::SentShutdown,
+            Self::SentStfu(_) => VariableType::SentStfu,
         }
     }
 }
@@ -145,6 +149,7 @@ pub enum VariableType {
     SentCommitmentSigned,
     SentFundingCreated,
     SentShutdown,
+    SentStfu,
 }
 
 impl VariableType {
@@ -156,7 +161,8 @@ impl VariableType {
             | Self::SentInteractiveTx
             | Self::SentCommitmentSigned
             | Self::SentFundingCreated
-            | Self::SentShutdown => true,
+            | Self::SentShutdown
+            | Self::SentStfu => true,
 
             Self::Bytes
             | Self::ChainHash
