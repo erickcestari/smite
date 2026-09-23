@@ -45,6 +45,10 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
             *v = tweak_short_channel_id(*v, rng);
             true
         }
+        Operation::LoadContribution(v) => {
+            *v = tweak_contribution(*v, rng);
+            true
+        }
         Operation::LoadFeeratePerKw(v)
         | Operation::LoadBlockHeight(v)
         | Operation::LoadTimestamp(v)
@@ -128,6 +132,9 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
         }
         | Operation::SendTxInitRbf {
             require_confirmed_inputs,
+        }
+        | Operation::SendSpliceInit {
+            require_confirmed_inputs,
         } => {
             // Toggle the value-less `require_confirmed_inputs` TLV.
             *require_confirmed_inputs = !*require_confirmed_inputs;
@@ -135,6 +142,17 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
         }
         Operation::SendStfu { initiator } => {
             *initiator = !*initiator;
+            true
+        }
+        Operation::SendTxAddSharedInput {
+            serial_id,
+            sequence,
+        } => {
+            if rng.random() {
+                *serial_id = tweak_serial_id(*serial_id, rng);
+            } else {
+                *sequence = tweak_sequence(*sequence, rng);
+            }
             true
         }
 
@@ -182,6 +200,18 @@ fn tweak_u64(v: u64, rng: &mut impl Rng) -> u64 {
         1 => v.wrapping_add(rng.random_range(1..=256)),
         2 => v.wrapping_sub(rng.random_range(1..=256)),
         _ => interesting_u64(rng),
+    }
+}
+
+/// Tweaks a splice contribution, whose sign decides between splicing in and
+/// out, so some tweaks flip it.
+fn tweak_contribution(v: i64, rng: &mut impl Rng) -> i64 {
+    match rng.random_range(0..5) {
+        0 => rng.random(),
+        1 => v.wrapping_add(rng.random_range(1..=256)),
+        2 => v.wrapping_sub(rng.random_range(1..=256)),
+        3 => v.wrapping_neg(),
+        _ => interesting_u64(rng).cast_signed(),
     }
 }
 

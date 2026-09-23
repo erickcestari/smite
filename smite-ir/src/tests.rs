@@ -768,6 +768,66 @@ fn stfu_operations() {
 }
 
 #[test]
+fn splice_operations() {
+    let load = Operation::LoadContribution(-50_000);
+    assert_eq!(load.output_type(), Some(VariableType::Contribution));
+    assert!(load.is_pure());
+    assert_eq!(load.to_string(), "LoadContribution(-50000)");
+
+    let init = Operation::SendSpliceInit {
+        require_confirmed_inputs: false,
+    };
+    assert_eq!(
+        init.input_types(),
+        vec![
+            VariableType::ChannelId,
+            VariableType::Contribution,
+            VariableType::FeeratePerKw,
+            VariableType::BlockHeight,
+            VariableType::Point,
+        ],
+    );
+    // Its reply, splice_ack, is read like any other turn of the exchange.
+    assert_eq!(init.output_type(), Some(VariableType::SentInteractiveTx));
+    assert!(!init.is_pure());
+
+    let shared = Operation::SendTxAddSharedInput {
+        serial_id: 0,
+        sequence: 0xffff_fffd,
+    };
+    assert_eq!(shared.input_types(), vec![VariableType::ChannelId]);
+    assert_eq!(shared.output_type(), Some(VariableType::SentInteractiveTx));
+    // It reads the channel's funding output, so its position is meaningful.
+    assert!(!shared.depends_only_on_inputs());
+    assert_eq!(
+        shared.to_string(),
+        "SendTxAddSharedInput{serial_id=0, sequence=4294967293}"
+    );
+}
+
+#[test]
+fn param_mutator_reaches_both_signs_of_a_contribution() {
+    let mut rng = SmallRng::seed_from_u64(0);
+    let mut signs = [false; 2];
+
+    for _ in 0..50 {
+        let mut program = Program {
+            instructions: vec![Instruction {
+                operation: Operation::LoadContribution(100_000),
+                inputs: vec![],
+            }],
+        };
+        OperationParamMutator.mutate(&mut program, &mut rng);
+        let Operation::LoadContribution(v) = program.instructions[0].operation else {
+            panic!("OperationParamMutator changed the operation type");
+        };
+        signs[usize::from(v < 0)] = true;
+    }
+
+    assert_eq!(signs, [true; 2], "a contribution sign was never reached");
+}
+
+#[test]
 fn param_mutator_toggles_stfu_initiator() {
     let mut program = Program {
         instructions: vec![Instruction {

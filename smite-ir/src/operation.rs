@@ -472,6 +472,40 @@ pub enum Operation {
     ///
     /// Input: `SentStfu`.
     RecvStfu,
+    /// Load a signed satoshi amount: what a splice adds to (positive) or
+    /// removes from (negative) a channel balance.
+    LoadContribution(i64),
+    /// Send `splice_init` (BOLT 2, type 80), starting to replace the live
+    /// channel's funding transaction.
+    ///
+    /// Its reply, `splice_ack` or `tx_abort`, is read by `RecvInteractiveTx`
+    /// like `tx_ack_rbf`. The splice then runs its own interactive
+    /// transaction construction, `commitment_signed` and `tx_signatures` on
+    /// the same `channel_id`.
+    ///
+    /// Inputs (5):
+    ///   0: `channel_id` (`ChannelId`)
+    ///   1: `funding_contribution_satoshis` (`Contribution`)
+    ///   2: `funding_feerate_perkw` (`FeeratePerKw`)
+    ///   3: `locktime` (`BlockHeight`)
+    ///   4: `funding_pubkey` (`Point`), the new funding output's
+    SendSpliceInit {
+        /// Whether to require the peer to contribute only confirmed inputs.
+        require_confirmed_inputs: bool,
+    },
+    /// Build and send the `tx_add_input` spending the channel's current
+    /// funding output, which BOLT 2 has the splice initiator add.
+    ///
+    /// It carries the funding txid in `shared_input_txid` instead of a
+    /// `prevtx`, since both peers already know the transaction.
+    ///
+    /// Input: `channel_id` (`ChannelId`).
+    SendTxAddSharedInput {
+        /// See [`Self::SendTxAddInput::serial_id`].
+        serial_id: u64,
+        /// See [`Self::SendTxAddInput::sequence`].
+        sequence: u32,
+    },
 }
 
 /// Where a `tx_add_output`'s value and script come from.
@@ -834,6 +868,8 @@ fn format_hex(bytes: &[u8]) -> String {
 /// (e.g., `LoadAmount(100000)`, `LoadChainHashFromContext()`). Operations that do take
 /// inputs omit parens so `Program::Display` can append them `(v0, v1, ...)`.
 impl fmt::Display for Operation {
+    // One arm per operation.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LoadAmount(v) => write!(f, "LoadAmount({v})"),
@@ -935,6 +971,20 @@ impl fmt::Display for Operation {
             Self::SendTxSignatures => write!(f, "SendTxSignatures"),
             Self::SendStfu { initiator } => write!(f, "SendStfu{{initiator={initiator}}}"),
             Self::RecvStfu => write!(f, "RecvStfu"),
+            Self::LoadContribution(v) => write!(f, "LoadContribution({v})"),
+            Self::SendSpliceInit {
+                require_confirmed_inputs,
+            } => write!(
+                f,
+                "SendSpliceInit{{require_confirmed_inputs={require_confirmed_inputs}}}"
+            ),
+            Self::SendTxAddSharedInput {
+                serial_id,
+                sequence,
+            } => write!(
+                f,
+                "SendTxAddSharedInput{{serial_id={serial_id}, sequence={sequence}}}"
+            ),
         }
     }
 }
@@ -996,7 +1046,10 @@ impl Operation {
             | Self::SendTxRemoveOutput { .. }
             | Self::SendTxComplete
             | Self::SendTxInitRbf { .. }
-            | Self::SendTxAddPreviousInput { .. } => Some(VariableType::SentInteractiveTx),
+            | Self::SendTxAddPreviousInput { .. }
+            | Self::SendSpliceInit { .. }
+            | Self::SendTxAddSharedInput { .. } => Some(VariableType::SentInteractiveTx),
+            Self::LoadContribution(_) => Some(VariableType::Contribution),
             Self::SendCommitmentSigned => Some(VariableType::SentCommitmentSigned),
             Self::SendFundingCreated => Some(VariableType::SentFundingCreated),
             Self::SendShutdown => Some(VariableType::SentShutdown),
@@ -1013,6 +1066,7 @@ impl Operation {
     pub fn input_types(&self) -> Vec<VariableType> {
         match self {
             Self::LoadAmount(_)
+            | Self::LoadContribution(_)
             | Self::LoadShortChannelId(_)
             | Self::LoadFeeratePerKw(_)
             | Self::LoadBlockHeight(_)
@@ -1136,7 +1190,15 @@ impl Operation {
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
             | Self::SendTxComplete
-            | Self::SendStfu { .. } => vec![VariableType::ChannelId],
+            | Self::SendStfu { .. }
+            | Self::SendTxAddSharedInput { .. } => vec![VariableType::ChannelId],
+            Self::SendSpliceInit { .. } => vec![
+                VariableType::ChannelId,    // channel_id
+                VariableType::Contribution, // funding_contribution_satoshis
+                VariableType::FeeratePerKw, // funding_feerate_perkw
+                VariableType::BlockHeight,  // locktime
+                VariableType::Point,        // funding_pubkey
+            ],
             Self::RecvStfu => vec![VariableType::SentStfu],
             Self::SendTxInitRbf { .. } => vec![
                 VariableType::ChannelId,    // channel_id
@@ -1254,7 +1316,10 @@ impl Operation {
             | Self::RecvTxSignatures
             | Self::SendTxSignatures
             | Self::SendStfu { .. }
-            | Self::RecvStfu => vec![],
+            | Self::RecvStfu
+            | Self::LoadContribution(_)
+            | Self::SendSpliceInit { .. }
+            | Self::SendTxAddSharedInput { .. } => vec![],
 
             Self::RecvAcceptChannel => AcceptChannelField::ALL
                 .iter()
@@ -1274,6 +1339,7 @@ impl Operation {
     pub fn has_side_effects(&self) -> bool {
         match self {
             Self::LoadAmount(_)
+            | Self::LoadContribution(_)
             | Self::LoadShortChannelId(_)
             | Self::LoadFeeratePerKw(_)
             | Self::LoadBlockHeight(_)
@@ -1329,7 +1395,9 @@ impl Operation {
             | Self::RecvTxSignatures
             | Self::SendTxSignatures
             | Self::SendStfu { .. }
-            | Self::RecvStfu => true,
+            | Self::RecvStfu
+            | Self::SendSpliceInit { .. }
+            | Self::SendTxAddSharedInput { .. } => true,
         }
     }
 
@@ -1378,7 +1446,8 @@ impl Operation {
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
             | Self::SendTxComplete
-            | Self::SendStfu { .. } => true,
+            | Self::SendStfu { .. }
+            | Self::LoadContribution(_) => true,
             // `CreateFundingTransaction` selects coins from the wallet, whose
             // contents change as transactions are created and broadcast.
             // `SendFundingCreated` builds its message from the recorded
@@ -1411,7 +1480,9 @@ impl Operation {
             | Self::MineEmptyBlocks(_)
             | Self::BroadcastTransaction
             | Self::LookupShortChannelId
-            | Self::RecvStfu => false,
+            | Self::RecvStfu
+            | Self::SendSpliceInit { .. }
+            | Self::SendTxAddSharedInput { .. } => false,
         }
     }
 
@@ -1455,7 +1526,10 @@ impl Operation {
             | Self::SendTxAddOutput { .. }
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
-            | Self::SendStfu { .. } => true,
+            | Self::SendStfu { .. }
+            | Self::LoadContribution(_)
+            | Self::SendSpliceInit { .. }
+            | Self::SendTxAddSharedInput { .. } => true,
 
             Self::LoadTargetPubkeyFromContext
             | Self::LoadChainHashFromContext

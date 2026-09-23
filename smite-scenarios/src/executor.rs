@@ -12,19 +12,21 @@ use smite::bolt::{
     ChannelReady, ChannelReadyTlvs, ChannelUpdate, CommitmentSigned, CommitmentSignedTlvs,
     Features, FromMessage, FundingCreated, FundingSigned, Message, MessageType, NodeAnnouncement,
     OpenChannel, OpenChannel2, OpenChannel2Tlvs, OpenChannelTlvs, Pong, ShortChannelId, Shutdown,
-    Stfu, TemporaryChannelId, TxAddInput, TxAddInputTlvs, TxAddOutput, TxComplete, TxInitRbf,
-    TxInitRbfTlvs, TxRemoveInput, TxRemoveOutput, TxSignatures, TxSignaturesTlvs,
+    SpliceInit, SpliceInitTlvs, Stfu, TemporaryChannelId, TxAddInput, TxAddInputTlvs, TxAddOutput,
+    TxComplete, TxInitRbf, TxInitRbfTlvs, TxRemoveInput, TxRemoveOutput, TxSignatures,
+    TxSignaturesTlvs,
 };
 use smite::channel_tx::{
     ChannelConfig, ChannelPartyConfig, ChannelState, Contributor, FundingTransaction,
-    HolderIdentity, SharedInput, SharedOutput, Side, Step, build_funding_transaction, signs_first,
+    HolderIdentity, SharedInput, SharedOutput, Side, Step, build_funding_transaction,
+    build_funding_witness_script, signs_first,
 };
 use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{
     AcceptChannelContext, AcceptChannelOracle, FundingSignedContext, FundingSignedOracle, Oracle,
 };
 use smite::pending_channel::{Exchange, FundingNegotiation, PendingChannel};
-use smite::pending_splice::Negotiations;
+use smite::pending_splice::{Negotiations, PendingSplice, PriorFunding};
 use smite::violation::Violation;
 
 use super::targets::TargetRpc;
@@ -971,6 +973,52 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     Some(Variable::SentInteractiveTx(channel_id))
                 }
 
+                Operation::LoadContribution(v) => Some(Variable::Contribution(*v)),
+
+                Operation::SendSpliceInit {
+                    require_confirmed_inputs,
+                } => {
+                    let msg = build_splice_init(
+                        &variables,
+                        &instr.inputs,
+                        *require_confirmed_inputs,
+                        &self.channel_states,
+                        &mut self.funding_negotiations,
+                    );
+                    let channel_id = msg.channel_id;
+                    let encoded = Message::SpliceInit(msg).encode();
+                    log::debug!(
+                        "[{:?}] SendSpliceInit: {} bytes",
+                        start.elapsed(),
+                        encoded.len(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
+
+                Operation::SendTxAddSharedInput {
+                    serial_id,
+                    sequence,
+                } => {
+                    let msg = build_tx_add_shared_input(
+                        &variables,
+                        &instr.inputs,
+                        *serial_id,
+                        *sequence,
+                        &self.channel_states,
+                        &mut self.funding_negotiations,
+                    );
+                    let channel_id = msg.channel_id;
+                    let encoded = Message::TxAddInput(msg).encode();
+                    log::debug!(
+                        "[{:?}] SendTxAddSharedInput: serial_id={serial_id}, {} bytes",
+                        start.elapsed(),
+                        encoded.len(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
+
                 Operation::SendStfu { initiator } => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
                     self.quiescence.entry(channel_id).or_default().sent = true;
@@ -1154,6 +1202,7 @@ macro_rules! define_resolver {
 }
 
 define_resolver!(resolve_amount, Amount, u64);
+define_resolver!(resolve_contribution, Contribution, i64);
 define_resolver!(resolve_feerate, FeeratePerKw, u32);
 define_resolver!(resolve_forwarding_fee, ForwardingFee, u32);
 define_resolver!(resolve_timestamp, Timestamp, u32);
@@ -1436,7 +1485,7 @@ fn build_tx_add_previous_input(
             .shared_tx()
             .inputs()
             .map(|(_, input)| input)
-            .filter(|input| input.contributor == Contributor::Local)
+            .filter(|input| input.contributor == Contributor::Local && !input.shared)
             .collect();
         (!ours.is_empty()).then(|| ours[usize::from(input_index) % ours.len()].clone())
     });
@@ -1506,6 +1555,96 @@ fn build_tx_init_rbf(
     }
 }
 
+/// Builds a `splice_init` and, on a live channel, starts the splice it
+/// proposes, spending the channel's current funding output.
+///
+/// A channel that is not live has no funding output both peers operate, so
+/// the message goes out for the peer to reject without a splice to track.
+fn build_splice_init(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+    require_confirmed_inputs: bool,
+    channel_states: &HashMap<ChannelId, ChannelState>,
+    negotiations: &mut Negotiations,
+) -> SpliceInit {
+    let msg = SpliceInit {
+        channel_id: resolve_channel_id(variables, inputs[0]),
+        funding_contribution_satoshis: resolve_contribution(variables, inputs[1]),
+        funding_feerate_perkw: resolve_feerate(variables, inputs[2]),
+        locktime: resolve_block_height(variables, inputs[3]),
+        funding_pubkey: resolve_pubkey(variables, inputs[4]),
+        tlvs: SpliceInitTlvs {
+            require_confirmed_inputs,
+        },
+    };
+
+    if let Some(state) = channel_states.get(&msg.channel_id)
+        && is_live(state)
+    {
+        let config = &state.config;
+        let prior = PriorFunding {
+            outpoint: config.funding_outpoint,
+            satoshis: config.funding_satoshis,
+            witness_script: build_funding_witness_script(
+                &config.opener.funding_pubkey,
+                &config.acceptor.funding_pubkey,
+            ),
+        };
+        negotiations
+            .splices
+            .insert(msg.channel_id, PendingSplice::new(msg.clone(), prior));
+    }
+
+    msg
+}
+
+/// Builds the `tx_add_input` spending the channel's current funding output,
+/// and records it in the splice.
+///
+/// Without a splice to take it from, the input names the channel's funding
+/// outpoint if the channel is tracked, so the peer still judges a shared
+/// input it did not agree to.
+fn build_tx_add_shared_input(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+    serial_id: u64,
+    sequence: u32,
+    channel_states: &HashMap<ChannelId, ChannelState>,
+    negotiations: &mut Negotiations,
+) -> TxAddInput {
+    let channel_id = resolve_channel_id(variables, inputs[0]);
+
+    let input = match negotiations.splices.get(&channel_id) {
+        Some(splice) => SharedInput::shared(splice.prior.outpoint, splice.prior.txout(), sequence),
+        None => SharedInput {
+            outpoint: channel_states
+                .get(&channel_id)
+                .map_or(OutPoint::null(), |state| state.config.funding_outpoint),
+            sequence,
+            contributor: Contributor::Local,
+            prevout: None,
+            shared: true,
+        },
+    };
+    let outpoint = input.outpoint;
+    record_sent_step(
+        negotiations,
+        channel_id,
+        Step::AddInput { serial_id, input },
+    );
+
+    TxAddInput {
+        channel_id,
+        serial_id,
+        prevtx: Vec::new(),
+        prevtx_vout: outpoint.vout,
+        sequence,
+        tlvs: TxAddInputTlvs {
+            shared_input_txid: Some(outpoint.txid),
+        },
+    }
+}
+
 /// Builds a `tx_add_output` and records it in the negotiation.
 ///
 /// The funding and change roles derive their value and script from the
@@ -1537,7 +1676,10 @@ fn build_tx_add_output(
                 let fee = shared_tx.local_fee_sat(attempt.feerate_perkw, &[change_script.len()]);
                 // An under-funded selection yields a zero-value output the peer
                 // rejects, rather than a panic.
-                (attempt.local_change_value(0, fee), change_script)
+                (
+                    attempt.local_change_value(pending.prior_capacity(), fee),
+                    change_script,
+                )
             })
         }
     };
@@ -1581,12 +1723,21 @@ fn apply_interactive_tx(
             m.channel_id,
             Step::AddInput {
                 serial_id: m.serial_id,
-                input: SharedInput::from_prevtx(
-                    &m.prevtx,
-                    m.prevtx_vout,
-                    m.sequence,
-                    Contributor::Remote,
-                ),
+                input: match m.tlvs.shared_input_txid {
+                    Some(txid) if m.prevtx.is_empty() => SharedInput {
+                        outpoint: OutPoint::new(txid, m.prevtx_vout),
+                        sequence: m.sequence,
+                        contributor: Contributor::Remote,
+                        prevout: None,
+                        shared: true,
+                    },
+                    _ => SharedInput::from_prevtx(
+                        &m.prevtx,
+                        m.prevtx_vout,
+                        m.sequence,
+                        Contributor::Remote,
+                    ),
+                },
             },
         ),
         Message::TxAddOutput(m) => (
@@ -1622,6 +1773,19 @@ fn apply_interactive_tx(
             {
                 log::debug!(
                     "tx_ack_rbf for {} answers no tx_init_rbf, ignoring",
+                    m.channel_id,
+                );
+            }
+            return Ok(());
+        }
+        Message::SpliceAck(m) => {
+            if !negotiations
+                .splices
+                .get_mut(&m.channel_id)
+                .is_some_and(|splice| splice.record_ack(m))
+            {
+                log::debug!(
+                    "splice_ack for {} answers no splice_init, ignoring",
                     m.channel_id,
                 );
             }
@@ -1714,6 +1878,10 @@ fn build_commitment_signed(
         tlvs: CommitmentSignedTlvs::default(),
     };
 
+    if negotiations.splices.contains_key(&channel_id) {
+        log::debug!("commitment_signed for splice of {channel_id}: not signed yet");
+        return Ok(unsigned(channel_id));
+    }
     let Some(pending) = negotiations.opens.get_mut(channel_id) else {
         return Ok(unsigned(channel_id));
     };

@@ -8,7 +8,8 @@
 //! purpose is to create malformed program.
 
 use super::harness::{
-    PointSource, SampleOpenChannel, acceptor_funding_sk, opener_funding_sk, v2_channel_id,
+    PointSource, SPLICE_FUNDING_KEY, SampleOpenChannel, acceptor_funding_sk, opener_funding_sk,
+    v2_channel_id,
 };
 use crate::executor::*;
 use smite::bolt::ChannelTypeVariant;
@@ -771,4 +772,69 @@ pub fn raw_program(instructions: &[(Operation, &[usize])]) -> Program {
 pub fn send_stfu(b: &mut ProgramBuilder, initiator: bool) -> usize {
     let channel_id = b.append(Operation::LoadChannelId(v2_channel_id().0), &[]);
     b.append(Operation::SendStfu { initiator }, &[channel_id])
+}
+
+// -- Splicing --
+
+/// The variables a splice of the live channel produces.
+#[derive(Clone, Copy)]
+pub struct SpliceVars {
+    pub channel_id: usize,
+    /// The `SendSpliceInit` result.
+    pub sent: usize,
+}
+
+/// Sends `splice_init` on the live channel, adding `contribution` at
+/// `feerate` with the [`SPLICE_FUNDING_KEY`].
+pub fn send_splice_init(b: &mut ProgramBuilder, contribution: i64, feerate: u32) -> SpliceVars {
+    let channel_id = b.append(Operation::LoadChannelId(v2_channel_id().0), &[]);
+    let contribution = b.append(Operation::LoadContribution(contribution), &[]);
+    let feerate = b.append(Operation::LoadFeeratePerKw(feerate), &[]);
+    let locktime = b.append(Operation::LoadBlockHeight(130), &[]);
+    let funding_privkey = b.append(Operation::LoadPrivateKey(SPLICE_FUNDING_KEY), &[]);
+    let funding_pubkey = b.append(Operation::DerivePoint, &[funding_privkey]);
+    let sent = b.append(
+        Operation::SendSpliceInit {
+            require_confirmed_inputs: false,
+        },
+        &[channel_id, contribution, feerate, locktime, funding_pubkey],
+    );
+
+    SpliceVars { channel_id, sent }
+}
+
+/// Sends the `tx_add_input` spending the channel's funding output.
+pub fn send_tx_add_shared_input(
+    b: &mut ProgramBuilder,
+    channel_id: usize,
+    serial_id: u64,
+) -> usize {
+    b.append(
+        Operation::SendTxAddSharedInput {
+            serial_id,
+            sequence: TX_ADD_INPUT_SEQUENCE,
+        },
+        &[channel_id],
+    )
+}
+
+/// Splices the live channel, taking `contribution` out when negative: sends
+/// `splice_init`, reads the peer's reply, then contributes the shared input,
+/// a wallet input when splicing in, and the funding and change outputs.
+/// Every turn reads the peer's reply; `splice_flow_replies` has them.
+pub fn splice_flow(b: &mut ProgramBuilder, contribution: i64, feerate: u32) -> SpliceVars {
+    let splice = send_splice_init(b, contribution, feerate);
+    recv_interactive_tx(b, splice.sent);
+    let shared = send_tx_add_shared_input(b, splice.channel_id, 0);
+    recv_interactive_tx(b, shared);
+    if contribution > 0 {
+        let input = send_tx_add_input(b, splice.channel_id, 2, 0);
+        recv_interactive_tx(b, input);
+    }
+    let funding = send_tx_add_output(b, splice.channel_id, 4, TxOutputRole::Funding);
+    recv_interactive_tx(b, funding);
+    let change = send_tx_add_output(b, splice.channel_id, 6, TxOutputRole::Change);
+    recv_interactive_tx(b, change);
+
+    splice
 }
