@@ -561,13 +561,19 @@ fn ir_mutator_envs(config: &CampaignConfig) -> Vec<(&'static str, String)> {
     // BOLT 2 makes the two channel establishment flows mutually exclusive on
     // one connection, so draw only from the generators this scenario's target
     // can act on. The other flow's programs would be rejected outright.
-    let generators = match config.scenario.as_str() {
+    let flow = match config.scenario.as_str() {
         "ir_v2" => "v2",
         // `ir` and `ir_bytes` both snapshot with `option_dual_fund` stripped.
         // A scenario added later lands here too: v1 is the safe default, since
         // every target supports it, but a v2 scenario must be named above or
         // it will fuzz a flow its snapshot cannot reach.
         _ => "v1",
+    };
+    // A target without `option_splice` would reject every splice program.
+    let generators = if config.target.supports_splicing() {
+        format!("{flow}-splice")
+    } else {
+        flow.to_string()
     };
     vec![
         (
@@ -576,7 +582,7 @@ fn ir_mutator_envs(config: &CampaignConfig) -> Vec<(&'static str, String)> {
         ),
         ("AFL_CUSTOM_MUTATOR_ONLY", "1".to_string()),
         ("AFL_FRAMESHIFT_DISABLE", "1".to_string()),
-        ("SMITE_IR_GENERATORS", generators.to_string()),
+        ("SMITE_IR_GENERATORS", generators),
     ]
 }
 
@@ -618,6 +624,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::config::Target;
 
     #[test]
     fn read_fuzzer_pid_parses_pid() {
@@ -1062,6 +1069,17 @@ sharedir = "{sharedir}"
         let envs = ir_mutator_envs(&config);
 
         assert_eq!(envs[3], ("SMITE_IR_GENERATORS", "v2".to_string()));
+    }
+
+    #[test]
+    fn ir_mutator_envs_adds_splicing_for_targets_that_support_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ir_config(dir.path(), "ir_v2");
+        config.target = Target::Eclair;
+
+        let envs = ir_mutator_envs(&config);
+
+        assert_eq!(envs[3], ("SMITE_IR_GENERATORS", "v2-splice".to_string()));
     }
 
     #[test]
