@@ -107,9 +107,14 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
         Operation::ExtractAcceptChannel2(field) => mutate_accept_channel2_field(field, rng),
         Operation::SendTxAddInput {
             serial_id,
-            utxo_index,
+            utxo_index: index,
             sequence,
-        } => mutate_tx_add_input(serial_id, utxo_index, sequence, rng),
+        }
+        | Operation::SendTxAddPreviousInput {
+            serial_id,
+            input_index: index,
+            sequence,
+        } => mutate_tx_add_input(serial_id, index, sequence, rng),
         Operation::SendTxAddOutput { serial_id, role } => {
             mutate_tx_add_output(serial_id, role, rng)
         }
@@ -119,6 +124,9 @@ fn mutate_operation(op: &mut Operation, rng: &mut impl Rng) -> bool {
             true
         }
         Operation::BuildOpenChannel2 {
+            require_confirmed_inputs,
+        }
+        | Operation::SendTxInitRbf {
             require_confirmed_inputs,
         } => {
             // Toggle the value-less `require_confirmed_inputs` TLV.
@@ -216,16 +224,17 @@ fn mutate_node_announcement(
 
 // -- Interactive transaction mutations --
 
-/// Mutates one of a `tx_add_input`'s three parameters.
+/// Mutates one of a `tx_add_input`'s three parameters. `index` picks the coin
+/// it spends, from the wallet or from the previous attempt.
 fn mutate_tx_add_input(
     serial_id: &mut u64,
-    utxo_index: &mut u8,
+    index: &mut u8,
     sequence: &mut u32,
     rng: &mut impl Rng,
 ) -> bool {
     match rng.random_range(0..3) {
         0 => *serial_id = tweak_serial_id(*serial_id, rng),
-        1 => *utxo_index = tweak_u8(*utxo_index, rng),
+        1 => *index = tweak_u8(*index, rng),
         _ => *sequence = tweak_sequence(*sequence, rng),
     }
     true

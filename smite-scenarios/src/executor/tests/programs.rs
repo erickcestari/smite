@@ -610,6 +610,68 @@ pub fn v2_funding_flow(b: &mut ProgramBuilder) -> V2FundingFlow {
     }
 }
 
+// -- RBF --
+
+/// Sends `tx_init_rbf` on `channel_id`, proposing an attempt with `nLockTime`
+/// `locktime` that pays `feerate` and puts `contribution` of ours in the
+/// funding output.
+pub fn send_tx_init_rbf(
+    b: &mut ProgramBuilder,
+    channel_id: usize,
+    locktime: u32,
+    feerate: u32,
+    contribution: u64,
+) -> usize {
+    let locktime = b.append(Operation::LoadBlockHeight(locktime), &[]);
+    let feerate = b.append(Operation::LoadFeeratePerKw(feerate), &[]);
+    let contribution = b.append(Operation::LoadAmount(contribution), &[]);
+    b.append(
+        Operation::SendTxInitRbf {
+            require_confirmed_inputs: false,
+        },
+        &[channel_id, locktime, feerate, contribution],
+    )
+}
+
+/// Re-adds our `input_index`th input of the previous attempt on `channel_id`.
+pub fn send_tx_add_previous_input(
+    b: &mut ProgramBuilder,
+    channel_id: usize,
+    serial_id: u64,
+    input_index: u8,
+) -> usize {
+    b.append(
+        Operation::SendTxAddPreviousInput {
+            serial_id,
+            input_index,
+            sequence: TX_ADD_INPUT_SEQUENCE,
+        },
+        &[channel_id],
+    )
+}
+
+/// Replaces `flow`'s funding transaction: `tx_init_rbf` at `feerate` keeping
+/// the open's contribution, then the previous input, the funding output and
+/// a change output. Returns the replacement flow; the peer's replies come
+/// from `rbf_flow_fixture`.
+pub fn rbf_funding_flow(
+    b: &mut ProgramBuilder,
+    flow: &V2FundingFlow,
+    feerate: u32,
+) -> V2FundingFlow {
+    let init = send_tx_init_rbf(b, flow.channel_id, 130, feerate, 200_000);
+    recv_interactive_tx(b, init);
+    send_tx_add_previous_input(b, flow.channel_id, 2, 0);
+    send_tx_add_output(b, flow.channel_id, 4, TxOutputRole::Funding);
+    send_tx_add_output(b, flow.channel_id, 6, TxOutputRole::Change);
+    let funding_tx = b.append(Operation::BuildFundingTransactionV2, &[flow.channel_id]);
+
+    V2FundingFlow {
+        funding_tx,
+        ..*flow
+    }
+}
+
 // -- Commitment and signature exchange --
 
 /// Sends our `commitment_signed` over `flow`'s funding transaction, signed

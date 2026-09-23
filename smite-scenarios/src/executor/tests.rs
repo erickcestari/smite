@@ -3220,3 +3220,254 @@ fn execute_recv_interactive_tx_records_a_peer_abort() {
     // An abort is not a tx_complete, so the negotiation has not concluded.
     assert!(!pending.attempt().tx_exchange.concluded());
 }
+
+// -- RBF --
+
+#[test]
+fn execute_send_tx_init_rbf_proposes_a_new_attempt() {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    send_tx_init_rbf(&mut b, flow.channel_id, 130, 300, 250_000);
+
+    let mut fx = v2_flow_fixture();
+    fx.run(&b.build());
+
+    let sent: TxInitRbf = fx.last_sent();
+    assert_eq!(sent.channel_id, v2_channel_id());
+    assert_eq!(sent.locktime, 130);
+    assert_eq!(sent.feerate, 300);
+    assert_eq!(sent.tlvs.funding_output_contribution, Some(250_000));
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert_eq!(pending.attempts().count(), 2);
+    let attempt = pending.attempt();
+    assert_eq!(attempt.tx_exchange.shared_tx().locktime, 130);
+    assert_eq!(attempt.tx_exchange.shared_tx().inputs().count(), 0);
+    assert_eq!(attempt.feerate_perkw, 300);
+    assert_eq!(attempt.local_funding_satoshis, 250_000);
+    // The peer owes its tx_ack_rbf.
+    assert!(pending.expects_reply());
+}
+
+#[test]
+fn execute_recv_interactive_tx_records_the_peers_rbf_contribution() {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    let init = send_tx_init_rbf(&mut b, flow.channel_id, 130, 300, 250_000);
+    recv_interactive_tx(&mut b, init);
+
+    let mut fx = v2_flow_fixture().queue(&tx_ack_rbf_reply(v2_channel_id(), Some(30_000)));
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert_eq!(pending.attempt().remote_funding_satoshis, 30_000);
+    assert_eq!(pending.total_funding_satoshis(), 280_000);
+    assert!(!pending.expects_reply());
+}
+
+#[test]
+fn execute_recv_interactive_tx_reads_a_negative_rbf_contribution_as_none() {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    let init = send_tx_init_rbf(&mut b, flow.channel_id, 130, 300, 250_000);
+    recv_interactive_tx(&mut b, init);
+
+    let mut fx = v2_flow_fixture().queue(&tx_ack_rbf_reply(v2_channel_id(), Some(-1)));
+    fx.run(&b.build());
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert_eq!(pending.attempt().remote_funding_satoshis, 0);
+}
+
+#[test]
+fn execute_recv_interactive_tx_abort_of_rbf_reverts_to_the_replaced_attempt() {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    let init = send_tx_init_rbf(&mut b, flow.channel_id, 130, 300, 250_000);
+    recv_interactive_tx(&mut b, init);
+
+    let mut fx = v2_flow_fixture().queue(&Message::TxAbort(TxAbort::new(
+        v2_channel_id(),
+        "rbf attempt too soon",
+    )));
+    fx.run(&b.build());
+
+    // BOLT 2 abandons only the RBF attempt: the original still funds the
+    // channel.
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    assert_eq!(pending.attempts().count(), 1);
+    assert!(!pending.attempt().tx_exchange.aborted());
+    assert_eq!(pending.total_funding_satoshis(), 200_000);
+    assert!(!pending.expects_reply());
+}
+
+#[test]
+fn execute_send_tx_add_previous_input_re_adds_our_input_without_the_wallet() {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    let init = send_tx_init_rbf(&mut b, flow.channel_id, 130, 300, 200_000);
+    recv_interactive_tx(&mut b, init);
+    send_tx_add_previous_input(&mut b, flow.channel_id, 2, 0);
+
+    let mut fx = v2_flow_fixture().queue(&tx_ack_rbf_reply(v2_channel_id(), Some(0)));
+    fx.run(&b.build());
+
+    let sent: TxAddInput = fx.last_sent();
+    assert_eq!(
+        sent.prevtx,
+        bitcoin::consensus::encode::serialize(&sample_prevtx())
+    );
+    assert_eq!(sent.prevtx_vout, 0);
+    // The first attempt locked the coin; re-adding it takes nothing more
+    // from the wallet.
+    assert_eq!(fx.bitcoin().locked_outpoints.len(), 1);
+
+    let pending = fx.negotiation_v2(sample_v2_temporary_channel_id());
+    let outpoints: Vec<Vec<OutPoint>> = pending
+        .attempts()
+        .map(|attempt| {
+            attempt
+                .tx_exchange
+                .shared_tx()
+                .inputs()
+                .map(|(_, input)| input.outpoint)
+                .collect()
+        })
+        .collect();
+    assert_eq!(outpoints[0], outpoints[1]);
+}
+
+#[test]
+fn execute_send_tx_add_previous_input_without_a_previous_attempt_sends_an_empty_prevtx() {
+    let mut b = ProgramBuilder::new();
+    let channel_id = negotiate_v2_channel(&mut b).channel_id;
+    send_tx_add_previous_input(&mut b, channel_id, 2, 0);
+
+    let mut fx = v2_fixture();
+    fx.run(&b.build());
+
+    assert!(fx.last_sent::<TxAddInput>().prevtx.is_empty());
+}
+
+#[test]
+fn execute_rbf_outputs_follow_the_new_feerate_and_contribution() {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    let init = send_tx_init_rbf(&mut b, flow.channel_id, 130, 1_000, 150_000);
+    recv_interactive_tx(&mut b, init);
+    send_tx_add_previous_input(&mut b, flow.channel_id, 2, 0);
+    send_tx_add_output(&mut b, flow.channel_id, 4, TxOutputRole::Funding);
+    send_tx_add_output(&mut b, flow.channel_id, 6, TxOutputRole::Change);
+
+    let mut fx = v2_flow_fixture().queue(&tx_ack_rbf_reply(v2_channel_id(), Some(0)));
+    fx.run(&b.build());
+
+    // Only our new 150_000 goes to the funding output, and the change pays
+    // the first attempt's weight of 610 at the new 1000 sat/kw.
+    let sent = fx.sent_len();
+    assert_eq!(fx.sent::<TxAddOutput>(sent - 2).sats, 150_000);
+    assert_eq!(
+        fx.sent::<TxAddOutput>(sent - 1).sats,
+        100_000_000 - 150_000 - 610
+    );
+}
+
+/// Runs the v2 funding flow and sends our `commitment_signed` over it, signed
+/// with `first_signer` if given, then replaces the funding transaction and
+/// sends our `commitment_signed` over the replacement, receiving the peer's
+/// if `recv`. The peer's replies come from `rbf_flow_fixture`.
+fn rbf_commitment_program(first_signer: Option<[u8; 32]>, recv: bool) -> Program {
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    let first_signer = first_signer.map_or(flow.inputs.funding_privkey, |sk| {
+        b.append(Operation::LoadPrivateKey(sk), &[])
+    });
+    b.append(
+        Operation::SendCommitmentSigned,
+        &[flow.funding_tx, first_signer, flow.channel_id],
+    );
+    let replacement = rbf_funding_flow(&mut b, &flow, 300);
+    let sent = send_commitment_signed(&mut b, &replacement);
+    if recv {
+        b.append(Operation::RecvCommitmentSigned, &[sent]);
+    }
+
+    b.build()
+}
+
+#[test]
+fn execute_recv_commitment_signed_verifies_the_rbf_replacement() {
+    // A first run establishes the channel state the peer signs against,
+    // which must have moved to the replacement's funding outpoint.
+    let mut fx = rbf_flow_fixture();
+    fx.run(&rbf_commitment_program(None, false));
+    let txids: Vec<Txid> = fx
+        .negotiation_v2(sample_v2_temporary_channel_id())
+        .attempts()
+        .map(|attempt| attempt.tx_exchange.shared_tx().build().compute_txid())
+        .collect();
+    assert_ne!(txids[0], txids[1]);
+    let state = fx.channel_state(&v2_channel_id());
+    assert_eq!(state.config.funding_outpoint.txid, txids[1]);
+    assert!(state.is_funding_outpoint_valid);
+    let reply =
+        counterparty_commitment_signed(state, v2_channel_id(), &sample_acceptor_funding_privkey());
+
+    // A fresh peer replays the flow and signs the replacement.
+    let mut fx = rbf_flow_fixture().queue(&Message::CommitmentSigned(reply));
+    fx.run(&rbf_commitment_program(None, true));
+
+    assert!(
+        fx.negotiation_v2(sample_v2_temporary_channel_id())
+            .attempt()
+            .commitment_exchange
+            .commitment_signed
+            .received
+    );
+}
+
+#[test]
+fn execute_rbf_commitment_signed_keeps_an_invalid_signature_sent() {
+    // The first commitment_signed is signed with a key other than the one
+    // open_channel2 announced, which the peer must reject.
+    let mut fx = rbf_flow_fixture();
+    fx.run(&rbf_commitment_program(Some([0x99; 32]), false));
+
+    assert!(fx.channel_state(&v2_channel_id()).sent_invalid_signature);
+}
+
+#[test]
+fn execute_recv_commitment_signed_for_an_rbf_attempt_we_did_not_sign_is_not_a_violation() {
+    // A mutated program can send the replacement's commitment_signed on
+    // another channel, so the state tracked here is still the replaced
+    // attempt's and cannot judge the peer's signature over the replacement.
+    let mut b = ProgramBuilder::new();
+    let flow = v2_funding_flow(&mut b);
+    let sent = send_commitment_signed(&mut b, &flow);
+    rbf_funding_flow(&mut b, &flow, 300);
+    b.append(Operation::RecvCommitmentSigned, &[sent]);
+    let reply = CommitmentSigned {
+        channel_id: v2_channel_id(),
+        signature: Signature::from_compact(&[0u8; 64]).expect("zero signature"),
+        htlc_signatures: Vec::new(),
+        tlvs: CommitmentSignedTlvs::default(),
+    };
+
+    let mut fx = rbf_flow_fixture().queue(&Message::CommitmentSigned(reply));
+    fx.run(&b.build());
+}
+
+#[test]
+fn apply_peer_witnesses_fills_an_attempt_rbf_moved_past() {
+    let mut negotiations = negotiation_with_peer_witnesses(vec![sample_peer_witness()]);
+    let pending = negotiations
+        .get_mut(sample_v2_temporary_channel_id())
+        .expect("negotiation");
+    let original = pending.attempt().tx_exchange.shared_tx().build();
+    pending.start_rbf(0, 300, 50_000);
+
+    // The original may still be the one that confirms.
+    let tx = apply_peer_witnesses(&negotiations, &original);
+
+    assert_eq!(tx.input[1].witness.len(), 2);
+}

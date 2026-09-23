@@ -711,6 +711,105 @@ fn mine_empty_blocks_operation() {
 }
 
 #[test]
+fn send_tx_init_rbf_operation() {
+    let op = Operation::SendTxInitRbf {
+        require_confirmed_inputs: true,
+    };
+    assert_eq!(
+        op.input_types(),
+        vec![
+            VariableType::ChannelId,
+            VariableType::BlockHeight,
+            VariableType::FeeratePerKw,
+            VariableType::Amount,
+        ],
+    );
+    // Its reply is read like any other turn of the exchange.
+    assert_eq!(op.output_type(), Some(VariableType::SentInteractiveTx));
+    assert!(op.is_param_mutable());
+    assert_eq!(
+        op.to_string(),
+        "SendTxInitRbf{require_confirmed_inputs=true}"
+    );
+}
+
+#[test]
+fn send_tx_add_previous_input_operation() {
+    let op = Operation::SendTxAddPreviousInput {
+        serial_id: 2,
+        input_index: 0,
+        sequence: 0xffff_fffd,
+    };
+    assert_eq!(op.input_types(), vec![VariableType::ChannelId]);
+    assert_eq!(op.output_type(), Some(VariableType::SentInteractiveTx));
+    assert!(op.is_param_mutable());
+    // It reads the previous attempt, so its position is meaningful.
+    assert!(!op.depends_only_on_inputs());
+    assert_eq!(
+        op.to_string(),
+        "SendTxAddPreviousInput{serial_id=2, input_index=0, sequence=4294967293}"
+    );
+}
+
+#[test]
+fn param_mutator_toggles_tx_init_rbf_confirmed_inputs() {
+    let mut program = Program {
+        instructions: vec![Instruction {
+            operation: Operation::SendTxInitRbf {
+                require_confirmed_inputs: false,
+            },
+            inputs: vec![],
+        }],
+    };
+    OperationParamMutator.mutate(&mut program, &mut SmallRng::seed_from_u64(0));
+
+    assert_eq!(
+        program.instructions[0].operation,
+        Operation::SendTxInitRbf {
+            require_confirmed_inputs: true,
+        },
+    );
+}
+
+#[test]
+fn param_mutator_changes_one_previous_input_param() {
+    let original = Operation::SendTxAddPreviousInput {
+        serial_id: 2,
+        input_index: 0,
+        sequence: 0xffff_fffd,
+    };
+    let mut rng = SmallRng::seed_from_u64(0);
+    let mut reached = [false; 3];
+
+    for _ in 0..50 {
+        let mut program = Program {
+            instructions: vec![Instruction {
+                operation: original.clone(),
+                inputs: vec![],
+            }],
+        };
+        OperationParamMutator.mutate(&mut program, &mut rng);
+        let Operation::SendTxAddPreviousInput {
+            serial_id,
+            input_index,
+            sequence,
+        } = program.instructions[0].operation
+        else {
+            panic!("OperationParamMutator changed the operation type");
+        };
+        let changed = [serial_id != 2, input_index != 0, sequence != 0xffff_fffd];
+        assert!(
+            changed.iter().filter(|&&c| c).count() <= 1,
+            "more than one parameter changed"
+        );
+        for (reached, changed) in reached.iter_mut().zip(changed) {
+            *reached |= changed;
+        }
+    }
+    assert_eq!(reached, [true; 3], "some parameter was never mutated");
+}
+
+#[test]
 fn create_and_broadcast_tx_operation() {
     let op = Operation::CreateFundingTransaction;
     assert_eq!(

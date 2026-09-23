@@ -4,7 +4,7 @@ use crate::executor::*;
 use bitcoin::{Amount, Transaction};
 use smite::bolt::{
     AcceptChannel2Tlvs, AcceptChannelTlvs, ChannelTypeVariant, CommitmentSigned,
-    CommitmentSignedTlvs, FromMessage,
+    CommitmentSignedTlvs, FromMessage, TxAckRbf, TxAckRbfTlvs,
 };
 use smite::pending_channel::PendingChannelV2;
 use std::collections::VecDeque;
@@ -787,6 +787,18 @@ pub fn tx_complete_reply(channel_id: ChannelId) -> Message {
     Message::TxComplete(TxComplete { channel_id })
 }
 
+/// A `tx_ack_rbf` from the peer contributing `contribution` to the funding
+/// output of the attempt our `tx_init_rbf` proposed.
+pub fn tx_ack_rbf_reply(channel_id: ChannelId, contribution: Option<i64>) -> Message {
+    Message::TxAckRbf(TxAckRbf {
+        channel_id,
+        tlvs: TxAckRbfTlvs {
+            funding_output_contribution: contribution,
+            require_confirmed_inputs: false,
+        },
+    })
+}
+
 /// A `commitment_signed` with a zero signature, standing for whatever the
 /// peer sends once the interactive transaction exchange concludes.
 pub fn commitment_signed_reply(channel_id: ChannelId) -> Message {
@@ -813,6 +825,15 @@ pub fn v2_flow_fixture() -> Fixture {
     Fixture::new()
         .with_v2_wallet()
         .queue_v2_flow_replies(sample_accept_channel2(sample_v2_temporary_channel_id()))
+}
+
+/// A [`v2_flow_fixture`] with the peer's side of `rbf_funding_flow` queued: a
+/// `tx_ack_rbf` contributing nothing, then a `tx_complete` answering each of
+/// the three contributions.
+pub fn rbf_flow_fixture() -> Fixture {
+    v2_flow_fixture()
+        .queue(&tx_ack_rbf_reply(v2_channel_id(), Some(0)))
+        .queue_repeated(&tx_complete_reply(v2_channel_id()), 3)
 }
 
 /// A [`v2_fixture`] with the peer's side of `settle_before_build` queued: one

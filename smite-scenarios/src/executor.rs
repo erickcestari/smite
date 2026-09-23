@@ -12,8 +12,8 @@ use smite::bolt::{
     ChannelReady, ChannelReadyTlvs, ChannelUpdate, CommitmentSigned, CommitmentSignedTlvs,
     Features, FromMessage, FundingCreated, FundingSigned, Message, MessageType, NodeAnnouncement,
     OpenChannel, OpenChannel2, OpenChannel2Tlvs, OpenChannelTlvs, Pong, ShortChannelId, Shutdown,
-    TemporaryChannelId, TxAddInput, TxAddInputTlvs, TxAddOutput, TxComplete, TxRemoveInput,
-    TxRemoveOutput, TxSignatures, TxSignaturesTlvs,
+    TemporaryChannelId, TxAddInput, TxAddInputTlvs, TxAddOutput, TxComplete, TxInitRbf,
+    TxInitRbfTlvs, TxRemoveInput, TxRemoveOutput, TxSignatures, TxSignaturesTlvs,
 };
 use smite::channel_tx::{
     ChannelConfig, ChannelPartyConfig, ChannelState, Contributor, FundingTransaction,
@@ -932,6 +932,54 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     }
                     None
                 }
+
+                Operation::SendTxInitRbf {
+                    require_confirmed_inputs,
+                } => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    // Replies the previous attempt is still owed arrive before
+                    // the tx_ack_rbf, so they are read first.
+                    self.settle_negotiation(channel_id)?;
+                    let msg = build_tx_init_rbf(
+                        &variables,
+                        &instr.inputs,
+                        *require_confirmed_inputs,
+                        &mut self.negotiations_v2,
+                    );
+                    let encoded = Message::TxInitRbf(msg).encode();
+                    log::debug!(
+                        "[{:?}] SendTxInitRbf: {} bytes",
+                        start.elapsed(),
+                        encoded.len(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
+
+                Operation::SendTxAddPreviousInput {
+                    serial_id,
+                    input_index,
+                    sequence,
+                } => {
+                    let msg = build_tx_add_previous_input(
+                        &variables,
+                        &instr.inputs,
+                        *serial_id,
+                        *input_index,
+                        *sequence,
+                        &mut self.bitcoin_cli,
+                        &mut self.negotiations_v2,
+                    );
+                    let channel_id = msg.channel_id;
+                    let encoded = Message::TxAddInput(msg).encode();
+                    log::debug!(
+                        "[{:?}] SendTxAddPreviousInput: serial_id={serial_id}, {} bytes",
+                        start.elapsed(),
+                        encoded.len(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    Some(Variable::SentInteractiveTx(channel_id))
+                }
             };
 
             variables.push(result);
@@ -1265,6 +1313,97 @@ fn build_tx_add_input(
     }
 }
 
+/// Builds a `tx_add_input` re-adding one of our inputs from the attempt the
+/// negotiation's RBF attempt replaces, and records it.
+///
+/// The coin is already locked and spent by that attempt, so it is taken from
+/// the attempt rather than the wallet. Without a previous attempt, or without
+/// an input of ours in it, the message goes out with an empty `prevtx` for the
+/// peer to reject, like `tx_add_input` from an empty wallet.
+fn build_tx_add_previous_input(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+    serial_id: u64,
+    input_index: u8,
+    sequence: u32,
+    cli: &mut impl BitcoinRpc,
+    negotiations: &mut V2Negotiations,
+) -> TxAddInput {
+    let channel_id = resolve_channel_id(variables, inputs[0]);
+
+    let previous = negotiations.get(channel_id).and_then(|pending| {
+        let ours: Vec<&SharedInput> = pending
+            .previous_attempt()?
+            .tx_exchange
+            .shared_tx()
+            .inputs()
+            .map(|(_, input)| input)
+            .filter(|input| input.contributor == Contributor::Local)
+            .collect();
+        (!ours.is_empty()).then(|| ours[usize::from(input_index) % ours.len()].clone())
+    });
+
+    let (prevtx, input) = match previous {
+        Some(input) => (
+            cli.get_raw_transaction(input.outpoint.txid)
+                .unwrap_or_default(),
+            SharedInput { sequence, ..input },
+        ),
+        None => (
+            Vec::new(),
+            SharedInput::from_prevtx(&[], 0, sequence, Contributor::Local),
+        ),
+    };
+    let prevtx_vout = input.outpoint.vout;
+    record_sent_step(
+        negotiations,
+        channel_id,
+        Step::AddInput { serial_id, input },
+    );
+
+    TxAddInput {
+        channel_id,
+        serial_id,
+        prevtx,
+        prevtx_vout,
+        sequence,
+        tlvs: TxAddInputTlvs::default(),
+    }
+}
+
+/// Builds a `tx_init_rbf` and, on a negotiation the peer has accepted, starts
+/// the attempt it proposes.
+///
+/// `funding_output_contribution` is always set: Eclair reads its absence as
+/// contributing nothing, where CLN reuses the previous amount.
+fn build_tx_init_rbf(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+    require_confirmed_inputs: bool,
+    negotiations: &mut V2Negotiations,
+) -> TxInitRbf {
+    let channel_id = resolve_channel_id(variables, inputs[0]);
+    let locktime = resolve_block_height(variables, inputs[1]);
+    let feerate = resolve_feerate(variables, inputs[2]);
+    let contribution = resolve_amount(variables, inputs[3]);
+
+    if let Some(pending) = negotiations.get_mut(channel_id)
+        && pending.accept_channel2.is_some()
+    {
+        pending.start_rbf(locktime, feerate, contribution);
+    }
+
+    TxInitRbf {
+        channel_id,
+        locktime,
+        feerate,
+        tlvs: TxInitRbfTlvs {
+            funding_output_contribution: Some(i64::try_from(contribution).unwrap_or(i64::MAX)),
+            require_confirmed_inputs,
+        },
+    }
+}
+
 /// Builds a `tx_add_output` and records it in the negotiation.
 ///
 /// The funding and change roles derive their value and script from the
@@ -1374,7 +1513,25 @@ fn apply_interactive_tx(
                 m.message().unwrap_or("<non-utf8>"),
             );
             if let Some(pending) = negotiations.get_mut(m.channel_id) {
-                pending.attempt_mut().tx_exchange.abort();
+                pending.abort();
+            }
+            return Ok(());
+        }
+        Message::TxAckRbf(m) => {
+            // Clamped at this boundary: a funding output takes no negative
+            // contribution, and BOLT 2 reads an absent one as nothing.
+            let contribution = m
+                .tlvs
+                .funding_output_contribution
+                .map_or(0, |sats| u64::try_from(sats).unwrap_or(0));
+            if !negotiations
+                .get_mut(m.channel_id)
+                .is_some_and(|pending| pending.record_ack_rbf(contribution))
+            {
+                log::debug!(
+                    "tx_ack_rbf for {} answers no tx_init_rbf, ignoring",
+                    m.channel_id,
+                );
             }
             return Ok(());
         }
@@ -1474,6 +1631,7 @@ fn build_commitment_signed(
     let open_channel2 = pending.open_channel2.clone();
     let total_funding_satoshis = pending.total_funding_satoshis();
     let on_derived_channel_id = pending.channel_id == Some(channel_id);
+    let in_rbf = pending.in_rbf();
     let attempt = pending.attempt_mut();
     let remote_funding_satoshis = attempt.remote_funding_satoshis;
     let already_sent = attempt.commitment_exchange.commitment_signed.sent;
@@ -1545,19 +1703,18 @@ fn build_commitment_signed(
         PublicKey::from_secret_key(&Secp256k1::new(), &opener_funding_privkey);
     let sent_invalid_signature = opener_funding_pubkey != open_channel2.funding_pubkey;
 
-    // Only track on the first `commitment_signed` for this negotiation, so a
-    // resend cannot clobber state that has already advanced.
+    // Only track on the first `commitment_signed` of each attempt, so a resend
+    // cannot clobber state that has already advanced.
     if on_derived_channel_id && !already_sent {
-        channel_states.entry(channel_id).or_insert_with(|| {
-            ChannelState::new(
-                config,
-                holder,
-                state,
-                is_funding_outpoint_valid,
-                mined_txids.contains(&funding_outpoint.txid),
-                sent_invalid_signature,
-            )
-        });
+        let state = ChannelState::new(
+            config,
+            holder,
+            state,
+            is_funding_outpoint_valid,
+            mined_txids.contains(&funding_outpoint.txid),
+            sent_invalid_signature,
+        );
+        track_channel_state(channel_states, channel_id, state, in_rbf);
     }
 
     Ok(CommitmentSigned {
@@ -1567,6 +1724,29 @@ fn build_commitment_signed(
         htlc_signatures: Vec::new(),
         tlvs: CommitmentSignedTlvs::default(),
     })
+}
+
+/// Tracks `channel_id` from `state`, which the first `commitment_signed` of
+/// an attempt was built on.
+///
+/// An RBF attempt moves a tracked channel to its own funding outpoint, but only
+/// before `channel_ready`, after which BOLT 2 forbids RBF; a signature the
+/// peer had to reject stays sent. Any other channel already tracked is left
+/// alone.
+fn track_channel_state(
+    channel_states: &mut HashMap<ChannelId, ChannelState>,
+    channel_id: ChannelId,
+    mut state: ChannelState,
+    in_rbf: bool,
+) {
+    match channel_states.get(&channel_id) {
+        None => {}
+        Some(previous) if in_rbf && awaits_channel_ready(previous) => {
+            state.sent_invalid_signature |= previous.sent_invalid_signature;
+        }
+        Some(_) => return,
+    }
+    channel_states.insert(channel_id, state);
 }
 
 /// Verifies the counterparty's `commitment_signed` against the holder's
@@ -2358,14 +2538,20 @@ fn is_channel_ready_expected(
     bitcoin_cli: &mut impl BitcoinRpc,
 ) -> bool {
     channel_states.values().any(|state| {
-        state.commitment.commitment_number == 0
-            && state.next_counterparty_per_commitment_point().is_none()
+        awaits_channel_ready(state)
             && state.is_funding_outpoint_valid
             && !state.was_funding_mined_prematurely
             && !state.sent_invalid_signature
             && bitcoin_cli.get_transaction_confirmations(state.config.funding_outpoint.txid)
                 >= state.config.minimum_depth
     })
+}
+
+/// Whether `state` is still at its initial commitment with no `channel_ready`
+/// received, so the counterparty's next per-commitment point is unknown.
+fn awaits_channel_ready(state: &ChannelState) -> bool {
+    state.commitment.commitment_number == 0
+        && state.next_counterparty_per_commitment_point().is_none()
 }
 
 /// Records a sent `open_channel`, keyed by `temporary_channel_id`, so the

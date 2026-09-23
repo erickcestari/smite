@@ -282,11 +282,10 @@ impl SharedTransaction {
     /// BOLT 2 splits fee responsibility: the initiator pays for the common
     /// transaction fields, and each peer pays for the inputs and outputs it
     /// contributed. This unconditionally charges both halves, which is correct
-    /// only while we are the initiator -- true for every caller today, since we
-    /// reach interactive construction by sending `open_channel2`. It stops
-    /// being true if `tx_init_rbf` is ever implemented, since an accepter that
-    /// initiates an RBF attempt becomes the initiator and takes the common
-    /// fields with it; splitting the two halves is the change to make then.
+    /// only while we are the initiator. We always are: we reach interactive
+    /// construction by sending `open_channel2` or `tx_init_rbf`, never by
+    /// accepting the peer's. Accepting its `tx_init_rbf` would hand it the
+    /// common fields, and splitting the two halves is the change to make then.
     ///
     /// `pending_output_script_lens` covers outputs we are about to add but have
     /// not added yet, which is what makes a change output's value computable

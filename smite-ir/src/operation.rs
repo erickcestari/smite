@@ -366,8 +366,9 @@ pub enum Operation {
     /// that we have nothing further to contribute.
     /// Input: `channel_id` (`ChannelId`).
     SendTxComplete,
-    /// Receive one interactive transaction construction message and apply it to
-    /// the negotiation it names.
+    /// Receive one interactive transaction construction message, or the
+    /// `tx_ack_rbf` answering `SendTxInitRbf`, and apply it to the negotiation
+    /// it names.
     ///
     /// Interactive transaction construction is turn-based, so each message we
     /// send earns exactly one reply; the affine input enforces that pairing in
@@ -424,6 +425,37 @@ pub enum Operation {
     /// refuse RBF until blocks have passed since the last attempt, and a block
     /// confirming the funding transaction would end RBF altogether.
     MineEmptyBlocks(u8),
+    /// Send `tx_init_rbf` (BOLT 2, type 72), starting an attempt to replace
+    /// the funding transaction with one paying `feerate`.
+    ///
+    /// Its reply, `tx_ack_rbf` or `tx_abort`, is read by `RecvInteractiveTx`
+    /// like any other turn of the exchange. The new attempt then runs its own
+    /// interactive transaction construction, `commitment_signed` and
+    /// `tx_signatures` on the same `channel_id`.
+    ///
+    /// Inputs (4):
+    ///   0: `channel_id` (`ChannelId`)
+    ///   1: `locktime` (`BlockHeight`)
+    ///   2: `feerate` (`FeeratePerKw`)
+    ///   3: `funding_output_contribution` (`Amount`)
+    SendTxInitRbf { require_confirmed_inputs: bool },
+    /// Build and send a `tx_add_input` re-adding one of our inputs from the
+    /// attempt this RBF attempt replaces.
+    ///
+    /// BOLT 2 has an RBF attempt spend an input of every previous attempt so
+    /// they all double-spend each other. Those coins are locked and already
+    /// spent in the mempool, so `SendTxAddInput` cannot reach them.
+    ///
+    /// Input: `channel_id` (`ChannelId`).
+    SendTxAddPreviousInput {
+        /// See [`Self::SendTxAddInput::serial_id`].
+        serial_id: u64,
+        /// Selects one of our inputs of the previous attempt, in `serial_id`
+        /// order, modulo how many there are.
+        input_index: u8,
+        /// See [`Self::SendTxAddInput::sequence`].
+        sequence: u32,
+    },
 }
 
 /// Where a `tx_add_output`'s value and script come from.
@@ -832,6 +864,21 @@ impl fmt::Display for Operation {
             Self::RecvChannelReady => write!(f, "RecvChannelReady()"),
             Self::MineBlocks(v) => write!(f, "MineBlocks({v})"),
             Self::MineEmptyBlocks(v) => write!(f, "MineEmptyBlocks({v})"),
+            Self::SendTxInitRbf {
+                require_confirmed_inputs,
+            } => write!(
+                f,
+                "SendTxInitRbf{{require_confirmed_inputs={require_confirmed_inputs}}}"
+            ),
+            Self::SendTxAddPreviousInput {
+                serial_id,
+                input_index,
+                sequence,
+            } => write!(
+                f,
+                "SendTxAddPreviousInput{{serial_id={serial_id}, input_index={input_index}, \
+                 sequence={sequence}}}"
+            ),
             Self::BroadcastTransaction => write!(f, "BroadcastTransaction"),
             Self::LookupShortChannelId => write!(f, "LookupShortChannelId"),
             Self::DeriveTemporaryChannelIdV2 => write!(f, "DeriveTemporaryChannelIdV2"),
@@ -927,7 +974,9 @@ impl Operation {
             | Self::SendTxAddOutput { .. }
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
-            | Self::SendTxComplete => Some(VariableType::SentInteractiveTx),
+            | Self::SendTxComplete
+            | Self::SendTxInitRbf { .. }
+            | Self::SendTxAddPreviousInput { .. } => Some(VariableType::SentInteractiveTx),
             Self::SendCommitmentSigned => Some(VariableType::SentCommitmentSigned),
             Self::SendFundingCreated => Some(VariableType::SentFundingCreated),
             Self::SendShutdown => Some(VariableType::SentShutdown),
@@ -1063,9 +1112,16 @@ impl Operation {
             ],
             Self::ExtractAcceptChannel2(_) => vec![VariableType::AcceptChannel2],
             Self::SendTxAddInput { .. }
+            | Self::SendTxAddPreviousInput { .. }
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
             | Self::SendTxComplete => vec![VariableType::ChannelId],
+            Self::SendTxInitRbf { .. } => vec![
+                VariableType::ChannelId,    // channel_id
+                VariableType::BlockHeight,  // locktime
+                VariableType::FeeratePerKw, // feerate
+                VariableType::Amount,       // funding_output_contribution
+            ],
             Self::SendTxAddOutput { .. } => vec![
                 VariableType::ChannelId, // channel_id
                 VariableType::Amount,    // sats
@@ -1163,6 +1219,8 @@ impl Operation {
             | Self::BuildOpenChannel2 { .. }
             | Self::SendOpenChannel2
             | Self::SendTxAddInput { .. }
+            | Self::SendTxInitRbf { .. }
+            | Self::SendTxAddPreviousInput { .. }
             | Self::SendTxAddOutput { .. }
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
@@ -1234,6 +1292,8 @@ impl Operation {
             | Self::SendOpenChannel2
             | Self::RecvAcceptChannel2
             | Self::SendTxAddInput { .. }
+            | Self::SendTxInitRbf { .. }
+            | Self::SendTxAddPreviousInput { .. }
             | Self::SendTxAddOutput { .. }
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. }
@@ -1301,10 +1361,14 @@ impl Operation {
             // against it, `MineEmptyBlocks` leaves unconfirmed whatever was
             // broadcast before it, and `LookupShortChannelId` reads chain
             // state. The `tx_add_*` operations pick a wallet UTXO and a fresh
-            // change address, so they read the wallet too.
+            // change address, so they read the wallet too, and
+            // `SendTxAddPreviousInput` reads the previous attempt.
+            // `SendTxInitRbf` first reads what the peer still owes.
             Self::CreateFundingTransaction
             | Self::SendFundingCreated
             | Self::SendTxAddInput { .. }
+            | Self::SendTxInitRbf { .. }
+            | Self::SendTxAddPreviousInput { .. }
             | Self::SendTxAddOutput { .. }
             | Self::BuildFundingTransactionV2
             | Self::SendCommitmentSigned
@@ -1358,6 +1422,8 @@ impl Operation {
             | Self::ExtractAcceptChannel2(_)
             | Self::BuildOpenChannel2 { .. }
             | Self::SendTxAddInput { .. }
+            | Self::SendTxInitRbf { .. }
+            | Self::SendTxAddPreviousInput { .. }
             | Self::SendTxAddOutput { .. }
             | Self::SendTxRemoveInput { .. }
             | Self::SendTxRemoveOutput { .. } => true,

@@ -56,6 +56,8 @@ pub struct FundingAttempt {
     pub local_funding_satoshis: u64,
     /// What the peer contributes to the funding output; 0 until it says.
     pub remote_funding_satoshis: u64,
+    /// Whether our `tx_init_rbf` still awaits the peer's `tx_ack_rbf`.
+    pub ack_pending: bool,
 }
 
 impl FundingAttempt {
@@ -69,6 +71,7 @@ impl FundingAttempt {
             feerate_perkw,
             local_funding_satoshis,
             remote_funding_satoshis: 0,
+            ack_pending: false,
         }
     }
 }
@@ -128,15 +131,67 @@ impl PendingChannelV2 {
             .unwrap_or(&mut self.first_attempt)
     }
 
+    /// The attempt before the latest, which an RBF attempt must share an
+    /// input with. `None` until RBF starts one.
+    #[must_use]
+    pub fn previous_attempt(&self) -> Option<&FundingAttempt> {
+        match self.rbf_attempts.len() {
+            0 => None,
+            1 => Some(&self.first_attempt),
+            n => self.rbf_attempts.get(n - 2),
+        }
+    }
+
     /// Every attempt at the funding transaction, oldest first.
     pub fn attempts(&self) -> impl Iterator<Item = &FundingAttempt> {
         std::iter::once(&self.first_attempt).chain(&self.rbf_attempts)
     }
 
-    /// Whether the peer owes us a reply in the latest attempt.
+    /// Whether the latest attempt was started by RBF.
+    #[must_use]
+    pub fn in_rbf(&self) -> bool {
+        !self.rbf_attempts.is_empty()
+    }
+
+    /// Whether the peer owes us a reply in the latest attempt: its
+    /// `tx_ack_rbf`, then one per interactive transaction message.
     #[must_use]
     pub fn expects_reply(&self) -> bool {
-        self.attempt().tx_exchange.expects_reply()
+        let attempt = self.attempt();
+        attempt.ack_pending || attempt.tx_exchange.expects_reply()
+    }
+
+    /// Records a sent `tx_init_rbf`, starting an attempt that awaits the
+    /// peer's `tx_ack_rbf`.
+    pub fn start_rbf(&mut self, locktime: u32, feerate_perkw: u32, local_funding_satoshis: u64) {
+        let mut attempt = FundingAttempt::new(locktime, feerate_perkw, local_funding_satoshis);
+        attempt.ack_pending = true;
+        self.rbf_attempts.push(attempt);
+    }
+
+    /// Records the peer's `tx_ack_rbf` and its funding contribution.
+    ///
+    /// Returns `false`, recording nothing, when no `tx_init_rbf` awaits one.
+    pub fn record_ack_rbf(&mut self, remote_funding_satoshis: u64) -> bool {
+        let attempt = self.attempt_mut();
+        if !attempt.ack_pending {
+            return false;
+        }
+        attempt.ack_pending = false;
+        attempt.remote_funding_satoshis = remote_funding_satoshis;
+        true
+    }
+
+    /// Records the peer's `tx_abort`.
+    ///
+    /// Aborting an RBF attempt abandons only that attempt, per BOLT 2: the
+    /// transaction it would have replaced still funds the channel, so it is
+    /// the latest attempt again. Aborting the first attempt ends the
+    /// negotiation.
+    pub fn abort(&mut self) {
+        if self.rbf_attempts.pop().is_none() {
+            self.first_attempt.tx_exchange.abort();
+        }
     }
 
     /// The funding output's `scriptPubKey`, once `accept_channel2` has
