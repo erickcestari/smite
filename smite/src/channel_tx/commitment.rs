@@ -289,6 +289,20 @@ impl ChannelState {
             .funding_pubkey
     }
 
+    /// The holder's balance in the current commitment, in millisatoshis.
+    #[must_use]
+    pub fn holder_balance_msat(&self) -> u64 {
+        self.commitment.party(self.holder.side).balance_msat
+    }
+
+    /// The counterparty's balance in the current commitment, in millisatoshis.
+    #[must_use]
+    pub fn counterparty_balance_msat(&self) -> u64 {
+        self.commitment
+            .party(self.holder.counterparty_side())
+            .balance_msat
+    }
+
     /// The state of a splice candidate: this channel moved onto `funding`, with
     /// the holder signing through `holder_funding_privkey`.
     ///

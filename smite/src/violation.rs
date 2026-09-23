@@ -80,4 +80,11 @@ pub enum Violation {
     /// the channel over.
     #[error("invalid splice_locked for channel_id {0}: {1}")]
     InvalidSpliceLocked(ChannelId, String),
+
+    /// The target's `splice_ack`, or `tx_ack_rbf` of a splice, broke a BOLT 2
+    /// requirement, as judged by [`crate::oracles::SpliceAckOracle`]: it
+    /// accepts a proposal BOLT 2 required it to reject, or takes out more
+    /// than the target's balance.
+    #[error("invalid splice acceptance for channel_id {0}: {1}")]
+    InvalidSpliceAck(ChannelId, String),
 }

@@ -997,9 +997,12 @@ pub fn splice_ack_reply(contribution: i64) -> Message {
 }
 
 /// A fixture with the live channel seeded and the v2 wallet funded, ready to
-/// splice.
+/// splice, with the peer's `stfu` quiescing it queued.
 pub fn splice_fixture() -> Fixture {
-    Fixture::new().with_v2_wallet().with_live_channel()
+    Fixture::new()
+        .with_v2_wallet()
+        .with_live_channel()
+        .queue(&stfu_reply(0))
 }
 
 /// The peer's `stfu` on the live channel.
