@@ -56,6 +56,15 @@ pub enum Target {
     Eclair,
 }
 
+impl Target {
+    /// Whether the pinned version negotiates `option_splice`. LND implements
+    /// only quiescence.
+    #[must_use]
+    pub fn supports_splicing(self) -> bool {
+        !matches!(self, Self::Lnd)
+    }
+}
+
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
