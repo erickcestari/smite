@@ -12,8 +12,8 @@ use smite::bolt::{
     ChannelReady, ChannelReadyTlvs, ChannelUpdate, CommitmentSigned, CommitmentSignedTlvs,
     Features, FromMessage, FundingCreated, FundingSigned, Message, MessageType, NodeAnnouncement,
     OpenChannel, OpenChannel2, OpenChannel2Tlvs, OpenChannelTlvs, Pong, ShortChannelId, Shutdown,
-    SpliceInit, SpliceInitTlvs, Stfu, TemporaryChannelId, TxAddInput, TxAddInputTlvs, TxAddOutput,
-    TxComplete, TxInitRbf, TxInitRbfTlvs, TxRemoveInput, TxRemoveOutput, TxSignatures,
+    SpliceInit, SpliceInitTlvs, SpliceLocked, Stfu, TemporaryChannelId, TxAddInput, TxAddInputTlvs,
+    TxAddOutput, TxComplete, TxInitRbf, TxInitRbfTlvs, TxRemoveInput, TxRemoveOutput, TxSignatures,
     TxSignaturesTlvs,
 };
 use smite::channel_tx::{
@@ -1045,6 +1045,47 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     Some(Variable::SentInteractiveTx(channel_id))
                 }
 
+                Operation::SendSpliceLocked => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    let splice_txid = resolve_funding_transaction(&variables, instr.inputs[1])
+                        .tx
+                        .compute_txid();
+                    if let Some(splice) = self.funding_negotiations.splices.get_mut(&channel_id) {
+                        splice.locked_sent = Some(splice_txid);
+                    }
+                    let encoded = Message::SpliceLocked(SpliceLocked {
+                        channel_id,
+                        splice_txid,
+                    })
+                    .encode();
+                    log::debug!(
+                        "[{:?}] SendSpliceLocked: splice_txid={splice_txid}",
+                        start.elapsed(),
+                    );
+                    self.conn.send_message(&encoded)?;
+                    self.complete_splice(channel_id);
+                    None
+                }
+
+                Operation::RecvSpliceLocked => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    if self.is_splice_locked_expected(channel_id) {
+                        log::debug!("[{:?}] RecvSpliceLocked: waiting", start.elapsed());
+                        // Sent once the peer sees the splice confirm, so it
+                        // waits on block polling like `channel_ready`.
+                        let msg: SpliceLocked =
+                            recv_bolt(&mut self.conn, RECV_CHANNEL_READY_TIMEOUT)?;
+                        log::debug!(
+                            "[{:?}] RecvSpliceLocked: splice_txid={}",
+                            start.elapsed(),
+                            msg.splice_txid,
+                        );
+                        record_splice_locked(&msg, &mut self.funding_negotiations)?;
+                        self.complete_splice(msg.channel_id);
+                    }
+                    None
+                }
+
                 Operation::SendStfu { initiator } => {
                     let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
                     self.quiescence.entry(channel_id).or_default().sent = true;
@@ -1142,6 +1183,55 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
             ));
         }
         Ok(())
+    }
+
+    /// Whether the peer owes us `splice_locked` on `channel_id`: it has not
+    /// sent one, and a splice transaction it can broadcast, since we signed a
+    /// valid commitment and sent our `tx_signatures` for it, has the channel's
+    /// `minimum_depth`.
+    fn is_splice_locked_expected(&mut self, channel_id: ChannelId) -> bool {
+        let (Some(splice), Some(state)) = (
+            self.funding_negotiations.splices.get(&channel_id),
+            self.channel_states.get(&channel_id),
+        ) else {
+            return false;
+        };
+        if splice.locked_received.is_some() {
+            return false;
+        }
+        let minimum_depth = state.config.minimum_depth;
+        splice
+            .funding_attempts()
+            .all()
+            .filter(|attempt| {
+                let exchange = attempt.commitment_exchange;
+                exchange.commitment_signed.sent && exchange.tx_signatures.sent
+            })
+            .map(|attempt| attempt.tx_exchange.shared_tx().build().compute_txid())
+            .filter(|txid| {
+                splice.candidates.get(txid).is_some_and(|candidate| {
+                    candidate.is_funding_outpoint_valid && !candidate.sent_invalid_signature
+                })
+            })
+            .any(|txid| self.bitcoin_cli.get_transaction_confirmations(txid) >= minimum_depth)
+    }
+
+    /// Moves `channel_id` onto its splice's funding output once both peers
+    /// sent `splice_locked` for the same transaction.
+    fn complete_splice(&mut self, channel_id: ChannelId) {
+        let Some(splice) = self.funding_negotiations.splices.get_mut(&channel_id) else {
+            return;
+        };
+        let Some(txid) = splice.locked_txid() else {
+            return;
+        };
+        match splice.candidates.remove(&txid) {
+            Some(candidate) => {
+                log::debug!("splice of {channel_id} locked on {txid}");
+                self.channel_states.insert(channel_id, candidate);
+            }
+            None => log::debug!("splice of {channel_id} locked on {txid}, which we never signed"),
+        }
     }
 
     /// Reads the `stfu` the peer owes on `channel_id`, applying any
@@ -2245,6 +2335,33 @@ fn verify_splice_commitment_signed(
         ),
     }
     attempt.commitment_exchange.commitment_signed.received = true;
+    Ok(())
+}
+
+/// Records the peer's `splice_locked`.
+///
+/// # Errors
+///
+/// Returns [`Violation::InvalidSpliceLocked`] if it names a transaction none
+/// of the channel's splice attempts built, which BOLT 2 has the receiver fail
+/// the channel over.
+fn record_splice_locked(
+    msg: &SpliceLocked,
+    negotiations: &mut Negotiations,
+) -> Result<(), Violation> {
+    let Some(splice) = negotiations.splices.get_mut(&msg.channel_id) else {
+        return Err(Violation::InvalidSpliceLocked(
+            msg.channel_id,
+            "no splice was negotiated".into(),
+        ));
+    };
+    if !splice.has_attempt(msg.splice_txid) {
+        return Err(Violation::InvalidSpliceLocked(
+            msg.channel_id,
+            format!("{} is not a splice transaction", msg.splice_txid),
+        ));
+    }
+    splice.locked_received = Some(msg.splice_txid);
     Ok(())
 }
 

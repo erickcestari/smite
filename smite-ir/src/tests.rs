@@ -806,6 +806,21 @@ fn splice_operations() {
 }
 
 #[test]
+fn splice_locked_operations() {
+    let send = Operation::SendSpliceLocked;
+    assert_eq!(
+        send.input_types(),
+        vec![VariableType::ChannelId, VariableType::FundingTransaction]
+    );
+    assert_eq!(send.output_type(), None);
+    assert!(!send.is_param_mutable());
+
+    let recv = Operation::RecvSpliceLocked;
+    assert_eq!(recv.input_types(), vec![VariableType::ChannelId]);
+    assert!(!recv.is_pure());
+}
+
+#[test]
 fn param_mutator_reaches_both_signs_of_a_contribution() {
     let mut rng = SmallRng::seed_from_u64(0);
     let mut signs = [false; 2];

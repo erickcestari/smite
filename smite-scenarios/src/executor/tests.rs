@@ -3745,8 +3745,9 @@ fn splice_program(stage: SpliceStage) -> Program {
     b.build()
 }
 
-/// Appends [`splice_program`] to `b`.
-fn append_splice(b: &mut ProgramBuilder, stage: SpliceStage) {
+/// Appends [`splice_program`] to `b`, returning the splice and its
+/// transaction.
+fn append_splice(b: &mut ProgramBuilder, stage: SpliceStage) -> (SpliceVars, usize) {
     let b = &mut *b;
     let splice = splice_flow(b, -50_000, 1_000);
     send_tx_complete(b, splice.channel_id);
@@ -3768,6 +3769,7 @@ fn append_splice(b: &mut ProgramBuilder, stage: SpliceStage) {
         );
         b.append(Operation::BroadcastTransaction, &[funding_tx]);
     }
+    (splice, funding_tx)
 }
 
 /// The peer's replies to a splice through `commitment_signed` and
@@ -4004,5 +4006,72 @@ fn execute_recv_tx_signatures_with_a_shared_input_signature_by_the_new_key_is_a_
     assert!(
         matches!(err, ExecuteError::Violation(Violation::InvalidTxSignatures(id, _)) if id == v2_channel_id()),
         "expected InvalidTxSignatures, got {err:?}"
+    );
+}
+
+/// Splices the live channel out by 50k through broadcast, mines `blocks`, and
+/// exchanges `splice_locked`, ours first.
+fn splice_locked_program(blocks: u8) -> Program {
+    let mut b = ProgramBuilder::new();
+    let (splice, funding_tx) = append_splice(&mut b, SpliceStage::Broadcast);
+    b.append(Operation::MineBlocks(blocks), &[]);
+    b.append(
+        Operation::SendSpliceLocked,
+        &[splice.channel_id, funding_tx],
+    );
+    b.append(Operation::RecvSpliceLocked, &[splice.channel_id]);
+    b.build()
+}
+
+/// The peer's `splice_locked` naming `splice_txid`.
+fn splice_locked_reply(splice_txid: Txid) -> Message {
+    Message::SpliceLocked(SpliceLocked {
+        channel_id: v2_channel_id(),
+        splice_txid,
+    })
+}
+
+#[test]
+fn execute_splice_locked_both_ways_moves_the_channel_onto_the_splice() {
+    let replies = PeerSpliceReplies::new();
+    let txid = replies.tx_signatures.txid;
+    let mut fx = replies.fixture().queue(&splice_locked_reply(txid));
+    fx.run(&splice_locked_program(6));
+
+    assert_eq!(fx.last_sent::<SpliceLocked>().splice_txid, txid);
+    let state = fx.channel_state(&v2_channel_id());
+    assert_eq!(state.config.funding_outpoint.txid, txid);
+    assert_eq!(state.config.funding_satoshis, 150_000);
+    assert_eq!(state.commitment.opener.balance_msat, 150_000_000);
+    // Still live, so it can be spliced again.
+    assert!(state.next_counterparty_per_commitment_point().is_some());
+}
+
+#[test]
+fn execute_recv_splice_locked_below_minimum_depth_reads_nothing() {
+    let replies = PeerSpliceReplies::new();
+    let txid = replies.tx_signatures.txid;
+    let mut fx = replies.fixture().queue(&splice_locked_reply(txid));
+    fx.run(&splice_locked_program(5));
+
+    assert_eq!(fx.queued_len(), 1);
+    assert_eq!(
+        fx.channel_state(&v2_channel_id()).config.funding_outpoint,
+        live_funding_outpoint()
+    );
+}
+
+#[test]
+fn execute_recv_splice_locked_naming_no_splice_transaction_is_a_violation() {
+    let replies = PeerSpliceReplies::new();
+    let mut fx = replies
+        .fixture()
+        .queue(&splice_locked_reply(live_funding_outpoint().txid));
+
+    let err = fx.run_err(&splice_locked_program(6));
+
+    assert!(
+        matches!(err, ExecuteError::Violation(Violation::InvalidSpliceLocked(id, _)) if id == v2_channel_id()),
+        "expected InvalidSpliceLocked, got {err:?}"
     );
 }

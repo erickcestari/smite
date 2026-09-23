@@ -74,4 +74,10 @@ pub enum Violation {
     /// quiescence.
     #[error("invalid stfu for channel_id {0}: {1}")]
     InvalidStfu(ChannelId, String),
+
+    /// The target's `splice_locked` named a transaction that is not one of
+    /// the channel's splice transactions, which BOLT 2 has the receiver fail
+    /// the channel over.
+    #[error("invalid splice_locked for channel_id {0}: {1}")]
+    InvalidSpliceLocked(ChannelId, String),
 }

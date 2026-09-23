@@ -64,6 +64,10 @@ pub struct PendingSplice {
     /// The channel moved onto each attempt's funding output, keyed by the
     /// funding txid our `commitment_signed` committed to.
     pub candidates: HashMap<Txid, ChannelState>,
+    /// The splice transaction our latest `splice_locked` named.
+    pub locked_sent: Option<Txid>,
+    /// The splice transaction the peer's `splice_locked` named.
+    pub locked_received: Option<Txid>,
     attempts: FundingAttempts,
 }
 
@@ -84,6 +88,8 @@ impl PendingSplice {
             splice_ack: None,
             prior,
             candidates: HashMap::new(),
+            locked_sent: None,
+            locked_received: None,
             attempts: FundingAttempts::new(first),
         }
     }
@@ -101,6 +107,22 @@ impl PendingSplice {
         first.remote_contribution = splice_ack.funding_contribution_satoshis;
         self.splice_ack = Some(splice_ack.clone());
         true
+    }
+
+    /// Whether `txid` is the transaction of one of its attempts.
+    #[must_use]
+    pub fn has_attempt(&self, txid: Txid) -> bool {
+        self.attempts
+            .all()
+            .any(|attempt| attempt.tx_exchange.shared_tx().build().compute_txid() == txid)
+    }
+
+    /// The splice transaction both peers sent `splice_locked` for, which BOLT 2
+    /// makes the channel's funding transaction.
+    #[must_use]
+    pub fn locked_txid(&self) -> Option<Txid> {
+        self.locked_sent
+            .filter(|txid| self.locked_received == Some(*txid))
     }
 }
 
@@ -264,6 +286,21 @@ mod tests {
 
         assert!(!splice.expects_reply());
         assert!(splice.attempt().tx_exchange.aborted());
+    }
+
+    #[test]
+    fn locked_txid_needs_both_peers_on_the_same_transaction() {
+        let mut splice = splice(0);
+        let ours = bitcoin::Txid::from_byte_array([1; 32]);
+        let theirs = bitcoin::Txid::from_byte_array([2; 32]);
+
+        splice.locked_sent = Some(ours);
+        assert_eq!(splice.locked_txid(), None);
+        // Different RBF candidates do not lock anything.
+        splice.locked_received = Some(theirs);
+        assert_eq!(splice.locked_txid(), None);
+        splice.locked_received = Some(ours);
+        assert_eq!(splice.locked_txid(), Some(ours));
     }
 
     #[test]
