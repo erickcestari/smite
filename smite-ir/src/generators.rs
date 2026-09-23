@@ -11,6 +11,7 @@ mod channel_update;
 mod dual_funding_flow;
 mod funding_created;
 mod funding_flow;
+mod interactive_tx;
 mod node_announcement;
 mod open_channel;
 
