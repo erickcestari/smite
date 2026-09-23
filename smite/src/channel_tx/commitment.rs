@@ -35,6 +35,11 @@ pub enum CommitmentError {
     /// Push amount exceeds the total funding amount.
     #[error("push_msat exceeds funding_msat")]
     PushExceedsFunding,
+
+    /// A splice contribution takes out more than its side's balance, or adds
+    /// more than a balance can hold.
+    #[error("splice contribution out of range for the balance")]
+    ContributionOutOfRange,
 }
 
 /// Identifies the channel participant relative to the funding flow.
@@ -45,6 +50,7 @@ pub enum Side {
 }
 
 /// Holder's identity and funding secret for the commitment.
+#[derive(Clone)]
 pub struct HolderIdentity {
     /// Whether the holder is the channel opener or acceptor.
     pub side: Side,
@@ -53,6 +59,7 @@ pub struct HolderIdentity {
 }
 
 /// Static public keys and channel parameters for one side of a channel (opener or acceptor).
+#[derive(Clone)]
 pub struct ChannelPartyConfig {
     /// Funding pubkey used in the funding output.
     pub funding_pubkey: PublicKey,
@@ -69,6 +76,7 @@ pub struct ChannelPartyConfig {
 }
 
 /// Channel configuration including funding details and both parties configuration.
+#[derive(Clone)]
 pub struct ChannelConfig {
     /// Funding transaction outpoint.
     pub funding_outpoint: OutPoint,
@@ -87,6 +95,7 @@ pub struct ChannelConfig {
 }
 
 /// Per-party parameters used in a commitment transaction.
+#[derive(Clone)]
 pub struct CommitmentPartyState {
     /// Per-commitment point used to derive all commitment-specific keys.
     pub per_commitment_point: PublicKey,
@@ -99,6 +108,7 @@ pub struct CommitmentPartyState {
 }
 
 /// Parameters for building a commitment transaction.
+#[derive(Clone)]
 pub struct CommitmentState {
     /// The commitment transaction number.
     pub commitment_number: u64,
@@ -110,6 +120,22 @@ pub struct CommitmentState {
     pub acceptor: CommitmentPartyState,
     // TODO: When adding HTLC support, store pending HTLCs (offered/received) for both sides
     // to correctly compute balances and construct HTLC outputs in the commitment transaction.
+}
+
+/// A splice transaction's funding output and what each side puts into it.
+pub struct SpliceFunding {
+    /// The splice transaction's funding outpoint.
+    pub outpoint: OutPoint,
+    /// The funding output's value.
+    pub satoshis: u64,
+    /// The holder's funding pubkey for it, as announced to the counterparty.
+    pub holder_funding_pubkey: PublicKey,
+    /// The counterparty's funding pubkey for it.
+    pub counterparty_funding_pubkey: PublicKey,
+    /// What the holder adds to its balance, negative when it takes funds out.
+    pub holder_contribution: i64,
+    /// What the counterparty adds to its balance.
+    pub counterparty_contribution: i64,
 }
 
 /// Costs associated with a commitment transaction, including transaction fee
@@ -247,6 +273,62 @@ impl ChannelState {
             Side::Acceptor => &mut self.acceptor_next_per_commitment_point,
         }
     }
+
+    /// The state of a splice candidate: this channel moved onto `funding`, with
+    /// the holder signing through `holder_funding_privkey`.
+    ///
+    /// Per BOLT 2 the splice commitment keeps the commitment number, feerate
+    /// and per-commitment points, and adds each side's contribution to its
+    /// balance. A signature the peer had to reject stays sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommitmentError::ContributionOutOfRange`] if a contribution
+    /// takes out more than its side's balance.
+    pub fn splice(
+        &self,
+        funding: &SpliceFunding,
+        holder_funding_privkey: SecretKey,
+        is_funding_outpoint_valid: bool,
+    ) -> Result<Self, CommitmentError> {
+        let holder_side = self.holder.side;
+        let mut config = self.config.clone();
+        config.funding_outpoint = funding.outpoint;
+        config.funding_satoshis = funding.satoshis;
+        config.party_mut(holder_side).funding_pubkey = funding.holder_funding_pubkey;
+        config.party_mut(holder_side.other()).funding_pubkey = funding.counterparty_funding_pubkey;
+
+        let mut commitment = self.commitment.clone();
+        commitment.party_mut(holder_side).balance_msat = add_contribution(
+            commitment.party(holder_side).balance_msat,
+            funding.holder_contribution,
+        )?;
+        commitment.party_mut(holder_side.other()).balance_msat = add_contribution(
+            commitment.party(holder_side.other()).balance_msat,
+            funding.counterparty_contribution,
+        )?;
+
+        Ok(Self {
+            config,
+            holder: HolderIdentity {
+                side: holder_side,
+                funding_privkey: holder_funding_privkey,
+            },
+            commitment,
+            opener_next_per_commitment_point: self.opener_next_per_commitment_point,
+            acceptor_next_per_commitment_point: self.acceptor_next_per_commitment_point,
+            is_funding_outpoint_valid,
+            was_funding_mined_prematurely: false,
+            sent_invalid_signature: self.sent_invalid_signature,
+            funding_signed_received: false,
+        })
+    }
+}
+
+/// Adds a splice contribution in satoshis to a balance in millisatoshis.
+fn add_contribution(balance_msat: u64, contribution_sat: i64) -> Result<u64, CommitmentError> {
+    let balance = i128::from(balance_msat) + i128::from(contribution_sat) * 1000;
+    u64::try_from(balance).map_err(|_| CommitmentError::ContributionOutOfRange)
 }
 
 impl ChannelConfig {
@@ -255,6 +337,14 @@ impl ChannelConfig {
         match side {
             Side::Opener => &self.opener,
             Side::Acceptor => &self.acceptor,
+        }
+    }
+
+    /// Mutable sibling of [`Self::party`].
+    fn party_mut(&mut self, side: Side) -> &mut ChannelPartyConfig {
+        match side {
+            Side::Opener => &mut self.opener,
+            Side::Acceptor => &mut self.acceptor,
         }
     }
 
@@ -509,6 +599,14 @@ impl CommitmentState {
         match side {
             Side::Opener => &self.opener,
             Side::Acceptor => &self.acceptor,
+        }
+    }
+
+    /// Mutable sibling of [`Self::party`].
+    fn party_mut(&mut self, side: Side) -> &mut CommitmentPartyState {
+        match side {
+            Side::Opener => &mut self.opener,
+            Side::Acceptor => &mut self.acceptor,
         }
     }
 
@@ -1513,5 +1611,128 @@ mod tests {
                 .checked_sub(CommitmentCost::new(feerate_per_kw, &anchor).total_sat()),
             None,
         );
+    }
+
+    // -- Splicing --
+
+    /// The opener's and the acceptor's views of one channel at 7M / 3M sat.
+    fn channel_states() -> (ChannelState, ChannelState) {
+        let (config, commitment, opener, acceptor) = bolt3_commitment_params(
+            253,
+            7_000_000_000,
+            3_000_000_000,
+            546,
+            Features::from_bits(&[Features::OPTION_ANCHORS]),
+        );
+        let state = |holder| {
+            ChannelState::new(
+                config.clone(),
+                holder,
+                commitment.clone(),
+                true,
+                false,
+                false,
+            )
+        };
+        (state(opener), state(acceptor))
+    }
+
+    /// Fresh funding keys for the splice transaction.
+    fn splice_funding_keys() -> (SecretKey, SecretKey) {
+        (
+            SecretKey::from_slice(&[0x31; 32]).expect("valid secret key"),
+            SecretKey::from_slice(&[0x32; 32]).expect("valid secret key"),
+        )
+    }
+
+    /// The splice both sides agreed on, from `holder_is_opener`'s view: the
+    /// opener adds 500k sat, the acceptor takes 200k sat out.
+    fn splice_funding(holder_is_opener: bool) -> SpliceFunding {
+        let secp = Secp256k1::new();
+        let (opener_sk, acceptor_sk) = splice_funding_keys();
+        let opener = (PublicKey::from_secret_key(&secp, &opener_sk), 500_000);
+        let acceptor = (PublicKey::from_secret_key(&secp, &acceptor_sk), -200_000);
+        let (holder, counterparty) = if holder_is_opener {
+            (opener, acceptor)
+        } else {
+            (acceptor, opener)
+        };
+        SpliceFunding {
+            outpoint: OutPoint {
+                txid: "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b"
+                    .parse()
+                    .expect("valid txid hex"),
+                vout: 1,
+            },
+            satoshis: 10_300_000,
+            holder_funding_pubkey: holder.0,
+            counterparty_funding_pubkey: counterparty.0,
+            holder_contribution: holder.1,
+            counterparty_contribution: counterparty.1,
+        }
+    }
+
+    #[test]
+    fn splice_moves_the_commitment_onto_the_new_funding_output() {
+        let (opener, _) = channel_states();
+        let (opener_sk, _) = splice_funding_keys();
+        let funding = splice_funding(true);
+
+        let spliced = opener.splice(&funding, opener_sk, true).unwrap();
+
+        assert_eq!(spliced.config.funding_outpoint, funding.outpoint);
+        assert_eq!(spliced.config.funding_satoshis, 10_300_000);
+        assert_eq!(
+            spliced.config.opener.funding_pubkey,
+            funding.holder_funding_pubkey
+        );
+        assert_eq!(
+            spliced.config.acceptor.funding_pubkey,
+            funding.counterparty_funding_pubkey
+        );
+        assert_eq!(spliced.commitment.opener.balance_msat, 7_500_000_000);
+        assert_eq!(spliced.commitment.acceptor.balance_msat, 2_800_000_000);
+        // BOLT 2 keeps the commitment number, feerate and points.
+        assert_eq!(spliced.commitment.commitment_number, 42);
+        assert_eq!(spliced.commitment.feerate_per_kw, 253);
+        assert_eq!(
+            spliced.commitment.opener.per_commitment_point,
+            opener.commitment.opener.per_commitment_point
+        );
+    }
+
+    #[test]
+    fn splice_commitments_of_both_sides_verify_each_others_signatures() {
+        let (opener, acceptor) = channel_states();
+        let (opener_sk, acceptor_sk) = splice_funding_keys();
+        let opener = opener
+            .splice(&splice_funding(true), opener_sk, true)
+            .unwrap();
+        let acceptor = acceptor
+            .splice(&splice_funding(false), acceptor_sk, true)
+            .unwrap();
+
+        let sig = acceptor
+            .config
+            .sign_counterparty_commitment(&acceptor.commitment, &acceptor.holder);
+
+        assert!(opener.config.verify_counterparty_signature(
+            &opener.commitment,
+            &opener.holder,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn splice_rejects_taking_out_more_than_the_balance() {
+        let (opener, _) = channel_states();
+        let (opener_sk, _) = splice_funding_keys();
+        let mut funding = splice_funding(true);
+        funding.counterparty_contribution = -3_000_001;
+
+        assert!(matches!(
+            opener.splice(&funding, opener_sk, true),
+            Err(CommitmentError::ContributionOutOfRange)
+        ));
     }
 }
