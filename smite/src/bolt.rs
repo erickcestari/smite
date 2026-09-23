@@ -26,6 +26,10 @@ mod ping;
 mod pong;
 mod revoke_and_ack;
 mod shutdown;
+mod splice_ack;
+mod splice_init;
+mod splice_locked;
+mod stfu;
 mod tlv;
 mod tx_abort;
 mod tx_ack_rbf;
@@ -67,6 +71,10 @@ pub use ping::Ping;
 pub use pong::Pong;
 pub use revoke_and_ack::RevokeAndAck;
 pub use shutdown::{Shutdown, is_acceptable_shutdown_script, is_standard_shutdown_script};
+pub use splice_ack::{SpliceAck, SpliceAckTlvs};
+pub use splice_init::{SpliceInit, SpliceInitTlvs};
+pub use splice_locked::SpliceLocked;
+pub use stfu::Stfu;
 pub use tlv::{TlvRecord, TlvStream};
 pub use tx_abort::TxAbort;
 pub use tx_ack_rbf::{TxAckRbf, TxAckRbfTlvs};
@@ -150,6 +158,8 @@ pub struct MessageType(u16);
 impl MessageType {
     /// Warning message (BOLT 1).
     pub const WARNING: MessageType = MessageType(1);
+    /// `stfu` message (BOLT 2).
+    pub const STFU: MessageType = MessageType(2);
     /// Init message (BOLT 1).
     pub const INIT: MessageType = MessageType(16);
     /// Error message (BOLT 1).
@@ -196,6 +206,12 @@ impl MessageType {
     pub const TX_ACK_RBF: MessageType = MessageType(73);
     /// `tx_abort` message (BOLT 2).
     pub const TX_ABORT: MessageType = MessageType(74);
+    /// `splice_locked` message (BOLT 2).
+    pub const SPLICE_LOCKED: MessageType = MessageType(77);
+    /// `splice_init` message (BOLT 2).
+    pub const SPLICE_INIT: MessageType = MessageType(80);
+    /// `splice_ack` message (BOLT 2).
+    pub const SPLICE_ACK: MessageType = MessageType(81);
     /// `update_add_htlc` message (BOLT 2).
     pub const UPDATE_ADD_HTLC: MessageType = MessageType(128);
     /// `update_fulfill_htlc` message (BOLT 2).
@@ -237,6 +253,7 @@ impl MessageType {
     pub fn name(self) -> &'static str {
         match self {
             Self::WARNING => "warning",
+            Self::STFU => "stfu",
             Self::INIT => "init",
             Self::ERROR => "error",
             Self::PING => "ping",
@@ -260,6 +277,9 @@ impl MessageType {
             Self::TX_INIT_RBF => "tx_init_rbf",
             Self::TX_ACK_RBF => "tx_ack_rbf",
             Self::TX_ABORT => "tx_abort",
+            Self::SPLICE_LOCKED => "splice_locked",
+            Self::SPLICE_INIT => "splice_init",
+            Self::SPLICE_ACK => "splice_ack",
             Self::UPDATE_ADD_HTLC => "update_add_htlc",
             Self::UPDATE_FULFILL_HTLC => "update_fulfill_htlc",
             Self::UPDATE_FAIL_HTLC => "update_fail_htlc",
@@ -288,6 +308,8 @@ impl std::fmt::Display for MessageType {
 pub enum Message {
     /// Warning message (type 1).
     Warning(Warning),
+    /// `stfu` message (type 2).
+    Stfu(Stfu),
     /// Init message (type 16).
     Init(Init),
     /// Error message (type 17).
@@ -334,6 +356,12 @@ pub enum Message {
     TxAckRbf(TxAckRbf),
     /// `tx_abort` message (type 74).
     TxAbort(TxAbort),
+    /// `splice_locked` message (type 77).
+    SpliceLocked(SpliceLocked),
+    /// `splice_init` message (type 80).
+    SpliceInit(SpliceInit),
+    /// `splice_ack` message (type 81).
+    SpliceAck(SpliceAck),
     /// `update_add_htlc` message (type 128).
     UpdateAddHtlc(UpdateAddHtlc),
     /// `update_fulfill_htlc` message (type 130).
@@ -380,6 +408,7 @@ impl Message {
     pub fn msg_type(&self) -> MessageType {
         match self {
             Self::Warning(_) => MessageType::WARNING,
+            Self::Stfu(_) => MessageType::STFU,
             Self::Init(_) => MessageType::INIT,
             Self::Error(_) => MessageType::ERROR,
             Self::Ping(_) => MessageType::PING,
@@ -403,6 +432,9 @@ impl Message {
             Self::TxInitRbf(_) => MessageType::TX_INIT_RBF,
             Self::TxAckRbf(_) => MessageType::TX_ACK_RBF,
             Self::TxAbort(_) => MessageType::TX_ABORT,
+            Self::SpliceLocked(_) => MessageType::SPLICE_LOCKED,
+            Self::SpliceInit(_) => MessageType::SPLICE_INIT,
+            Self::SpliceAck(_) => MessageType::SPLICE_ACK,
             Self::UpdateAddHtlc(_) => MessageType::UPDATE_ADD_HTLC,
             Self::UpdateFulfillHtlc(_) => MessageType::UPDATE_FULFILL_HTLC,
             Self::UpdateFailHtlc(_) => MessageType::UPDATE_FAIL_HTLC,
@@ -425,6 +457,7 @@ impl Message {
         self.msg_type().as_u16().write(&mut out);
         match self {
             Self::Warning(m) => out.extend(m.encode()),
+            Self::Stfu(m) => out.extend(m.encode()),
             Self::Init(m) => out.extend(m.encode()),
             Self::Error(m) => out.extend(m.encode()),
             Self::Ping(m) => out.extend(m.encode()),
@@ -448,6 +481,9 @@ impl Message {
             Self::TxInitRbf(m) => out.extend(m.encode()),
             Self::TxAckRbf(m) => out.extend(m.encode()),
             Self::TxAbort(m) => out.extend(m.encode()),
+            Self::SpliceLocked(m) => out.extend(m.encode()),
+            Self::SpliceInit(m) => out.extend(m.encode()),
+            Self::SpliceAck(m) => out.extend(m.encode()),
             Self::UpdateAddHtlc(m) => out.extend(m.encode()),
             Self::UpdateFulfillHtlc(m) => out.extend(m.encode()),
             Self::UpdateFailHtlc(m) => out.extend(m.encode()),
@@ -477,6 +513,7 @@ impl Message {
 
         match MessageType::from_u16(msg_type) {
             MessageType::WARNING => Ok(Self::Warning(Warning::decode(cursor)?)),
+            MessageType::STFU => Ok(Self::Stfu(Stfu::decode(cursor)?)),
             MessageType::INIT => Ok(Self::Init(Init::decode(cursor)?)),
             MessageType::ERROR => Ok(Self::Error(Error::decode(cursor)?)),
             MessageType::PING => Ok(Self::Ping(Ping::decode(cursor)?)),
@@ -508,6 +545,9 @@ impl Message {
             MessageType::TX_INIT_RBF => Ok(Self::TxInitRbf(TxInitRbf::decode(cursor)?)),
             MessageType::TX_ACK_RBF => Ok(Self::TxAckRbf(TxAckRbf::decode(cursor)?)),
             MessageType::TX_ABORT => Ok(Self::TxAbort(TxAbort::decode(cursor)?)),
+            MessageType::SPLICE_LOCKED => Ok(Self::SpliceLocked(SpliceLocked::decode(cursor)?)),
+            MessageType::SPLICE_INIT => Ok(Self::SpliceInit(SpliceInit::decode(cursor)?)),
+            MessageType::SPLICE_ACK => Ok(Self::SpliceAck(SpliceAck::decode(cursor)?)),
             MessageType::UPDATE_ADD_HTLC => Ok(Self::UpdateAddHtlc(UpdateAddHtlc::decode(cursor)?)),
             MessageType::UPDATE_FULFILL_HTLC => {
                 Ok(Self::UpdateFulfillHtlc(UpdateFulfillHtlc::decode(cursor)?))
@@ -581,6 +621,7 @@ macro_rules! impl_from_message {
 
 impl_from_message! {
     Warning => WARNING,
+    Stfu => STFU,
     Init => INIT,
     Error => ERROR,
     Ping => PING,
@@ -604,6 +645,9 @@ impl_from_message! {
     TxInitRbf => TX_INIT_RBF,
     TxAckRbf => TX_ACK_RBF,
     TxAbort => TX_ABORT,
+    SpliceLocked => SPLICE_LOCKED,
+    SpliceInit => SPLICE_INIT,
+    SpliceAck => SPLICE_ACK,
     UpdateAddHtlc => UPDATE_ADD_HTLC,
     UpdateFulfillHtlc => UPDATE_FULFILL_HTLC,
     UpdateFailHtlc => UPDATE_FAIL_HTLC,
@@ -638,7 +682,8 @@ mod tests {
     use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
     use types::CHAIN_HASH_SIZE;
 
-    // Tests ordered by message type number: Warning(1), Init(16), Error(17), Ping(18), Pong(19)
+    // Tests ordered by message type number: Warning(1), Stfu(2), Init(16), Error(17), Ping(18),
+    // Pong(19)
 
     #[test]
     fn message_warning_roundtrip() {
@@ -647,6 +692,20 @@ mod tests {
         let encoded = msg.encode();
         let decoded = Message::decode(&encoded).unwrap();
         assert_eq!(decoded, Message::Warning(warning));
+    }
+
+    fn sample_stfu() -> Stfu {
+        Stfu {
+            channel_id: ChannelId::new([0xab; CHANNEL_ID_SIZE]),
+            initiator: 1,
+        }
+    }
+
+    #[test]
+    fn message_stfu_roundtrip() {
+        let msg = Message::Stfu(sample_stfu());
+        let decoded = Message::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded, msg);
     }
 
     #[test]
@@ -1096,6 +1155,61 @@ mod tests {
         assert_eq!(decoded, Message::TxAbort(tx_abort));
     }
 
+    fn sample_splice_locked() -> SpliceLocked {
+        SpliceLocked {
+            channel_id: ChannelId::new([0xab; CHANNEL_ID_SIZE]),
+            splice_txid: Txid::from_byte_array([0xcd; TXID_SIZE]),
+        }
+    }
+
+    fn sample_funding_pubkey() -> PublicKey {
+        let sk = SecretKey::from_slice(&[0x33; 32]).expect("valid secret");
+        PublicKey::from_secret_key(&Secp256k1::new(), &sk)
+    }
+
+    fn sample_splice_init() -> SpliceInit {
+        SpliceInit {
+            channel_id: ChannelId::new([0xab; CHANNEL_ID_SIZE]),
+            funding_contribution_satoshis: -25_000,
+            funding_feerate_perkw: 2_500,
+            locktime: 800_000,
+            funding_pubkey: sample_funding_pubkey(),
+            tlvs: SpliceInitTlvs {
+                require_confirmed_inputs: true,
+            },
+        }
+    }
+
+    fn sample_splice_ack() -> SpliceAck {
+        SpliceAck {
+            channel_id: ChannelId::new([0xab; CHANNEL_ID_SIZE]),
+            funding_contribution_satoshis: 10_000,
+            funding_pubkey: sample_funding_pubkey(),
+            tlvs: SpliceAckTlvs::default(),
+        }
+    }
+
+    #[test]
+    fn message_splice_locked_roundtrip() {
+        let msg = Message::SpliceLocked(sample_splice_locked());
+        let decoded = Message::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn message_splice_init_roundtrip() {
+        let msg = Message::SpliceInit(sample_splice_init());
+        let decoded = Message::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn message_splice_ack_roundtrip() {
+        let msg = Message::SpliceAck(sample_splice_ack());
+        let decoded = Message::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
     /// Valid `UpdateAddHtlc` message for testing.
     fn sample_update_add_htlc() -> UpdateAddHtlc {
         UpdateAddHtlc {
@@ -1351,6 +1465,7 @@ mod tests {
                 "warning",
                 MessageType::WARNING,
             ),
+            (Message::Stfu(sample_stfu()), "stfu", MessageType::STFU),
             (Message::Init(Init::empty()), "init", MessageType::INIT),
             (
                 Message::Error(Error::all_channels("")),
@@ -1469,6 +1584,21 @@ mod tests {
                 Message::TxAbort(TxAbort::new(ChannelId::new([0; CHANNEL_ID_SIZE]), "")),
                 "tx_abort",
                 MessageType::TX_ABORT,
+            ),
+            (
+                Message::SpliceLocked(sample_splice_locked()),
+                "splice_locked",
+                MessageType::SPLICE_LOCKED,
+            ),
+            (
+                Message::SpliceInit(sample_splice_init()),
+                "splice_init",
+                MessageType::SPLICE_INIT,
+            ),
+            (
+                Message::SpliceAck(sample_splice_ack()),
+                "splice_ack",
+                MessageType::SPLICE_ACK,
             ),
             (
                 Message::UpdateAddHtlc(sample_update_add_htlc()),
