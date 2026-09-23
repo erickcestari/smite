@@ -786,10 +786,22 @@ pub struct SpliceVars {
     pub sent: usize,
 }
 
-/// Sends `splice_init` on the live channel, adding `contribution` at
-/// `feerate` with the [`SPLICE_FUNDING_KEY`].
+/// Quiesces the live channel, then sends `splice_init` on it, adding
+/// `contribution` at `feerate` with the [`SPLICE_FUNDING_KEY`].
 pub fn send_splice_init(b: &mut ProgramBuilder, contribution: i64, feerate: u32) -> SpliceVars {
     let channel_id = b.append(Operation::LoadChannelId(v2_channel_id().0), &[]);
+    let stfu = b.append(Operation::SendStfu { initiator: true }, &[channel_id]);
+    b.append(Operation::RecvStfu, &[stfu]);
+    send_splice_init_unquiesced(b, channel_id, contribution, feerate)
+}
+
+/// Sends `splice_init` on `channel_id` without quiescing it first.
+pub fn send_splice_init_unquiesced(
+    b: &mut ProgramBuilder,
+    channel_id: usize,
+    contribution: i64,
+    feerate: u32,
+) -> SpliceVars {
     let contribution = b.append(Operation::LoadContribution(contribution), &[]);
     let feerate = b.append(Operation::LoadFeeratePerKw(feerate), &[]);
     let locktime = b.append(Operation::LoadBlockHeight(130), &[]);

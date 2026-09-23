@@ -24,6 +24,7 @@ use smite::channel_tx::{
 use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{
     AcceptChannelContext, AcceptChannelOracle, FundingSignedContext, FundingSignedOracle, Oracle,
+    SpliceAckContext, SpliceAckOracle, SpliceProposal, splice_init_rejection, splice_rbf_rejection,
 };
 use smite::pending_channel::{Exchange, FundingNegotiation, PendingChannel};
 use smite::pending_splice::{Negotiations, PendingSplice, PriorFunding};
@@ -989,6 +990,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         *require_confirmed_inputs,
                         &mut self.funding_negotiations,
                     );
+                    self.judge_splice_rbf_proposal(channel_id);
                     let encoded = Message::TxInitRbf(msg).encode();
                     log::debug!(
                         "[{:?}] SendTxInitRbf: {} bytes",
@@ -1004,10 +1006,15 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                 Operation::SendSpliceInit {
                     require_confirmed_inputs,
                 } => {
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[0]);
+                    // Whether an earlier splice was aborted is only known once
+                    // the replies it is owed are read.
+                    self.settle_negotiation(channel_id)?;
                     let msg = build_splice_init(
                         &variables,
                         &instr.inputs,
                         *require_confirmed_inputs,
+                        self.is_quiesced(channel_id),
                         &self.channel_states,
                         &mut self.funding_negotiations,
                     );
@@ -1151,7 +1158,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                 self.record_stfu(stfu)?;
                 continue;
             }
-            apply_interactive_tx(&mut self.funding_negotiations, &msg)?;
+            apply_interactive_tx(&mut self.funding_negotiations, &self.channel_states, &msg)?;
             return Ok(msg);
         }
     }
@@ -1183,6 +1190,33 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
             ));
         }
         Ok(())
+    }
+
+    /// Whether we sent `stfu` on `channel_id` since quiescence last ended.
+    fn is_quiesced(&self, channel_id: ChannelId) -> bool {
+        self.quiescence
+            .get(&channel_id)
+            .is_some_and(|stfu| stfu.sent)
+    }
+
+    /// Records why the peer must reject the `tx_init_rbf` just proposed on
+    /// `channel_id`, if it replaces a splice transaction.
+    fn judge_splice_rbf_proposal(&mut self, channel_id: ChannelId) {
+        let quiesced = self.is_quiesced(channel_id);
+        let (Some(splice), Some(channel)) = (
+            self.funding_negotiations.splices.get_mut(&channel_id),
+            self.channel_states.get(&channel_id),
+        ) else {
+            return;
+        };
+        let sent_splice_locked = splice.locked_sent.is_some();
+        let attempt = splice.attempt_mut();
+        let proposal = SpliceProposal {
+            channel,
+            local_contribution: attempt.local_contribution,
+            quiesced,
+        };
+        attempt.must_reject = splice_rbf_rejection(&proposal, sent_splice_locked);
     }
 
     /// Whether the peer owes us `splice_locked` on `channel_id`: it has not
@@ -1240,7 +1274,11 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
         while self.is_stfu_owed(channel_id) {
             match recv_non_ping(&mut self.conn, RECV_IDLE_TIMEOUT)? {
                 Message::Stfu(stfu) => self.record_stfu(&stfu)?,
-                other => apply_interactive_tx(&mut self.funding_negotiations, &other)?,
+                other => apply_interactive_tx(
+                    &mut self.funding_negotiations,
+                    &self.channel_states,
+                    &other,
+                )?,
             }
         }
         Ok(())
@@ -1680,6 +1718,7 @@ fn build_splice_init(
     variables: &[Option<Variable>],
     inputs: &[usize],
     require_confirmed_inputs: bool,
+    quiesced: bool,
     channel_states: &HashMap<ChannelId, ChannelState>,
     negotiations: &mut Negotiations,
 ) -> SpliceInit {
@@ -1706,12 +1745,31 @@ fn build_splice_init(
                 &config.acceptor.funding_pubkey,
             ),
         };
-        negotiations
+        let over_unlocked_splice = negotiations
             .splices
-            .insert(msg.channel_id, PendingSplice::new(msg.clone(), prior));
+            .get(&msg.channel_id)
+            .is_some_and(is_signed_and_unlocked);
+        let mut splice = PendingSplice::new(msg.clone(), prior);
+        let proposal = SpliceProposal {
+            channel: state,
+            local_contribution: msg.funding_contribution_satoshis,
+            quiesced,
+        };
+        splice.attempt_mut().must_reject = splice_init_rejection(&proposal, over_unlocked_splice);
+        negotiations.splices.insert(msg.channel_id, splice);
     }
 
     msg
+}
+
+/// Whether both peers signed a transaction of `splice` but did not both lock
+/// it, so BOLT 2 forbids starting another.
+fn is_signed_and_unlocked(splice: &PendingSplice) -> bool {
+    let signed = splice.funding_attempts().all().any(|attempt| {
+        let tx_signatures = attempt.commitment_exchange.tx_signatures;
+        tx_signatures.sent && tx_signatures.received
+    });
+    signed && splice.locked_txid().is_none()
 }
 
 /// Builds the `tx_add_input` spending the channel's current funding output,
@@ -1832,6 +1890,7 @@ fn build_tx_add_output(
 /// view, and it will fail the negotiation if not.
 fn apply_interactive_tx(
     negotiations: &mut Negotiations,
+    channel_states: &HashMap<ChannelId, ChannelState>,
     msg: &Message,
 ) -> Result<(), ExecuteError> {
     let (channel_id, step) = match msg {
@@ -1891,7 +1950,9 @@ fn apply_interactive_tx(
                     "tx_ack_rbf for {} answers no tx_init_rbf, ignoring",
                     m.channel_id,
                 );
+                return Ok(());
             }
+            judge_splice_ack(m.channel_id, channel_states, negotiations)?;
             return Ok(());
         }
         Message::SpliceAck(m) => {
@@ -1904,7 +1965,9 @@ fn apply_interactive_tx(
                     "splice_ack for {} answers no splice_init, ignoring",
                     m.channel_id,
                 );
+                return Ok(());
             }
+            judge_splice_ack(m.channel_id, channel_states, negotiations)?;
             return Ok(());
         }
         other => {
@@ -1923,6 +1986,28 @@ fn apply_interactive_tx(
     }
 
     Ok(())
+}
+
+/// Judges the peer accepting the latest attempt of `channel_id`'s splice, when
+/// the channel is being spliced.
+fn judge_splice_ack(
+    channel_id: ChannelId,
+    channel_states: &HashMap<ChannelId, ChannelState>,
+    negotiations: &Negotiations,
+) -> Result<(), Violation> {
+    let (Some(splice), Some(channel)) = (
+        negotiations.splices.get(&channel_id),
+        channel_states.get(&channel_id),
+    ) else {
+        return Ok(());
+    };
+    let attempt = splice.attempt();
+    SpliceAckOracle.evaluate(&SpliceAckContext {
+        channel_id,
+        channel,
+        must_reject: attempt.must_reject.as_deref(),
+        remote_contribution: attempt.remote_contribution,
+    })
 }
 
 /// Reconstructs the shared funding transaction from a negotiation.

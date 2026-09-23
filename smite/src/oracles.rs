@@ -4,10 +4,14 @@
 
 mod accept_channel;
 mod funding_signed;
+mod splice_ack;
 
 use super::violation::Violation;
 pub use accept_channel::{AcceptChannelContext, AcceptChannelOracle};
 pub use funding_signed::{FundingSignedContext, FundingSignedOracle};
+pub use splice_ack::{
+    SpliceAckContext, SpliceAckOracle, SpliceProposal, splice_init_rejection, splice_rbf_rejection,
+};
 
 /// `Oracle` evaluates a condition against some context
 pub trait Oracle<C> {

@@ -3958,13 +3958,8 @@ fn execute_broadcast_of_a_splice_witnesses_the_shared_input_with_both_signatures
 #[test]
 fn execute_send_tx_signatures_of_a_splice_ends_quiescence() {
     let replies = PeerSpliceReplies::new();
-    let mut b = ProgramBuilder::new();
-    let stfu = send_stfu(&mut b, true);
-    b.append(Operation::RecvStfu, &[stfu]);
-    append_splice(&mut b, SpliceStage::Broadcast);
-
-    let mut fx = replies.queue(splice_fixture().queue(&stfu_reply(0)));
-    fx.run(&b.build());
+    let mut fx = replies.fixture();
+    fx.run(&splice_program(SpliceStage::Broadcast));
 
     assert_eq!(fx.quiescence(&v2_channel_id()), Exchange::default());
 }
@@ -4074,4 +4069,110 @@ fn execute_recv_splice_locked_naming_no_splice_transaction_is_a_violation() {
         matches!(err, ExecuteError::Violation(Violation::InvalidSpliceLocked(id, _)) if id == v2_channel_id()),
         "expected InvalidSpliceLocked, got {err:?}"
     );
+}
+
+// -- Splice acceptance --
+
+/// Asserts `err` is an `InvalidSpliceAck` on the live channel.
+fn assert_invalid_splice_ack(err: &ExecuteError) {
+    assert!(
+        matches!(err, ExecuteError::Violation(Violation::InvalidSpliceAck(id, _)) if *id == v2_channel_id()),
+        "expected InvalidSpliceAck, got {err:?}"
+    );
+}
+
+/// Sends `splice_init` on the live channel without `stfu`, then reads the
+/// reply.
+fn unquiesced_splice_init_program() -> Program {
+    let mut b = ProgramBuilder::new();
+    let channel_id = b.append(Operation::LoadChannelId(v2_channel_id().0), &[]);
+    let splice = send_splice_init_unquiesced(&mut b, channel_id, 50_000, 1_000);
+    recv_interactive_tx(&mut b, splice.sent);
+    b.build()
+}
+
+#[test]
+fn execute_splice_ack_to_a_splice_init_that_is_not_quiescent_is_a_violation() {
+    let mut fx = Fixture::new()
+        .with_live_channel()
+        .queue(&splice_ack_reply(0));
+
+    assert_invalid_splice_ack(&fx.run_err(&unquiesced_splice_init_program()));
+}
+
+#[test]
+fn execute_tx_abort_rejecting_a_splice_init_that_is_not_quiescent_is_not_a_violation() {
+    let mut fx = Fixture::new()
+        .with_live_channel()
+        .queue(&Message::TxAbort(TxAbort::new(
+            v2_channel_id(),
+            "not quiescent",
+        )));
+
+    fx.run(&unquiesced_splice_init_program());
+}
+
+#[test]
+fn execute_splice_ack_to_a_splice_out_beyond_our_balance_is_a_violation() {
+    let mut b = ProgramBuilder::new();
+    // Our balance is the 200k we opened the channel with.
+    let splice = send_splice_init(&mut b, -200_001, 1_000);
+    recv_interactive_tx(&mut b, splice.sent);
+
+    let mut fx = splice_fixture().queue(&splice_ack_reply(0));
+
+    assert_invalid_splice_ack(&fx.run_err(&b.build()));
+}
+
+#[test]
+fn execute_splice_ack_taking_out_more_than_the_peers_balance_is_a_violation() {
+    let mut b = ProgramBuilder::new();
+    let splice = send_splice_init(&mut b, 50_000, 1_000);
+    recv_interactive_tx(&mut b, splice.sent);
+
+    // The peer contributed nothing to the channel, so it has nothing to take.
+    let mut fx = splice_fixture().queue(&splice_ack_reply(-1));
+
+    assert_invalid_splice_ack(&fx.run_err(&b.build()));
+}
+
+#[test]
+fn execute_splice_ack_over_an_unlocked_splice_is_a_violation() {
+    let replies = PeerSpliceReplies::new();
+    let mut b = ProgramBuilder::new();
+    append_splice(&mut b, SpliceStage::Broadcast);
+    let splice = send_splice_init(&mut b, 50_000, 1_000);
+    recv_interactive_tx(&mut b, splice.sent);
+
+    let mut fx = replies
+        .fixture()
+        .queue(&stfu_reply(0))
+        .queue(&splice_ack_reply(0));
+
+    assert_invalid_splice_ack(&fx.run_err(&b.build()));
+}
+
+#[test]
+fn execute_tx_ack_rbf_of_a_splice_after_our_splice_locked_is_a_violation() {
+    let replies = PeerSpliceReplies::new();
+    let mut b = ProgramBuilder::new();
+    let (splice, funding_tx) = append_splice(&mut b, SpliceStage::Broadcast);
+    b.append(
+        Operation::SendSpliceLocked,
+        &[splice.channel_id, funding_tx],
+    );
+    let stfu = b.append(
+        Operation::SendStfu { initiator: true },
+        &[splice.channel_id],
+    );
+    b.append(Operation::RecvStfu, &[stfu]);
+    let rbf = send_tx_init_rbf(&mut b, splice.channel_id, 130, 2_000, 0);
+    recv_interactive_tx(&mut b, rbf);
+
+    let mut fx = replies
+        .fixture()
+        .queue(&stfu_reply(0))
+        .queue(&tx_ack_rbf_reply(v2_channel_id(), Some(0)));
+
+    assert_invalid_splice_ack(&fx.run_err(&b.build()));
 }

@@ -61,6 +61,9 @@ pub struct FundingAttempt {
     pub remote_contribution: i64,
     /// Whether our `tx_init_rbf` still awaits the peer's `tx_ack_rbf`.
     pub ack_pending: bool,
+    /// Why BOLT 2 requires the peer to reject the proposal that started this
+    /// attempt, when it does: accepting it is then a violation.
+    pub must_reject: Option<String>,
 }
 
 impl FundingAttempt {
@@ -76,6 +79,7 @@ impl FundingAttempt {
             local_contribution,
             remote_contribution: 0,
             ack_pending: false,
+            must_reject: None,
         }
     }
 
