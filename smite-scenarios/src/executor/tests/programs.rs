@@ -780,6 +780,8 @@ pub fn send_stfu(b: &mut ProgramBuilder, initiator: bool) -> usize {
 #[derive(Clone, Copy)]
 pub struct SpliceVars {
     pub channel_id: usize,
+    /// The key behind the new funding pubkey `splice_init` announced.
+    pub funding_privkey: usize,
     /// The `SendSpliceInit` result.
     pub sent: usize,
 }
@@ -800,7 +802,11 @@ pub fn send_splice_init(b: &mut ProgramBuilder, contribution: i64, feerate: u32)
         &[channel_id, contribution, feerate, locktime, funding_pubkey],
     );
 
-    SpliceVars { channel_id, sent }
+    SpliceVars {
+        channel_id,
+        funding_privkey,
+        sent,
+    }
 }
 
 /// Sends the `tx_add_input` spending the channel's funding output.

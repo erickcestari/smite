@@ -274,6 +274,21 @@ impl ChannelState {
         }
     }
 
+    /// The holder's funding pubkey, as announced to the counterparty.
+    #[must_use]
+    pub fn holder_funding_pubkey(&self) -> &PublicKey {
+        &self.config.party(self.holder.side).funding_pubkey
+    }
+
+    /// The counterparty's funding pubkey.
+    #[must_use]
+    pub fn counterparty_funding_pubkey(&self) -> &PublicKey {
+        &self
+            .config
+            .party(self.holder.counterparty_side())
+            .funding_pubkey
+    }
+
     /// The state of a splice candidate: this channel moved onto `funding`, with
     /// the holder signing through `holder_funding_privkey`.
     ///

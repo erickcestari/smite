@@ -3725,3 +3725,284 @@ fn execute_build_funding_transaction_v2_builds_the_splice_transaction() {
     assert_eq!(tx.output[0].value, Amount::from_sat(150_000));
     assert_eq!(tx.lock_time.to_consensus_u32(), 130);
 }
+
+/// How far `splice_program` takes a 50k splice-out.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum SpliceStage {
+    /// Our `commitment_signed` sent.
+    Signed,
+    /// The peer's `commitment_signed` read.
+    CommitmentReceived,
+    /// `tx_signatures` exchanged, the peer's first, and the splice broadcast.
+    Broadcast,
+}
+
+/// Splices the live channel out by 50k, concluding the exchange and signing
+/// our commitment, then goes on to `stage`.
+fn splice_program(stage: SpliceStage) -> Program {
+    let mut b = ProgramBuilder::new();
+    append_splice(&mut b, stage);
+    b.build()
+}
+
+/// Appends [`splice_program`] to `b`.
+fn append_splice(b: &mut ProgramBuilder, stage: SpliceStage) {
+    let b = &mut *b;
+    let splice = splice_flow(b, -50_000, 1_000);
+    send_tx_complete(b, splice.channel_id);
+    let funding_tx = b.append(Operation::BuildFundingTransactionV2, &[splice.channel_id]);
+    let sent = b.append(
+        Operation::SendCommitmentSigned,
+        &[funding_tx, splice.funding_privkey, splice.channel_id],
+    );
+    if stage >= SpliceStage::CommitmentReceived {
+        b.append(Operation::RecvCommitmentSigned, &[sent]);
+    }
+    if stage >= SpliceStage::Broadcast {
+        // The previous funding output is attributed to us, so the peer, which
+        // contributes nothing, signs first.
+        b.append(Operation::RecvTxSignatures, &[splice.channel_id]);
+        b.append(
+            Operation::SendTxSignatures,
+            &[splice.channel_id, funding_tx],
+        );
+        b.append(Operation::BroadcastTransaction, &[funding_tx]);
+    }
+}
+
+/// The peer's replies to a splice through `commitment_signed` and
+/// `tx_signatures`, signed over what a first run negotiated.
+struct PeerSpliceReplies {
+    commitment_signed: CommitmentSigned,
+    tx_signatures: TxSignatures,
+}
+
+impl PeerSpliceReplies {
+    fn new() -> Self {
+        let mut fx = splice_flow_replies(splice_fixture(), 3);
+        fx.run(&splice_program(SpliceStage::Signed));
+        let splice = fx.splice(&v2_channel_id());
+        let tx = splice.attempt().tx_exchange.shared_tx().build();
+        let txid = tx.compute_txid();
+
+        let candidate = splice.candidates.get(&txid).expect("splice candidate");
+        let mut commitment_signed = counterparty_commitment_signed(
+            candidate,
+            v2_channel_id(),
+            &peer_splice_funding_privkey(),
+        );
+        commitment_signed.tlvs.funding_txid = Some(txid);
+
+        // The shared input is signed with the peer's current funding key.
+        let shared_input_signature = splice
+            .prior
+            .input(&tx)
+            .expect("shared input")
+            .sign(&sample_acceptor_funding_privkey());
+        let tx_signatures = TxSignatures {
+            channel_id: v2_channel_id(),
+            txid,
+            witnesses: Vec::new(),
+            tlvs: TxSignaturesTlvs {
+                shared_input_signature,
+            },
+        };
+
+        Self {
+            commitment_signed,
+            tx_signatures,
+        }
+    }
+
+    /// A fixture that answers `splice_program` with these replies.
+    fn fixture(&self) -> Fixture {
+        self.queue(splice_fixture())
+    }
+
+    /// Queues these replies onto `fx`, after whatever it already holds.
+    fn queue(&self, fx: Fixture) -> Fixture {
+        splice_flow_replies(fx, 3)
+            .queue(&Message::CommitmentSigned(self.commitment_signed.clone()))
+            .queue(&Message::TxSignatures(self.tx_signatures.clone()))
+    }
+}
+
+#[test]
+fn execute_send_commitment_signed_signs_the_splice_commitment() {
+    let mut fx = splice_flow_replies(splice_fixture(), 3);
+    fx.run(&splice_program(SpliceStage::Signed));
+
+    let splice = fx.splice(&v2_channel_id());
+    let txid = splice
+        .attempt()
+        .tx_exchange
+        .shared_tx()
+        .build()
+        .compute_txid();
+    let sent: CommitmentSigned = fx.last_sent();
+    assert_eq!(sent.tlvs.funding_txid, Some(txid));
+
+    let candidate = splice.candidates.get(&txid).expect("splice candidate");
+    assert!(candidate.is_funding_outpoint_valid);
+    assert_eq!(candidate.config.funding_satoshis, 150_000);
+    assert_eq!(candidate.commitment.opener.balance_msat, 150_000_000);
+    assert_eq!(candidate.commitment.acceptor.balance_msat, 0);
+
+    // The peer, holding the new funding key, accepts our signature.
+    let peer = HolderIdentity {
+        side: Side::Acceptor,
+        funding_privkey: peer_splice_funding_privkey(),
+    };
+    assert!(candidate.config.verify_counterparty_signature(
+        &candidate.commitment,
+        &peer,
+        &sent.signature,
+    ));
+}
+
+#[test]
+fn execute_recv_commitment_signed_verifies_the_splice_commitment() {
+    let replies = PeerSpliceReplies::new();
+    let mut fx = replies.fixture();
+    fx.run(&splice_program(SpliceStage::CommitmentReceived));
+
+    let exchange = fx.splice(&v2_channel_id()).attempt().commitment_exchange;
+    assert!(exchange.commitment_signed.received);
+}
+
+#[test]
+fn execute_recv_commitment_signed_without_funding_txid_takes_the_latest_attempt() {
+    let mut replies = PeerSpliceReplies::new();
+    replies.commitment_signed.tlvs.funding_txid = None;
+    let mut fx = replies.fixture();
+    fx.run(&splice_program(SpliceStage::CommitmentReceived));
+
+    let exchange = fx.splice(&v2_channel_id()).attempt().commitment_exchange;
+    assert!(exchange.commitment_signed.received);
+}
+
+#[test]
+fn execute_recv_commitment_signed_invalid_splice_signature_is_a_violation() {
+    let mut replies = PeerSpliceReplies::new();
+    // Signed with the peer's previous funding key rather than its new one.
+    let splice_ready = {
+        let mut fx = splice_flow_replies(splice_fixture(), 3);
+        fx.run(&splice_program(SpliceStage::Signed));
+        let splice = fx.splice(&v2_channel_id());
+        let txid = splice
+            .attempt()
+            .tx_exchange
+            .shared_tx()
+            .build()
+            .compute_txid();
+        counterparty_commitment_signed(
+            &splice.candidates[&txid],
+            v2_channel_id(),
+            &sample_acceptor_funding_privkey(),
+        )
+    };
+    replies.commitment_signed.signature = splice_ready.signature;
+    let mut fx = replies.fixture();
+
+    let err = fx.run_err(&splice_program(SpliceStage::CommitmentReceived));
+
+    assert!(
+        matches!(err, ExecuteError::Violation(Violation::InvalidCounterpartySignature(id)) if id == v2_channel_id()),
+        "expected InvalidCounterpartySignature, got {err:?}"
+    );
+}
+
+#[test]
+fn execute_splice_tx_signatures_carry_our_shared_input_signature() {
+    let replies = PeerSpliceReplies::new();
+    let mut fx = replies.fixture();
+    fx.run(&splice_program(SpliceStage::Broadcast));
+
+    let ours: TxSignatures = fx.sent(fx.sent_len() - 1);
+    assert!(
+        ours.witnesses.is_empty(),
+        "the shared input takes no witness"
+    );
+    let splice = fx.splice(&v2_channel_id());
+    let tx = splice.attempt().tx_exchange.shared_tx().build();
+    let signature = ours
+        .tlvs
+        .shared_input_signature
+        .expect("shared input signature");
+    assert!(
+        splice
+            .prior
+            .input(&tx)
+            .expect("shared input")
+            .verify(&signature, &sample_open_channel2().funding_pubkey)
+    );
+}
+
+#[test]
+fn execute_broadcast_of_a_splice_witnesses_the_shared_input_with_both_signatures() {
+    let replies = PeerSpliceReplies::new();
+    let mut fx = replies.fixture();
+    fx.run(&splice_program(SpliceStage::Broadcast));
+
+    let broadcast = &fx.bitcoin().broadcast_calls[0];
+    let witness = &broadcast.input[0].witness;
+    assert_eq!(witness.len(), 4);
+    assert_eq!(
+        witness.last(),
+        Some(fx.splice(&v2_channel_id()).prior.witness_script.as_bytes())
+    );
+}
+
+#[test]
+fn execute_send_tx_signatures_of_a_splice_ends_quiescence() {
+    let replies = PeerSpliceReplies::new();
+    let mut b = ProgramBuilder::new();
+    let stfu = send_stfu(&mut b, true);
+    b.append(Operation::RecvStfu, &[stfu]);
+    append_splice(&mut b, SpliceStage::Broadcast);
+
+    let mut fx = replies.queue(splice_fixture().queue(&stfu_reply(0)));
+    fx.run(&b.build());
+
+    assert_eq!(fx.quiescence(&v2_channel_id()), Exchange::default());
+}
+
+#[test]
+fn execute_recv_tx_signatures_without_shared_input_signature_is_a_violation() {
+    let mut replies = PeerSpliceReplies::new();
+    replies.tx_signatures.tlvs.shared_input_signature = None;
+    let mut fx = replies.fixture();
+
+    let err = fx.run_err(&splice_program(SpliceStage::Broadcast));
+
+    assert!(
+        matches!(err, ExecuteError::Violation(Violation::InvalidTxSignatures(id, _)) if id == v2_channel_id()),
+        "expected InvalidTxSignatures, got {err:?}"
+    );
+}
+
+#[test]
+fn execute_recv_tx_signatures_with_a_shared_input_signature_by_the_new_key_is_a_violation() {
+    let mut replies = PeerSpliceReplies::new();
+    // BOLT 2 has the shared input signed with the key of the output it spends.
+    let splice_key_signature = {
+        let mut fx = splice_flow_replies(splice_fixture(), 3);
+        fx.run(&splice_program(SpliceStage::Signed));
+        let splice = fx.splice(&v2_channel_id());
+        let tx = splice.attempt().tx_exchange.shared_tx().build();
+        splice
+            .prior
+            .input(&tx)
+            .expect("shared input")
+            .sign(&peer_splice_funding_privkey())
+    };
+    replies.tx_signatures.tlvs.shared_input_signature = splice_key_signature;
+    let mut fx = replies.fixture();
+
+    let err = fx.run_err(&splice_program(SpliceStage::Broadcast));
+
+    assert!(
+        matches!(err, ExecuteError::Violation(Violation::InvalidTxSignatures(id, _)) if id == v2_channel_id()),
+        "expected InvalidTxSignatures, got {err:?}"
+    );
+}

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::{ScriptBuf, Witness};
 
 use crate::bolt::{
@@ -49,6 +50,9 @@ pub struct FundingAttempt {
     pub commitment_exchange: CommitmentExchange,
     /// Witnesses from the peer's `tx_signatures`
     pub peer_witnesses: Vec<Witness>,
+    /// The peer's signature for a splice's shared input, from its
+    /// `tx_signatures`.
+    pub peer_shared_input_signature: Option<Signature>,
     /// Feerate the funding transaction pays, in satoshis per kilo-weight.
     pub feerate_perkw: u32,
     /// What we add to our channel balance, negative when we take funds out.
@@ -67,6 +71,7 @@ impl FundingAttempt {
             tx_exchange: TxExchange::new(locktime),
             commitment_exchange: CommitmentExchange::default(),
             peer_witnesses: Vec::new(),
+            peer_shared_input_signature: None,
             feerate_perkw,
             local_contribution,
             remote_contribution: 0,
@@ -163,6 +168,11 @@ impl FundingAttempts {
     /// Every attempt, oldest first.
     pub fn all(&self) -> impl Iterator<Item = &FundingAttempt> {
         std::iter::once(&self.first).chain(&self.rbf)
+    }
+
+    /// Mutable sibling of [`Self::all`].
+    pub fn all_mut(&mut self) -> impl Iterator<Item = &mut FundingAttempt> {
+        std::iter::once(&mut self.first).chain(&mut self.rbf)
     }
 
     /// Whether the latest attempt was started by RBF.

@@ -18,8 +18,8 @@ use smite::bolt::{
 };
 use smite::channel_tx::{
     ChannelConfig, ChannelPartyConfig, ChannelState, Contributor, FundingTransaction,
-    HolderIdentity, SharedInput, SharedOutput, Side, Step, build_funding_transaction,
-    build_funding_witness_script, signs_first,
+    HolderIdentity, SharedInput, SharedOutput, Side, SpliceFunding, Step,
+    build_funding_transaction, build_funding_witness, build_funding_witness_script, signs_first,
 };
 use smite::noise::{ConnectionError, NoiseConnection};
 use smite::oracles::{
@@ -629,6 +629,11 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     // peer's inputs, which our wallet cannot sign. Its
                     // `tx_signatures` is the only thing that can witness them.
                     let tx = apply_peer_witnesses(&self.funding_negotiations, &ft.tx);
+                    let tx = apply_shared_input_witness(
+                        &self.funding_negotiations,
+                        &self.channel_states,
+                        tx,
+                    );
                     evict_double_spends(&mut self.private_mempool, &mut self.unmined_txids, &tx);
                     // Queue transactions rejected by the mempool in the private
                     // mempool so they can be mined later. Dedup on txid so the
@@ -858,14 +863,23 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                 }
 
                 Operation::SendCommitmentSigned => {
-                    self.settle_negotiation(resolve_channel_id(&variables, instr.inputs[2]))?;
-                    let cs = build_commitment_signed(
-                        &variables,
-                        &instr.inputs,
-                        &mut self.channel_states,
-                        &mut self.funding_negotiations,
-                        &self.mined_txids,
-                    )?;
+                    let channel_id = resolve_channel_id(&variables, instr.inputs[2]);
+                    self.settle_negotiation(channel_id)?;
+                    let cs = match self.funding_negotiations.splices.get_mut(&channel_id) {
+                        Some(splice) => build_splice_commitment_signed(
+                            &variables,
+                            &instr.inputs,
+                            &self.channel_states,
+                            splice,
+                        )?,
+                        None => build_commitment_signed(
+                            &variables,
+                            &instr.inputs,
+                            &mut self.channel_states,
+                            &mut self.funding_negotiations,
+                            &self.mined_txids,
+                        )?,
+                    };
                     let encoded = Message::CommitmentSigned(cs).encode();
                     log::debug!(
                         "[{:?}] SendCommitmentSigned: {} bytes",
@@ -917,10 +931,16 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                                     .len()
                             });
                         let witnesses = validate_peer_witnesses(&ts, contributed)?;
+                        let shared_input_signature = check_shared_input_signature(
+                            &ts,
+                            &self.channel_states,
+                            &self.funding_negotiations,
+                        )?;
                         if let Some(pending) = self.funding_negotiations.get_mut(ts.channel_id) {
                             let attempt = pending.attempt_mut();
                             attempt.commitment_exchange.tx_signatures.received = true;
                             attempt.peer_witnesses = witnesses;
+                            attempt.peer_shared_input_signature = shared_input_signature;
                         }
                     }
                     None
@@ -933,6 +953,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                         &variables,
                         &instr.inputs,
                         &mut self.bitcoin_cli,
+                        &self.channel_states,
                         &self.funding_negotiations,
                     );
                     let encoded = Message::TxSignatures(ts).encode();
@@ -946,6 +967,11 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                     // so this is what makes a later receive expect one.
                     if let Some(pending) = self.funding_negotiations.get_mut(channel_id) {
                         pending.attempt_mut().commitment_exchange.tx_signatures.sent = true;
+                    }
+                    // The peer receiving a splice's tx_signatures ends quiescence
+                    // (BOLT 2), so a later splice or RBF must quiesce again.
+                    if self.funding_negotiations.splices.contains_key(&channel_id) {
+                        self.quiescence.remove(&channel_id);
                     }
                     None
                 }
@@ -1878,10 +1904,6 @@ fn build_commitment_signed(
         tlvs: CommitmentSignedTlvs::default(),
     };
 
-    if negotiations.splices.contains_key(&channel_id) {
-        log::debug!("commitment_signed for splice of {channel_id}: not signed yet");
-        return Ok(unsigned(channel_id));
-    }
     let Some(pending) = negotiations.opens.get_mut(channel_id) else {
         return Ok(unsigned(channel_id));
     };
@@ -1988,6 +2010,78 @@ fn build_commitment_signed(
     })
 }
 
+/// Builds the `commitment_signed` committing to a splice attempt's funding
+/// output, and records the splice candidate it signs.
+///
+/// Per BOLT 2 it spends the splice's funding output and names it in
+/// `funding_txid`. Without the peer's `splice_ack`, or the channel being
+/// spliced, there is no commitment to sign, so this falls back to an all-zero
+/// signature.
+fn build_splice_commitment_signed(
+    variables: &[Option<Variable>],
+    inputs: &[usize],
+    channel_states: &HashMap<ChannelId, ChannelState>,
+    splice: &mut PendingSplice,
+) -> Result<CommitmentSigned, ExecuteError> {
+    let funding_tx = resolve_funding_transaction(variables, inputs[0]);
+    let funding_privkey_bytes = resolve_private_key(variables, inputs[1]);
+    let channel_id = resolve_channel_id(variables, inputs[2]);
+    let funding_txid = funding_tx.tx.compute_txid();
+    let mut msg = CommitmentSigned {
+        channel_id,
+        signature: Signature::from_compact(&[0u8; 64]).expect("zero bytes parse as a signature"),
+        htlc_signatures: Vec::new(),
+        tlvs: CommitmentSignedTlvs {
+            funding_txid: Some(funding_txid),
+        },
+    };
+    let (Some(state), Some(ack)) = (channel_states.get(&channel_id), &splice.splice_ack) else {
+        return Ok(msg);
+    };
+
+    let holder_funding_pubkey = splice.splice_init.funding_pubkey;
+    let counterparty_funding_pubkey = ack.funding_pubkey;
+    let funding_satoshis = splice.total_funding_satoshis();
+    let attempt = splice.attempt_mut();
+    let already_sent = attempt.commitment_exchange.commitment_signed.sent;
+    attempt.commitment_exchange.commitment_signed.sent = true;
+    let negotiated_txid = attempt.tx_exchange.shared_tx().build().compute_txid();
+    let funding = SpliceFunding {
+        outpoint: OutPoint {
+            txid: funding_txid,
+            vout: funding_tx.vout,
+        },
+        satoshis: funding_satoshis,
+        holder_funding_pubkey,
+        counterparty_funding_pubkey,
+        holder_contribution: attempt.local_contribution,
+        counterparty_contribution: attempt.remote_contribution,
+    };
+    // As for an open, the peer signs the transaction it negotiated.
+    let is_funding_outpoint_valid = funding_txid == negotiated_txid
+        && funding_tx.matches_funding_output(
+            &holder_funding_pubkey,
+            &counterparty_funding_pubkey,
+            funding_satoshis,
+        );
+
+    let funding_privkey = SecretKey::from_slice(&funding_privkey_bytes).expect("valid private key");
+    let mut candidate = state.splice(&funding, funding_privkey, is_funding_outpoint_valid)?;
+    // The peer must reject a signature made with a key other than the funding
+    // key we announced in `splice_init`.
+    candidate.sent_invalid_signature |=
+        PublicKey::from_secret_key(&Secp256k1::new(), &funding_privkey) != holder_funding_pubkey;
+    msg.signature = candidate
+        .config
+        .sign_counterparty_commitment(&candidate.commitment, &candidate.holder);
+
+    // Only the first `commitment_signed` of an attempt starts its candidate.
+    if !already_sent {
+        splice.candidates.insert(funding_txid, candidate);
+    }
+    Ok(msg)
+}
+
 /// Tracks `channel_id` from `state`, which the first `commitment_signed` of
 /// an attempt was built on.
 ///
@@ -2045,6 +2139,9 @@ fn verify_commitment_signed(
     if !cs.htlc_signatures.is_empty() {
         return Err(Violation::UnexpectedHtlcSignatures(cs.channel_id).into());
     }
+    if let Some(splice) = negotiations.splices.get_mut(&cs.channel_id) {
+        return verify_splice_commitment_signed(cs, splice);
+    }
 
     let signed_attempt = negotiations
         .get(cs.channel_id)
@@ -2080,6 +2177,74 @@ fn verify_commitment_signed(
         exchange.commitment_signed.received = true;
     }
 
+    Ok(())
+}
+
+/// Verifies the peer's `commitment_signed` for a splice attempt against the
+/// candidate our own `commitment_signed` for that attempt built.
+///
+/// The attempt is the one whose transaction `funding_txid` names. As for an
+/// open, only an attempt we signed can be judged, and only when we signed its
+/// negotiated funding output: anything else is the program's doing.
+///
+/// # Errors
+///
+/// Returns [`Violation::InvalidCounterpartySignature`] if the signature does
+/// not verify.
+fn verify_splice_commitment_signed(
+    cs: &CommitmentSigned,
+    splice: &mut PendingSplice,
+) -> Result<(), ExecuteError> {
+    // BOLT 2 requires `funding_txid`, but whether every target sends it is
+    // not settled yet, so its absence is noted rather than reported.
+    let txid = cs.tlvs.funding_txid.unwrap_or_else(|| {
+        log::debug!(
+            "commitment_signed for splice of {} names no funding_txid, taking the latest attempt",
+            cs.channel_id,
+        );
+        splice
+            .attempt()
+            .tx_exchange
+            .shared_tx()
+            .build()
+            .compute_txid()
+    });
+    let verified = splice.candidates.get(&txid).map(|candidate| {
+        !candidate.is_funding_outpoint_valid
+            || candidate.config.verify_counterparty_signature(
+                &candidate.commitment,
+                &candidate.holder,
+                &cs.signature,
+            )
+    });
+    let Some(attempt) = splice
+        .funding_attempts_mut()
+        .all_mut()
+        .find(|attempt| attempt.tx_exchange.shared_tx().build().compute_txid() == txid)
+    else {
+        log::debug!(
+            "commitment_signed for splice of {} names no attempt ({txid}), ignoring",
+            cs.channel_id,
+        );
+        return Ok(());
+    };
+    if !attempt.commitment_exchange.commitment_signed.sent {
+        log::debug!(
+            "commitment_signed for splice of {} answers no commitment_signed of ours, ignoring",
+            cs.channel_id,
+        );
+        return Ok(());
+    }
+    match verified {
+        Some(false) => return Err(Violation::InvalidCounterpartySignature(cs.channel_id).into()),
+        Some(true) => {}
+        None => log::debug!(
+            "our commitment_signed for splice of {} committed to another funding \
+             transaction, not checking the signature",
+            cs.channel_id,
+        ),
+    }
+    attempt.commitment_exchange.commitment_signed.received = true;
     Ok(())
 }
 
@@ -2149,6 +2314,7 @@ fn build_tx_signatures(
     variables: &[Option<Variable>],
     inputs: &[usize],
     cli: &mut impl BitcoinRpc,
+    channel_states: &HashMap<ChannelId, ChannelState>,
     negotiations: &Negotiations,
 ) -> TxSignatures {
     let channel_id = resolve_channel_id(variables, inputs[0]);
@@ -2179,12 +2345,83 @@ fn build_tx_signatures(
         })
         .unwrap_or_default();
 
+    // A splice's shared input is signed with our current funding key, which
+    // the channel being spliced still holds (BOLT 2).
+    let shared_input_signature = negotiations
+        .splices
+        .get(&channel_id)
+        .zip(channel_states.get(&channel_id))
+        .and_then(|(splice, state)| {
+            splice
+                .prior
+                .input(&funding_tx.tx)?
+                .sign(&state.holder.funding_privkey)
+        });
+
     TxSignatures {
         channel_id,
         txid,
         witnesses,
-        tlvs: TxSignaturesTlvs::default(),
+        tlvs: TxSignaturesTlvs {
+            shared_input_signature,
+        },
     }
+}
+
+/// Checks the shared input signature a splice's `tx_signatures` carries,
+/// returning it for the witness.
+///
+/// Only judged when the peer signed the splice transaction we negotiated with
+/// it: otherwise our views of the transaction diverge, which is the program's
+/// doing.
+///
+/// # Errors
+///
+/// Returns [`Violation::InvalidTxSignatures`] if the signature is missing or
+/// does not verify under the peer's current funding pubkey, both of which
+/// BOLT 2 has the receiver fail the channel over.
+fn check_shared_input_signature(
+    ts: &TxSignatures,
+    channel_states: &HashMap<ChannelId, ChannelState>,
+    negotiations: &Negotiations,
+) -> Result<Option<Signature>, Violation> {
+    let (Some(splice), Some(state)) = (
+        negotiations.splices.get(&ts.channel_id),
+        channel_states.get(&ts.channel_id),
+    ) else {
+        return Ok(None);
+    };
+    let tx = splice.attempt().tx_exchange.shared_tx().build();
+    if tx.compute_txid() != ts.txid {
+        log::debug!(
+            "tx_signatures for splice of {} signs {}, not the negotiated {}",
+            ts.channel_id,
+            ts.txid,
+            tx.compute_txid(),
+        );
+        return Ok(None);
+    }
+    let Some(input) = splice.prior.input(&tx) else {
+        log::debug!(
+            "splice of {} negotiated no shared input, nothing to check",
+            ts.channel_id
+        );
+        return Ok(None);
+    };
+
+    let Some(signature) = ts.tlvs.shared_input_signature else {
+        return Err(Violation::InvalidTxSignatures(
+            ts.channel_id,
+            "no shared_input_signature for the splice".into(),
+        ));
+    };
+    if !input.verify(&signature, state.counterparty_funding_pubkey()) {
+        return Err(Violation::InvalidTxSignatures(
+            ts.channel_id,
+            "shared_input_signature does not verify".into(),
+        ));
+    }
+    Ok(Some(signature))
 }
 
 /// Validates and decodes the witnesses of a received `tx_signatures`.
@@ -2320,6 +2557,48 @@ fn apply_peer_witnesses(
         "applied {applied} of {} peer witness(es) to {txid}",
         attempt.peer_witnesses.len(),
     );
+    tx
+}
+
+/// Completes a splice transaction's shared input with both peers' signatures:
+/// ours, made with the funding key the spliced channel still holds, and the
+/// one from the peer's `tx_signatures`.
+///
+/// The splice is found by txid, like [`apply_peer_witnesses`]. Without the
+/// peer's signature the input stays unsigned, so the wallet cannot complete
+/// the transaction and it is not broadcast.
+fn apply_shared_input_witness(
+    negotiations: &Negotiations,
+    channel_states: &HashMap<ChannelId, ChannelState>,
+    mut tx: bitcoin::Transaction,
+) -> bitcoin::Transaction {
+    let txid = tx.compute_txid();
+    for (channel_id, splice) in &negotiations.splices {
+        let Some(peer_signature) = splice
+            .funding_attempts()
+            .all()
+            .find(|attempt| attempt.tx_exchange.shared_tx().build().compute_txid() == txid)
+            .and_then(|attempt| attempt.peer_shared_input_signature)
+        else {
+            continue;
+        };
+        let Some(state) = channel_states.get(channel_id) else {
+            continue;
+        };
+        let Some((index, our_signature)) = splice
+            .prior
+            .input(&tx)
+            .and_then(|input| Some((input.index, input.sign(&state.holder.funding_privkey)?)))
+        else {
+            continue;
+        };
+        tx.input[index].witness = build_funding_witness(
+            (state.holder_funding_pubkey(), &our_signature),
+            (state.counterparty_funding_pubkey(), &peer_signature),
+        );
+        log::debug!("applied the shared input witness to {txid}");
+        break;
+    }
     tx
 }
 

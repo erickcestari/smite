@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 
-use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 
 use crate::bolt::{ChannelId, SpliceAck, SpliceInit};
-use crate::channel_tx::build_funding_witness_script;
+use crate::channel_tx::{ChannelState, FundingInput, build_funding_witness_script};
 use crate::pending_channel::{
     FundingAttempt, FundingAttempts, FundingNegotiation, PendingChannelV2, V2Negotiations,
 };
@@ -35,6 +35,22 @@ impl PriorFunding {
             script_pubkey: self.witness_script.to_p2wsh(),
         }
     }
+
+    /// The input of `tx` spending it, which both peers sign: the splice's
+    /// shared input. `None` when `tx` does not spend it.
+    #[must_use]
+    pub fn input<'a>(&'a self, tx: &'a Transaction) -> Option<FundingInput<'a>> {
+        let index = tx
+            .input
+            .iter()
+            .position(|txin| txin.previous_output == self.outpoint)?;
+        Some(FundingInput {
+            tx,
+            index,
+            witness_script: &self.witness_script,
+            satoshis: self.satoshis,
+        })
+    }
 }
 
 /// A splice of a live channel, from the `splice_init` we sent.
@@ -45,6 +61,9 @@ pub struct PendingSplice {
     pub splice_ack: Option<SpliceAck>,
     /// The funding output the splice transaction spends.
     pub prior: PriorFunding,
+    /// The channel moved onto each attempt's funding output, keyed by the
+    /// funding txid our `commitment_signed` committed to.
+    pub candidates: HashMap<Txid, ChannelState>,
     attempts: FundingAttempts,
 }
 
@@ -64,6 +83,7 @@ impl PendingSplice {
             splice_init,
             splice_ack: None,
             prior,
+            candidates: HashMap::new(),
             attempts: FundingAttempts::new(first),
         }
     }

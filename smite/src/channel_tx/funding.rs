@@ -1,11 +1,15 @@
 //! BOLT 3 funding transaction construction.
 
 use bitcoin::absolute::LockTime;
+use bitcoin::ecdsa;
+use bitcoin::hashes::Hash;
 use bitcoin::opcodes::all as opcodes;
 use bitcoin::script::Builder;
-use bitcoin::secp256k1::PublicKey;
+use bitcoin::secp256k1::ecdsa::Signature;
+use bitcoin::secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::transaction::{InputWeightPrediction, Version, predict_weight};
-use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use bitcoin::{Amount, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
 use crate::bitcoin::Utxo;
 
@@ -203,6 +207,69 @@ pub fn build_funding_witness_script(pubkey1: &PublicKey, pubkey2: &PublicKey) ->
         .push_opcode(opcodes::OP_PUSHNUM_2)
         .push_opcode(opcodes::OP_CHECKMULTISIG)
         .into_script()
+}
+
+/// A 2-of-2 funding output being spent: the input of `tx` at `index`, worth
+/// `satoshis` and locked to `witness_script`.
+pub struct FundingInput<'a> {
+    pub tx: &'a Transaction,
+    pub index: usize,
+    pub witness_script: &'a Script,
+    pub satoshis: u64,
+}
+
+impl FundingInput<'_> {
+    /// The `SIGHASH_ALL` digest both funding keys sign, or `None` when
+    /// `index` is past the inputs.
+    fn sighash(&self) -> Option<Message> {
+        let sighash = SighashCache::new(self.tx)
+            .p2wsh_signature_hash(
+                self.index,
+                self.witness_script,
+                Amount::from_sat(self.satoshis),
+                EcdsaSighashType::All,
+            )
+            .ok()?;
+        Some(Message::from_digest(sighash.to_byte_array()))
+    }
+
+    /// Signs the input with one of the two funding keys, or `None` when
+    /// `index` is past the inputs.
+    #[must_use]
+    pub fn sign(&self, privkey: &SecretKey) -> Option<Signature> {
+        Some(Secp256k1::signing_only().sign_ecdsa(&self.sighash()?, privkey))
+    }
+
+    /// Whether `signature` signs the input under `pubkey`.
+    #[must_use]
+    pub fn verify(&self, signature: &Signature, pubkey: &PublicKey) -> bool {
+        self.sighash().is_some_and(|sighash| {
+            Secp256k1::verification_only()
+                .verify_ecdsa(&sighash, signature, pubkey)
+                .is_ok()
+        })
+    }
+}
+
+/// The witness spending a 2-of-2 funding output: the empty `CHECKMULTISIG`
+/// dummy, both signatures in the order their pubkeys appear in the script,
+/// then the script (BOLT 3).
+#[must_use]
+pub fn build_funding_witness(
+    (pubkey1, signature1): (&PublicKey, &Signature),
+    (pubkey2, signature2): (&PublicKey, &Signature),
+) -> Witness {
+    let (first, second) = if pubkey1.serialize() < pubkey2.serialize() {
+        (signature1, signature2)
+    } else {
+        (signature2, signature1)
+    };
+    let mut witness = Witness::new();
+    witness.push([]);
+    witness.push(ecdsa::Signature::sighash_all(*first).serialize());
+    witness.push(ecdsa::Signature::sighash_all(*second).serialize());
+    witness.push(build_funding_witness_script(pubkey1, pubkey2).as_bytes());
+    witness
 }
 
 #[cfg(test)]
@@ -781,5 +848,92 @@ mod tests {
             &acceptor_funding_pubkey,
             other_amount
         ));
+    }
+
+    /// A transaction spending a 2-of-2 funding output as its second input.
+    fn funding_spend() -> Transaction {
+        let input = |vout| TxIn {
+            previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([9; 32]), vout),
+            ..TxIn::default()
+        };
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![input(0), input(1)],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn funding_input_signatures_verify_under_their_own_key_only() {
+        let secp = Secp256k1::new();
+        let (sk1, sk2) = (secret(&"11".repeat(32)), secret(&"22".repeat(32)));
+        let (pk1, pk2) = (sk1.public_key(&secp), sk2.public_key(&secp));
+        let tx = funding_spend();
+        let witness_script = build_funding_witness_script(&pk1, &pk2);
+        let input = FundingInput {
+            tx: &tx,
+            index: 1,
+            witness_script: &witness_script,
+            satoshis: 100_000,
+        };
+
+        let sig = input.sign(&sk1).expect("input 1 exists");
+
+        assert!(input.verify(&sig, &pk1));
+        assert!(!input.verify(&sig, &pk2));
+        // Signing commits to the input, so the other one does not verify.
+        let other = FundingInput { index: 0, ..input };
+        assert!(!other.verify(&sig, &pk1));
+    }
+
+    #[test]
+    fn funding_input_past_the_inputs_has_no_signature() {
+        let tx = funding_spend();
+        let witness_script = ScriptBuf::new();
+        let input = FundingInput {
+            tx: &tx,
+            index: 2,
+            witness_script: &witness_script,
+            satoshis: 100_000,
+        };
+
+        assert_eq!(input.sign(&secret(&"11".repeat(32))), None);
+    }
+
+    #[test]
+    fn funding_witness_orders_signatures_like_the_script_pubkeys() {
+        let secp = Secp256k1::new();
+        let (sk1, sk2) = (secret(&"11".repeat(32)), secret(&"22".repeat(32)));
+        let (pk1, pk2) = (sk1.public_key(&secp), sk2.public_key(&secp));
+        let tx = funding_spend();
+        let witness_script = build_funding_witness_script(&pk1, &pk2);
+        let input = FundingInput {
+            tx: &tx,
+            index: 1,
+            witness_script: &witness_script,
+            satoshis: 100_000,
+        };
+        let (sig1, sig2) = (input.sign(&sk1).unwrap(), input.sign(&sk2).unwrap());
+
+        // Either argument order yields the same witness.
+        let witness = build_funding_witness((&pk2, &sig2), (&pk1, &sig1));
+        assert_eq!(witness, build_funding_witness((&pk1, &sig1), (&pk2, &sig2)));
+
+        let elements: Vec<&[u8]> = witness.iter().collect();
+        assert_eq!(elements.len(), 4);
+        assert!(elements[0].is_empty());
+        assert_eq!(elements[3], witness_script.as_bytes());
+        let (lesser, greater) = if pk1.serialize() < pk2.serialize() {
+            (pk1, pk2)
+        } else {
+            (pk2, pk1)
+        };
+        let decode = |element: &[u8]| ecdsa::Signature::from_slice(element).unwrap().signature;
+        assert!(input.verify(&decode(elements[1]), &lesser));
+        assert!(input.verify(&decode(elements[2]), &greater));
     }
 }
