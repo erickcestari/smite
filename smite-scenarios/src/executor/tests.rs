@@ -3556,3 +3556,172 @@ fn execute_recv_interactive_tx_records_an_stfu_ahead_of_the_reply() {
     assert!(fx.quiescence(&v2_channel_id()).received);
     assert!(!fx.negotiation_v2(v2_channel_id()).expects_reply());
 }
+
+// -- Splicing --
+
+/// The peer's side of `splice_flow`: a `splice_ack` contributing nothing,
+/// then a `tx_complete` answering each of our `contributions`.
+fn splice_flow_replies(fx: Fixture, contributions: usize) -> Fixture {
+    fx.queue(&splice_ack_reply(0))
+        .queue_repeated(&tx_complete_reply(v2_channel_id()), contributions)
+}
+
+/// Our new funding pubkey, announced in `splice_init`.
+fn splice_funding_pubkey() -> PublicKey {
+    let sk = SecretKey::from_slice(&SPLICE_FUNDING_KEY).expect("valid secret key");
+    PublicKey::from_secret_key(&Secp256k1::new(), &sk)
+}
+
+#[test]
+fn execute_send_splice_init_on_a_live_channel_starts_a_splice() {
+    let mut b = ProgramBuilder::new();
+    send_splice_init(&mut b, 150_000, 1_000);
+
+    let mut fx = splice_fixture();
+    fx.run(&b.build());
+
+    let sent: SpliceInit = fx.last_sent();
+    assert_eq!(sent.channel_id, v2_channel_id());
+    assert_eq!(sent.funding_contribution_satoshis, 150_000);
+    assert_eq!(sent.funding_feerate_perkw, 1_000);
+    assert_eq!(sent.locktime, 130);
+    assert_eq!(sent.funding_pubkey, splice_funding_pubkey());
+
+    let splice = fx.splice(&v2_channel_id());
+    assert_eq!(splice.prior.outpoint, live_funding_outpoint());
+    assert_eq!(splice.prior.satoshis, 200_000);
+    // The peer owes its splice_ack.
+    assert!(splice.expects_reply());
+}
+
+#[test]
+fn execute_send_splice_init_on_a_channel_that_is_not_live_tracks_nothing() {
+    let mut b = ProgramBuilder::new();
+    send_splice_init(&mut b, 150_000, 1_000);
+
+    let mut fx = Fixture::new();
+    fx.run(&b.build());
+
+    assert_eq!(fx.last_sent::<SpliceInit>().channel_id, v2_channel_id());
+    assert!(!fx.has_splice(&v2_channel_id()));
+}
+
+#[test]
+fn execute_recv_interactive_tx_records_the_splice_ack() {
+    let mut b = ProgramBuilder::new();
+    let splice = send_splice_init(&mut b, 150_000, 1_000);
+    recv_interactive_tx(&mut b, splice.sent);
+
+    let mut fx = splice_fixture().queue(&splice_ack_reply(30_000));
+    fx.run(&b.build());
+
+    let splice = fx.splice(&v2_channel_id());
+    assert!(splice.is_accepted());
+    assert!(!splice.expects_reply());
+    assert_eq!(splice.attempt().remote_contribution, 30_000);
+    // The previous 200k with both contributions applied.
+    assert_eq!(splice.total_funding_satoshis(), 380_000);
+}
+
+#[test]
+fn execute_recv_interactive_tx_abort_of_splice_init_ends_the_splice() {
+    let mut b = ProgramBuilder::new();
+    let splice = send_splice_init(&mut b, 150_000, 1_000);
+    recv_interactive_tx(&mut b, splice.sent);
+
+    let mut fx = splice_fixture().queue(&Message::TxAbort(TxAbort::new(
+        v2_channel_id(),
+        "feerate too low",
+    )));
+    fx.run(&b.build());
+
+    let splice = fx.splice(&v2_channel_id());
+    assert!(splice.attempt().tx_exchange.aborted());
+    assert!(!splice.expects_reply());
+}
+
+#[test]
+fn execute_send_tx_add_shared_input_spends_the_current_funding_output() {
+    let mut b = ProgramBuilder::new();
+    let splice = send_splice_init(&mut b, 150_000, 1_000);
+    recv_interactive_tx(&mut b, splice.sent);
+    send_tx_add_shared_input(&mut b, splice.channel_id, 0);
+
+    let mut fx = splice_fixture().queue(&splice_ack_reply(0));
+    fx.run(&b.build());
+
+    let sent: TxAddInput = fx.last_sent();
+    assert!(sent.prevtx.is_empty());
+    assert_eq!(sent.prevtx_vout, live_funding_outpoint().vout);
+    assert_eq!(
+        sent.tlvs.shared_input_txid,
+        Some(live_funding_outpoint().txid)
+    );
+    let shared_tx = fx
+        .splice(&v2_channel_id())
+        .attempt()
+        .tx_exchange
+        .shared_tx();
+    let (_, input) = shared_tx.inputs().next().expect("the shared input");
+    assert!(input.shared);
+    assert_eq!(input.value(), 200_000);
+}
+
+#[test]
+fn execute_splice_out_pays_the_amount_taken_out_less_our_fee() {
+    let mut b = ProgramBuilder::new();
+    splice_flow(&mut b, -50_000, 1_000);
+
+    let mut fx = splice_flow_replies(splice_fixture(), 3);
+    fx.run(&b.build());
+
+    let sent = fx.sent_len();
+    let funding: TxAddOutput = fx.sent(sent - 2);
+    assert_eq!(funding.sats, 150_000);
+    assert_eq!(
+        funding.script,
+        build_funding_witness_script(&splice_funding_pubkey(), &sample_pubkey(21))
+            .to_p2wsh()
+            .into_bytes()
+    );
+    // At 1000 sat/kw we pay for the common fields (42), the shared input
+    // (164 + 222), the P2WSH funding output (172) and the P2WPKH change (124).
+    let change: TxAddOutput = fx.sent(sent - 1);
+    assert_eq!(change.sats, 50_000 - 724);
+}
+
+#[test]
+fn execute_splice_in_change_keeps_what_our_input_does_not_add() {
+    let mut b = ProgramBuilder::new();
+    splice_flow(&mut b, 150_000, 1_000);
+
+    let mut fx = splice_flow_replies(splice_fixture(), 4);
+    fx.run(&b.build());
+
+    let sent = fx.sent_len();
+    assert_eq!(fx.sent::<TxAddOutput>(sent - 2).sats, 350_000);
+    // The 1 BTC wallet input also pays for itself (164 + 108).
+    assert_eq!(
+        fx.sent::<TxAddOutput>(sent - 1).sats,
+        100_000_000 - 150_000 - 724 - 272
+    );
+}
+
+#[test]
+fn execute_build_funding_transaction_v2_builds_the_splice_transaction() {
+    let mut b = ProgramBuilder::new();
+    let splice = splice_flow(&mut b, -50_000, 1_000);
+    send_tx_complete(&mut b, splice.channel_id);
+    let funding_tx = b.append(Operation::BuildFundingTransactionV2, &[splice.channel_id]);
+    b.append(Operation::BroadcastTransaction, &[funding_tx]);
+
+    // The peer's tx_complete answering our change output precedes ours, so
+    // ours concludes the exchange.
+    let mut fx = splice_flow_replies(splice_fixture(), 3);
+    fx.run(&b.build());
+
+    let tx = &fx.bitcoin().broadcast_calls[0];
+    assert_eq!(tx.input[0].previous_output, live_funding_outpoint());
+    assert_eq!(tx.output[0].value, Amount::from_sat(150_000));
+    assert_eq!(tx.lock_time.to_consensus_u32(), 130);
+}

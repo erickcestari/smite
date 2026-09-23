@@ -181,6 +181,9 @@ impl ProgramBuilder {
     pub fn generate_fresh(&mut self, var_type: VariableType, rng: &mut impl Rng) -> usize {
         match var_type {
             VariableType::Amount => self.append(Operation::LoadAmount(rng.random()), &[]),
+            VariableType::Contribution => {
+                self.append(Operation::LoadContribution(rng.random()), &[])
+            }
             VariableType::FeeratePerKw => {
                 self.append(Operation::LoadFeeratePerKw(rng.random()), &[])
             }

@@ -30,6 +30,8 @@ pub enum Variable {
     PrivateKey([u8; PRIVATE_KEY_SIZE]),
     /// Satoshi or millisatoshi amount.
     Amount(u64),
+    /// Signed satoshi amount a splice adds to or removes from a balance.
+    Contribution(i64),
     /// Fee rate in sat/kw.
     FeeratePerKw(u32),
     /// Block height or count (`minimum_depth`, `cltv_expiry`, `locktime`).
@@ -95,6 +97,7 @@ impl Variable {
             Self::Point(_) => VariableType::Point,
             Self::PrivateKey(_) => VariableType::PrivateKey,
             Self::Amount(_) => VariableType::Amount,
+            Self::Contribution(_) => VariableType::Contribution,
             Self::FeeratePerKw(_) => VariableType::FeeratePerKw,
             Self::BlockHeight(_) => VariableType::BlockHeight,
             Self::Timestamp(_) => VariableType::Timestamp,
@@ -150,6 +153,7 @@ pub enum VariableType {
     SentFundingCreated,
     SentShutdown,
     SentStfu,
+    Contribution,
 }
 
 impl VariableType {
@@ -183,7 +187,8 @@ impl VariableType {
             | Self::OpenChannel2Message
             | Self::AcceptChannel2
             | Self::ShortChannelId
-            | Self::FundingTransaction => false,
+            | Self::FundingTransaction
+            | Self::Contribution => false,
         }
     }
 }

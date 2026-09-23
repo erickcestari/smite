@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use bitcoin::{OutPoint, ScriptBuf};
+use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut};
 
 use crate::bolt::{ChannelId, SpliceAck, SpliceInit};
 use crate::channel_tx::build_funding_witness_script;
@@ -24,6 +24,17 @@ pub struct PriorFunding {
     pub satoshis: u64,
     /// The 2-of-2 script both peers' previous funding pubkeys lock it to.
     pub witness_script: ScriptBuf,
+}
+
+impl PriorFunding {
+    /// The output it names.
+    #[must_use]
+    pub fn txout(&self) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(self.satoshis),
+            script_pubkey: self.witness_script.to_p2wsh(),
+        }
+    }
 }
 
 /// A splice of a live channel, from the `splice_init` we sent.

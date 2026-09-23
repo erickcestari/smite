@@ -7,7 +7,9 @@ use smite::bolt::{
     AcceptChannel2Tlvs, AcceptChannelTlvs, ChannelTypeVariant, CommitmentSigned,
     CommitmentSignedTlvs, FromMessage, TxAckRbf, TxAckRbfTlvs,
 };
+use smite::bolt::{SpliceAck, SpliceAckTlvs};
 use smite::pending_channel::PendingChannelV2;
+use smite::pending_splice::PendingSplice;
 use std::collections::VecDeque;
 use std::str::FromStr;
 
@@ -316,6 +318,20 @@ impl Fixture {
             .channel_states
             .insert(v2_channel_id(), live_channel_state(Side::Opener));
         self
+    }
+
+    /// Returns the splice recorded for `id`.
+    pub fn splice(&self, id: &ChannelId) -> &PendingSplice {
+        self.executor
+            .funding_negotiations
+            .splices
+            .get(id)
+            .expect("splice recorded")
+    }
+
+    /// Returns whether a splice is recorded for `id`.
+    pub fn has_splice(&self, id: &ChannelId) -> bool {
+        self.executor.funding_negotiations.splices.contains_key(id)
     }
 
     /// Returns the progress of the `stfu` exchange on `id`.
@@ -957,6 +973,25 @@ pub fn live_channel_state(side: Side) -> ChannelState {
     state.opener_next_per_commitment_point = Some(open.second_per_commitment_point);
     state.acceptor_next_per_commitment_point = Some(accept.second_per_commitment_point);
     state
+}
+
+/// The key behind the new funding pubkey our `splice_init` announces.
+pub const SPLICE_FUNDING_KEY: [u8; 32] = [0x88; 32];
+
+/// The peer's `splice_ack` on the live channel, contributing `contribution`.
+pub fn splice_ack_reply(contribution: i64) -> Message {
+    Message::SpliceAck(SpliceAck {
+        channel_id: v2_channel_id(),
+        funding_contribution_satoshis: contribution,
+        funding_pubkey: sample_pubkey(21),
+        tlvs: SpliceAckTlvs::default(),
+    })
+}
+
+/// A fixture with the live channel seeded and the v2 wallet funded, ready to
+/// splice.
+pub fn splice_fixture() -> Fixture {
+    Fixture::new().with_v2_wallet().with_live_channel()
 }
 
 /// The peer's `stfu` on the live channel.
