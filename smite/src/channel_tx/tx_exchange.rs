@@ -260,6 +260,7 @@ mod tests {
             sequence: MAX_SEQUENCE,
             contributor: Contributor::Remote,
             prevout: None,
+            shared: false,
         }
     }
 

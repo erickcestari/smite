@@ -896,7 +896,7 @@ impl<C: Connection, B: BitcoinRpc, R: TargetRpc> Executor<C, B, R> {
                                 .attempt()
                                 .tx_exchange
                                 .shared_tx()
-                                .input_positions(Contributor::Remote)
+                                .witness_positions(Contributor::Remote)
                                 .len()
                         });
                         let witnesses = validate_peer_witnesses(&ts, contributed)?;
@@ -1899,7 +1899,7 @@ fn build_tx_signatures(
                 .attempt()
                 .tx_exchange
                 .shared_tx()
-                .input_positions(Contributor::Local)
+                .witness_positions(Contributor::Local)
         })
         .unwrap_or_default();
 
@@ -2046,7 +2046,7 @@ fn apply_peer_witnesses(
     let positions = attempt
         .tx_exchange
         .shared_tx()
-        .input_positions(Contributor::Remote);
+        .witness_positions(Contributor::Remote);
     let mut applied = 0usize;
     for (&position, witness) in positions.iter().zip(&attempt.peer_witnesses) {
         let Some(txin) = tx.input.get_mut(position) else {

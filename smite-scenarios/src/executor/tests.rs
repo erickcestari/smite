@@ -2735,6 +2735,7 @@ fn negotiation_awaiting_tx_signatures(local_value: u64, remote_value: u64) -> V2
                     value: Amount::from_sat(value),
                     script_pubkey: sample_change_spk(),
                 }),
+                shared: false,
             },
         };
         // One turn each way, so nothing is left owed.

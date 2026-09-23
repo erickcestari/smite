@@ -45,6 +45,10 @@ const OUTPUT_BASE_WEIGHT: u64 = (8 + 1) * 4;
 /// feerate falls short, never when it exceeds.
 const WITNESS_WEIGHT_PER_INPUT: u64 = 108;
 
+/// Witness weight of a splice's shared input, which spends the previous 2-of-2
+/// funding output: BOLT 3's `funding_input` witness.
+const SHARED_INPUT_WITNESS_WEIGHT: u64 = 222;
+
 /// Maximum outputs in the constructed transaction (BOLT 2).
 pub const MAX_OUTPUTS: usize = 252;
 
@@ -76,6 +80,10 @@ pub struct SharedInput {
     /// known for the peer's only when its `prevtx` parsed and `prevtx_vout` was
     /// within range.
     pub prevout: Option<TxOut>,
+    /// Whether this is a splice's shared input, spending the previous funding
+    /// output. Both peers sign it through `shared_input_signature` rather
+    /// than a witness.
+    pub shared: bool,
 }
 
 impl SharedInput {
@@ -110,6 +118,23 @@ impl SharedInput {
             sequence,
             contributor,
             prevout,
+            shared: false,
+        }
+    }
+
+    /// Builds a splice's shared input, spending the previous funding output
+    /// `prevout` at `outpoint`.
+    ///
+    /// Only its initiator adds it, so it is ours; BOLT 2 attributes all of its
+    /// value to the initiator when deciding who signs first.
+    #[must_use]
+    pub fn shared(outpoint: OutPoint, prevout: TxOut, sequence: u32) -> Self {
+        Self {
+            outpoint,
+            sequence,
+            contributor: Contributor::Local,
+            prevout: Some(prevout),
+            shared: true,
         }
     }
 
@@ -249,25 +274,27 @@ impl SharedTransaction {
     }
 
     /// Positions in the assembled transaction of the inputs `contributor`
-    /// contributed.
+    /// witnesses in its `tx_signatures`: every input it contributed but the
+    /// shared input, which is signed through `shared_input_signature`.
     ///
     /// [`Self::build`] emits inputs in ascending `serial_id` order, so these
     /// are also the positions BOLT 2's "order the `witnesses` by the
     /// `serial_id` of the input they correspond to" maps a `tx_signatures`'s
     /// witnesses onto, in either direction.
     #[must_use]
-    pub fn input_positions(&self, contributor: Contributor) -> Vec<usize> {
+    pub fn witness_positions(&self, contributor: Contributor) -> Vec<usize> {
         self.inputs
             .values()
             .enumerate()
-            .filter(|(_, input)| input.contributor == contributor)
+            .filter(|(_, input)| input.contributor == contributor && !input.shared)
             .map(|(position, _)| position)
             .collect()
     }
 
     /// Total value of the inputs contributed by `contributor`, saturating.
     ///
-    /// Inputs whose `prevout` is unknown count as zero.
+    /// Inputs whose `prevout` is unknown count as zero. A shared input counts
+    /// in full, as BOLT 2 attributes it to the splice initiator.
     #[must_use]
     pub fn contributed_input_value(&self, contributor: Contributor) -> u64 {
         self.inputs
@@ -296,11 +323,19 @@ impl SharedTransaction {
     /// underpaying by a single satoshi makes the peer fail the negotiation.
     #[must_use]
     pub fn local_fee_sat(&self, feerate_per_kw: u32, pending_output_script_lens: &[usize]) -> u64 {
-        let local_inputs = self
+        let input_weight = self
             .inputs
             .values()
             .filter(|i| i.contributor == Contributor::Local)
-            .count() as u64;
+            .map(|i| {
+                INPUT_WEIGHT
+                    + if i.shared {
+                        SHARED_INPUT_WITNESS_WEIGHT
+                    } else {
+                        WITNESS_WEIGHT_PER_INPUT
+                    }
+            })
+            .sum::<u64>();
 
         let output_weight = self
             .outputs
@@ -311,10 +346,7 @@ impl SharedTransaction {
             .map(|script_len| OUTPUT_BASE_WEIGHT + script_len * 4)
             .sum::<u64>();
 
-        let weight = COMMON_FIELDS_WEIGHT
-            + local_inputs * INPUT_WEIGHT
-            + output_weight
-            + local_inputs * WITNESS_WEIGHT_PER_INPUT;
+        let weight = COMMON_FIELDS_WEIGHT + input_weight + output_weight;
 
         weight
             .saturating_mul(u64::from(feerate_per_kw))
@@ -594,21 +626,58 @@ e37d3280b2e60e0000000017a9147ecd1b519326bc13b0ec716e469b58ed02b112a087f0006bee00
     }
 
     #[test]
-    fn input_positions_follow_serial_order_not_insertion_order() {
+    fn witness_positions_follow_serial_order_not_insertion_order() {
         let shared = appendix_g();
 
         // Serial 11 is the accepter's and was added second, but sorts first.
-        assert_eq!(shared.input_positions(Contributor::Remote), vec![0]);
-        assert_eq!(shared.input_positions(Contributor::Local), vec![1]);
+        assert_eq!(shared.witness_positions(Contributor::Remote), vec![0]);
+        assert_eq!(shared.witness_positions(Contributor::Local), vec![1]);
     }
 
     #[test]
-    fn input_positions_is_empty_without_contributions() {
+    fn witness_positions_is_empty_without_contributions() {
         assert!(
             SharedTransaction::new(0)
-                .input_positions(Contributor::Local)
+                .witness_positions(Contributor::Local)
                 .is_empty()
         );
+    }
+
+    /// The previous funding output a splice's shared input spends.
+    fn shared_input(value: u64) -> SharedInput {
+        SharedInput::shared(
+            OutPoint {
+                txid: Txid::from_byte_array([7u8; 32]),
+                vout: 1,
+            },
+            TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: script(APPENDIX_G_FUNDING_SPK),
+            },
+            MAX_SEQUENCE,
+        )
+    }
+
+    #[test]
+    fn witness_positions_skip_the_shared_input() {
+        let mut shared = appendix_g();
+        // Serial 0 sorts before every Appendix G input.
+        shared.add_input(0, shared_input(1_000_000));
+
+        assert_eq!(shared.witness_positions(Contributor::Local), vec![2]);
+        assert_eq!(shared.witness_positions(Contributor::Remote), vec![1]);
+    }
+
+    #[test]
+    fn contributed_input_value_counts_the_shared_input_as_ours() {
+        let mut shared = SharedTransaction::new(0);
+        shared.add_input(0, shared_input(1_000_000));
+
+        assert_eq!(
+            shared.contributed_input_value(Contributor::Local),
+            1_000_000
+        );
+        assert_eq!(shared.contributed_input_value(Contributor::Remote), 0);
     }
 
     #[test]
@@ -832,6 +901,19 @@ e37d3280b2e60e0000000017a9147ecd1b519326bc13b0ec716e469b58ed02b112a087f0006bee00
         assert_eq!(
             with_output - with_input,
             OUTPUT_BASE_WEIGHT + change_script.len() as u64 * 4,
+        );
+    }
+
+    #[test]
+    fn local_fee_charges_the_shared_input_its_funding_witness() {
+        let mut shared = SharedTransaction::new(0);
+        let base = shared.local_fee_sat(1000, &[]);
+
+        shared.add_input(0, shared_input(1_000_000));
+
+        assert_eq!(
+            shared.local_fee_sat(1000, &[]) - base,
+            INPUT_WEIGHT + SHARED_INPUT_WITNESS_WEIGHT
         );
     }
 

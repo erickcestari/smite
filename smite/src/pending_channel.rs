@@ -429,6 +429,7 @@ mod tests {
                     value: Amount::from_sat(input_value),
                     script_pubkey: ScriptBuf::new(),
                 }),
+                shared: false,
             },
         });
         attempt
