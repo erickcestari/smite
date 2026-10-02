@@ -6,6 +6,7 @@ import java.util.BitSet;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -23,8 +24,11 @@ import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
+import org.objectweb.asm.tree.LookupSwitchInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TableSwitchInsnNode;
+import org.objectweb.asm.tree.TryCatchBlockNode;
 
 // Build-time coverage instrumentation for Eclair.
 //
@@ -36,6 +40,11 @@ import org.objectweb.asm.tree.MethodNode;
 //
 // Each method gets a probe at entry, one after each conditional jump (the
 // fall-through arc) and one at each label (block entry, covering taken arcs).
+// A block probe can't tell which arc entered the block, so each critical edge
+// (a jump or switch arc between a block with several exits and one with
+// several entries) is moved onto a new block with its own probe. Together this
+// is edge coverage, except for arcs taken by exceptions.
+//
 // IDs are sequential over classes sorted by name, then bytecode order, so they
 // are stable across builds of the same JARs.
 //
@@ -185,26 +194,124 @@ public class EclairInstrumenter {
   }
 
   // Inserts edge() probes at method entry, after each conditional jump (the
-  // fall-through arc) and after each block-start label (covering taken arcs),
-  // taking IDs from the shared counter in bytecode order.
+  // fall-through arc), after each block-start label and on each critical
+  // edge, taking IDs from the shared counter in bytecode order.
   static void insertProbes(MethodNode method, BitSet blockStarts,
                            int[] nextId) {
     InsnList insns = method.instructions;
     AbstractInsnNode[] original = insns.toArray();
+    Map<LabelNode, Integer> entries = countEntries(method, original);
+    // Blocks that split critical edges, appended after the method's code.
+    InsnList splits = new InsnList();
     insns.insert(probe(nextId));
     int index = 0;
     for (AbstractInsnNode node : original) {
       if (node instanceof LabelNode && blockStarts.get(index)) {
         insns.insert(node, probe(nextId));
-      } else if (node instanceof JumpInsnNode &&
-                 node.getOpcode() != Opcodes.GOTO &&
-                 node.getOpcode() != Opcodes.JSR) {
+      } else if (node instanceof JumpInsnNode jump && isConditional(jump)) {
+        // The fall-through arc already has the probe below, so only the
+        // taken arc can be critical.
+        if (entries.get(jump.label) > 1) {
+          jump.label = split(jump.label, splits, nextId);
+        }
         insns.insert(node, probe(nextId));
+      } else if (node instanceof TableSwitchInsnNode sw) {
+        Map<LabelNode, LabelNode> moved =
+            splitSwitch(sw.dflt, sw.labels, entries, splits, nextId);
+        sw.dflt = moved.getOrDefault(sw.dflt, sw.dflt);
+        sw.labels.replaceAll(target -> moved.getOrDefault(target, target));
+      } else if (node instanceof LookupSwitchInsnNode sw) {
+        Map<LabelNode, LabelNode> moved =
+            splitSwitch(sw.dflt, sw.labels, entries, splits, nextId);
+        sw.dflt = moved.getOrDefault(sw.dflt, sw.dflt);
+        sw.labels.replaceAll(target -> moved.getOrDefault(target, target));
       }
       if (node.getOpcode() >= 0) {
         index++;
       }
     }
+    insns.add(splits);
+  }
+
+  // Number of arcs into each label: one per jump or switch targeting it, one
+  // from the instruction before it if that falls through (or from the method
+  // entry), and one per exception handler it starts.
+  static Map<LabelNode, Integer> countEntries(MethodNode method,
+                                              AbstractInsnNode[] insns) {
+    Map<LabelNode, Integer> entries = new HashMap<>();
+    AbstractInsnNode previous = null;
+    for (AbstractInsnNode node : insns) {
+      if (node instanceof LabelNode label) {
+        if (previous == null || canFallThrough(previous)) {
+          entries.merge(label, 1, Integer::sum);
+        }
+      } else if (node instanceof JumpInsnNode jump) {
+        entries.merge(jump.label, 1, Integer::sum);
+      } else if (node instanceof TableSwitchInsnNode sw) {
+        for (LabelNode target : targets(sw.dflt, sw.labels)) {
+          entries.merge(target, 1, Integer::sum);
+        }
+      } else if (node instanceof LookupSwitchInsnNode sw) {
+        for (LabelNode target : targets(sw.dflt, sw.labels)) {
+          entries.merge(target, 1, Integer::sum);
+        }
+      }
+      if (node.getOpcode() >= 0) {
+        previous = node;
+      }
+    }
+    for (TryCatchBlockNode block : method.tryCatchBlocks) {
+      entries.merge(block.handler, 1, Integer::sum);
+    }
+    return entries;
+  }
+
+  // Splits the critical arcs out of a switch and returns where each moved
+  // target now points. Keys sharing a target share one arc, and one probe.
+  static Map<LabelNode, LabelNode> splitSwitch(LabelNode dflt,
+                                               List<LabelNode> labels,
+                                               Map<LabelNode, Integer> entries,
+                                               InsnList splits, int[] nextId) {
+    Set<LabelNode> targets = targets(dflt, labels);
+    Map<LabelNode, LabelNode> moved = new HashMap<>();
+    if (targets.size() > 1) {
+      for (LabelNode target : targets) {
+        if (entries.get(target) > 1) {
+          moved.put(target, split(target, splits, nextId));
+        }
+      }
+    }
+    return moved;
+  }
+
+  // Moves an arc onto a new block that runs a probe and jumps to the original
+  // target, and returns the new block's label.
+  static LabelNode split(LabelNode target, InsnList splits, int[] nextId) {
+    LabelNode block = new LabelNode();
+    splits.add(block);
+    splits.add(probe(nextId));
+    splits.add(new JumpInsnNode(Opcodes.GOTO, target));
+    return block;
+  }
+
+  // Distinct switch targets, in key order and then the default.
+  static Set<LabelNode> targets(LabelNode dflt, List<LabelNode> labels) {
+    Set<LabelNode> targets = new LinkedHashSet<>(labels);
+    targets.add(dflt);
+    return targets;
+  }
+
+  // GOTO and JSR have no fall-through.
+  static boolean isConditional(JumpInsnNode jump) {
+    return jump.getOpcode() != Opcodes.GOTO && jump.getOpcode() != Opcodes.JSR;
+  }
+
+  static boolean canFallThrough(AbstractInsnNode insn) {
+    int opcode = insn.getOpcode();
+    return !(opcode == Opcodes.GOTO || opcode == Opcodes.JSR ||
+             opcode == Opcodes.RET || opcode == Opcodes.ATHROW ||
+             opcode == Opcodes.TABLESWITCH || opcode == Opcodes.LOOKUPSWITCH ||
+             (opcode >= Opcodes.IRETURN && opcode <= Opcodes.RETURN));
   }
 
   // ldc id; invokestatic EclairSanCov.edge(I)V
