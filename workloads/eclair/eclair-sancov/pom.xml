@@ -27,10 +27,22 @@
       <artifactId>asm-tree</artifactId>
       <version>9.7</version>
     </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
     <plugins>
+      <!-- Pinned because the default Maven binding predates JUnit 5 support -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
       <!-- Bundle ASM into a fat JAR so EclairInstrumenter runs with a single -cp entry -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
