@@ -178,7 +178,7 @@ def parse_args():
     )
     p.add_argument("--timeout", type=int, default=86400)
     p.add_argument(
-        "--exec-timeout", type=int, default=2000, help="AFL++ exec timeout in ms (-t)"
+        "--exec-timeout", type=int, default=5000, help="AFL++ exec timeout in ms (-t)"
     )
     p.add_argument(
         "--hang-timeout",
