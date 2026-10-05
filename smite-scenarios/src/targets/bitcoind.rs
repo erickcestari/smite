@@ -161,7 +161,6 @@ fn setup_wallet(cli: &BitcoinCli) -> Result<(), TargetError> {
 
 /// Pays [`FUNDING_UTXOS`] outputs to a target's `address` from the fuzzer's
 /// wallet and mines [`FUNDING_BLOCKS`] to confirm them.
-#[expect(dead_code, reason = "targets call it in the following commits")]
 pub fn fund_wallet(cli: &BitcoinCli, address: &str) -> Result<(), TargetError> {
     log::info!("Funding target wallet at {address}");
     // One payment per UTXO, as `sendmany` rejects repeated addresses.
