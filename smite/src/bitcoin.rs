@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 
-use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 
@@ -302,6 +302,31 @@ impl BitcoinCli {
         Address::from_str(addr_str.trim())
             .and_then(|a| a.require_network(Network::Regtest))
             .expect("getnewaddress should return a valid address")
+    }
+
+    /// Signs the wallet-owned inputs of `tx` and leaves the rest untouched, so
+    /// unlike [`Self::sign_and_broadcast_tx`] signing need not be complete.
+    ///
+    /// Returns `None` if bitcoind rejects the request, e.g. a transaction with
+    /// no inputs, which it cannot decode.
+    ///
+    /// # Panics
+    ///
+    /// - If `bitcoin-cli signrawtransactionwithwallet` fails to execute.
+    /// - If the command succeeds but its output is not valid JSON, or its `hex`
+    ///   field does not decode as a transaction.
+    #[must_use]
+    pub fn sign_tx(&self, tx: &Transaction) -> Option<Transaction> {
+        let signed = self
+            .sign_raw_transaction_with_wallet(tx)
+            .inspect_err(|stderr| {
+                log::debug!("bitcoin-cli signrawtransactionwithwallet failed: {stderr}");
+            })
+            .ok()?;
+        Some(
+            deserialize_hex(&signed.hex)
+                .expect("signrawtransactionwithwallet should return a valid transaction"),
+        )
     }
 
     /// Runs `signrawtransactionwithwallet`, returning the parsed response, or
