@@ -4,10 +4,12 @@ Smite Protocol Depth Measure
 
 Measures how far into channel establishment each arm of a comparison got. For each
 stage of the single-funded flow (open_channel, funding_created, channel_ready) it
-reports whether the target handled the message, meaning its handler for that message
-ran, and whether it accepted it, meaning it replied or recorded the message and moved
-on. Some targets run a handler in any state and reject a message for an unknown
-channel there, so only acceptance shows that the stage's state was reached.
+counts the replayed inputs that made the target handle the message, meaning its
+handler for that message ran, and that made it accept the message, meaning it replied
+or recorded the message and moved on. Some targets run a handler in any state and
+reject a message for an unknown channel there, so only acceptance shows that the
+stage's state was reached. Inputs are counted rather than line executions, because
+one IR program can send a message several times and a byte input cannot.
 
 For each arm and target, the queues of all trials are merged, reduced with
 `afl-cmin -X` against the Nyx image the trials ran, and replayed with
@@ -26,8 +28,9 @@ Usage:
 
 Output (<out_dir>, default <EVAL_DIR>/depth):
     depth.csv, depth.md          One row per target, arm, stage and level
+    depth-inputs.csv             One row per replayed input: which stages and levels it reached
     <label>/<target>/cmin/       Reduced corpus that was replayed
-    <label>/<target>/coverage/   Merged coverage data and HTML report
+    <label>/<target>/coverage/   Per-input and merged coverage data, HTML report
 """
 
 import argparse
@@ -40,6 +43,7 @@ import subprocess
 import sys
 import threading
 import xml.etree.ElementTree as ET
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,8 +52,6 @@ SMITE_DIR = Path(__file__).resolve().parent.parent
 STAGES = ("open_channel", "funding_created", "channel_ready")
 LEVELS = ("handled", "accepted")
 EXEC_TIMEOUT_MS = 5000
-# JaCoCo records the instructions covered on a line, not how often it ran.
-HAS_EXEC_COUNTS = {"cln": True, "lnd": True, "ldk": True, "eclair": False}
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,9 @@ SOURCE_ROOTS = {
     "ldk": "/cargo/registry/src",
     "eclair": "/eclair-src/eclair-core/src/main/scala",
 }
+# Eclair's per-input reports analyze only the classes of the marker files, which are
+# named after them under this package root. Analyzing the whole jar per input is slow.
+ECLAIR_CLASS_ROOT = "fr/acinq/eclair/"
 
 print_lock = threading.Lock()
 
@@ -282,20 +287,34 @@ def replay(args, label: str, target: str):
 # ────────────────────────────  STAGE MARKERS  ────────────────────────────
 
 
-def docker_sh(image: str, script: str, cov_dir: Path | None = None) -> str:
-    cmd = ["docker", "run", "--rm"]
-    if cov_dir is not None:
-        # Run as the caller so files written to the mount stay theirs.
-        cmd += ["--user", f"{os.getuid()}:{os.getgid()}", "-v", f"{cov_dir}:/output"]
-    return run(cmd + [image, "sh", "-c", script]).stdout
+class CoverageContainer:
+    """A coverage image kept running, so per-input tools skip docker run's start-up."""
+
+    def __init__(self, image: str, cov_dir: Path):
+        self.image, self.cov_dir, self.id = image, cov_dir, None
+
+    def __enter__(self):
+        # Run as the caller so files written to the mount stay theirs; Go then needs a
+        # cache that user can write.
+        self.id = run(["docker", "run", "-d", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+                       "-v", f"{self.cov_dir}:/output", "--tmpfs", "/tmp:rw,exec,size=1g",
+                       "-e", "HOME=/tmp", "-e", "GOCACHE=/tmp/go-cache", "-e", "GOPATH=/tmp/go",
+                       "--entrypoint", "sleep", self.image, "infinity"]).stdout.strip()
+        return self
+
+    def __exit__(self, *exc):
+        subprocess.run(["docker", "rm", "-f", self.id], capture_output=True)
+
+    def sh(self, script: str) -> str:
+        return run(["docker", "exec", self.id, "sh", "-c", script]).stdout
 
 
-def find_source(image: str, target: str, suffix: str) -> str:
+def find_source(c: CoverageContainer, target: str, suffix: str) -> str:
     """Absolute path, inside the image, of the one source file ending in suffix."""
-    out = docker_sh(image, f"find {SOURCE_ROOTS[target]} -path '*/{suffix}' -type f")
+    out = c.sh(f"find {SOURCE_ROOTS[target]} -path '*/{suffix}' -type f")
     paths = [p for p in out.split() if p]
     if len(paths) != 1:
-        raise RuntimeError(f"{image}: expected one source matching {suffix}, found {paths}")
+        raise RuntimeError(f"{c.image}: expected one source matching {suffix}, found {paths}")
     return paths[0]
 
 
@@ -312,14 +331,8 @@ def resolve(marker: Marker, lines: list[str]) -> int:
     raise RuntimeError(f"marker {marker.line!r} not found in {marker.file}")
 
 
-def line_counts_llvm(target: str, image: str, cov_dir: Path, sources: list[str]) -> dict:
-    """{path: {line: count}} from the merged LLVM profile, for the given sources only."""
-    objects = ('BIN=/usr/local/bin/lightningd; OBJ=""; '
-               'for b in /usr/local/libexec/c-lightning/lightning_* /usr/local/libexec/c-lightning/plugins/*; '
-               'do [ -f "$b" ] && OBJ="$OBJ -object=$b"; done'
-               if target == "cln" else 'BIN=/usr/local/bin/ldk-node-wrapper; OBJ=""')
-    lcov = docker_sh(image, f"{objects}; llvm-cov export -format=lcov $BIN $OBJ "
-                            f"-instr-profile=/output/merged.profdata {' '.join(sources)}", cov_dir)
+def parse_lcov(lcov: str) -> dict:
+    """{path: {line: count}} from an lcov export."""
     counts, current = {}, None
     for l in lcov.splitlines():
         if l.startswith("SF:"):
@@ -330,10 +343,10 @@ def line_counts_llvm(target: str, image: str, cov_dir: Path, sources: list[str])
     return counts
 
 
-def line_counts_go(cov_dir: Path) -> dict:
+def parse_go_profile(text: str) -> dict:
     """{import path: {line: count}} from Go's text coverage profile."""
     counts = {}
-    for l in (cov_dir / "coverage.txt").read_text().splitlines()[1:]:
+    for l in text.splitlines():
         m = re.match(r"(.+):(\d+)\.\d+,(\d+)\.\d+ \d+ (\d+)$", l)
         if not m:
             continue
@@ -344,12 +357,10 @@ def line_counts_go(cov_dir: Path) -> dict:
     return counts
 
 
-def line_counts_jacoco(image: str, cov_dir: Path) -> dict:
-    """{package/sourcefile: {line: covered instructions}} from the merged JaCoCo data."""
-    docker_sh(image, "java -jar /jacococli.jar report /output/merged.exec "
-                     "--classfiles $(ls /opt/eclair/lib/eclair-core*.jar) --xml /output/jacoco.xml", cov_dir)
+def parse_jacoco_xml(xml: str) -> dict:
+    """{package/sourcefile: {line: covered instructions}} from a JaCoCo XML report."""
     counts = {}
-    for pkg in ET.parse(cov_dir / "jacoco.xml").getroot().iter("package"):
+    for pkg in ET.fromstring(xml).iter("package"):
         for sf in pkg.iter("sourcefile"):
             counts[f"{pkg.get('name')}/{sf.get('name')}"] = {
                 int(l.get("nr")): int(l.get("ci")) for l in sf.iter("line")
@@ -357,47 +368,119 @@ def line_counts_jacoco(image: str, cov_dir: Path) -> dict:
     return counts
 
 
-def lookup(counts: dict, path: str, suffix: str) -> dict:
+def llvm_export(target: str, profdata: str, sources: list[str]) -> str:
+    """Shell that prints the lcov of the given sources from one LLVM profile."""
+    if target == "cln":
+        objects = ('BIN=/usr/local/bin/lightningd; OBJ=""; '
+                   'for b in /usr/local/libexec/c-lightning/lightning_* /usr/local/libexec/c-lightning/plugins/*; '
+                   'do if [ -f "$b" ]; then OBJ="$OBJ -object=$b"; fi; done; ')
+    else:
+        objects = 'BIN=/usr/local/bin/ldk-node-wrapper; OBJ=""; '
+    return f"{objects}llvm-cov export -format=lcov $BIN $OBJ -instr-profile={profdata} {' '.join(sources)}"
+
+
+def merged_line_counts(c: CoverageContainer, target: str, paths: dict) -> dict:
+    """Line coverage of the whole replayed corpus, from the merged profile."""
+    if target in ("cln", "ldk"):
+        return parse_lcov(c.sh(llvm_export(target, "/output/merged.profdata", list(paths.values()))))
+    if target == "lnd":
+        return parse_go_profile((c.cov_dir / "coverage.txt").read_text())
+    # The whole jar rather than the extracted classes, so a class the extraction
+    # missed makes the per-input and merged results disagree.
+    c.sh("java -jar /jacococli.jar report /output/merged.exec "
+         "--classfiles $(ls /opt/eclair/lib/eclair-core*.jar) --xml /output/jacoco.xml > /dev/null")
+    return parse_jacoco_xml((c.cov_dir / "jacoco.xml").read_text())
+
+
+def extract_eclair_classes(c: CoverageContainer, suffixes: list[str]):
+    """Copy the classes of the marker files out of Eclair's jar into /output/classes."""
+    jars = c.sh("ls /opt/eclair/lib/eclair-core*.jar").split()
+    if len(jars) != 1:
+        raise RuntimeError(f"{c.image}: expected one eclair-core jar, found {jars}")
+    jar = c.cov_dir / "eclair-core.jar"
+    run(["docker", "cp", f"{c.id}:{jars[0]}", str(jar)])
+    prefixes = tuple(ECLAIR_CLASS_ROOT + s.removesuffix(".scala") for s in suffixes)
+    shutil.rmtree(c.cov_dir / "classes", ignore_errors=True)
+    with zipfile.ZipFile(jar) as z:
+        names = [n for n in z.namelist() if n.startswith(prefixes) and n.endswith(".class")]
+        if not names:
+            raise RuntimeError(f"no classes under {prefixes} in {jars[0]}")
+        z.extractall(c.cov_dir / "classes", names)
+    jar.unlink()
+
+
+def input_line_counts(c: CoverageContainer, target: str, paths: dict, input_dir: str) -> dict:
+    """Line coverage of one replayed input, from its own profile."""
+    tmp = "/tmp/" + Path(input_dir).name
+    if target in ("cln", "ldk"):
+        return parse_lcov(c.sh(f"set -e; llvm-profdata merge -sparse {input_dir}/*.profraw -o {tmp}.profdata; "
+                               f"{llvm_export(target, tmp + '.profdata', list(paths.values()))}; "
+                               f"rm -f {tmp}.profdata"))
+    if target == "lnd":
+        greps = " ".join(f"-e '/{s}:'" for s in paths)
+        return parse_go_profile(c.sh(f"set -e; go tool covdata textfmt -i={input_dir} -o={tmp}.txt; "
+                                     f"grep -F {greps} {tmp}.txt || [ $? -eq 1 ]; rm -f {tmp}.txt"))
+    return parse_jacoco_xml(c.sh(f"set -e; java -jar /jacococli.jar report {input_dir}/jacoco.exec "
+                                 f"--classfiles /output/classes --xml {tmp}.xml > /dev/null; "
+                                 f"cat {tmp}.xml; rm -f {tmp}.xml"))
+
+
+def lookup(counts: dict, path: str, suffix: str) -> dict | None:
     """Coverage of the file that is `path`, or the one whose name ends with suffix."""
     if path in counts:
         return counts[path]
     hits = [v for k, v in counts.items() if k.endswith("/" + suffix)]
-    if len(hits) != 1:
+    if len(hits) > 1:
         raise RuntimeError(f"expected one coverage entry for {suffix}, found {len(hits)}")
-    return hits[0]
+    return hits[0] if hits else None
 
 
-def measure_stages(args, label: str, target: str) -> list[dict]:
-    """One row per stage and level: whether its markers ran, and how often."""
+def reached(counts: dict, paths: dict, lines: list[tuple[str, int]]) -> bool:
+    """Whether any marker line ran. A file missing from an input's profile did not run."""
+    return any((lookup(counts, paths[suffix], suffix) or {}).get(n, 0) > 0 for suffix, n in lines)
+
+
+def measure_stages(args, label: str, target: str) -> tuple[list[dict], list[dict]]:
+    """Per stage and level, how many inputs ran a marker line; and per input, what it reached."""
     cov_dir = args.out_dir / label / target / "coverage"
-    image = coverage_image(target, label)
     markers = MARKERS[target]
     suffixes = sorted({m.file for ms in markers.values() for m in ms})
-    paths = {s: find_source(image, target, s) for s in suffixes}
-    sources = {s: docker_sh(image, f"cat {paths[s]}").splitlines() for s in suffixes}
+    keys = [(s, l) for s in STAGES for l in LEVELS]
+    inputs = sorted((d for d in (cov_dir / "covdata").iterdir() if d.is_dir() and any(d.iterdir())),
+                    key=lambda d: int(d.name.removeprefix("input-")))
 
-    if target in ("cln", "ldk"):
-        counts = line_counts_llvm(target, image, cov_dir, list(paths.values()))
-    elif target == "lnd":
-        counts = line_counts_go(cov_dir)
-    else:
-        counts = line_counts_jacoco(image, cov_dir)
+    with CoverageContainer(coverage_image(target, label), cov_dir) as c:
+        paths = {s: find_source(c, target, s) for s in suffixes}
+        sources = {s: c.sh(f"cat {paths[s]}").splitlines() for s in suffixes}
+        lines = {k: [(m.file, resolve(m, sources[m.file])) for m in markers[k]] for k in keys}
 
+        merged = merged_line_counts(c, target, paths)
+        for k in keys:
+            for suffix, n in lines[k]:
+                if n not in (lookup(merged, paths[suffix], suffix) or {}):
+                    raise RuntimeError(f"{target}: marker line {suffix}:{n} has no coverage data")
+
+        if target == "eclair":
+            extract_eclair_classes(c, suffixes)
+
+        def measure_input(d: Path) -> dict:
+            counts = input_line_counts(c, target, paths, f"/output/covdata/{d.name}")
+            return {f"{s}_{l}": int(reached(counts, paths, lines[(s, l)])) for s, l in keys}
+
+        log(f"[{label}/{target}] measuring {len(inputs)} inputs")
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            flags = list(pool.map(measure_input, inputs))
+
+    input_rows = [{"target": target, "arm": label, "input": d.name, **f} for d, f in zip(inputs, flags)]
     rows = []
-    for stage in STAGES:
-        for level in LEVELS:
-            total, where = 0, []
-            for m in markers[(stage, level)]:
-                n = resolve(m, sources[m.file])
-                file_counts = lookup(counts, paths[m.file], m.file)
-                if n not in file_counts:
-                    raise RuntimeError(f"{target}: marker line {m.file}:{n} has no coverage data")
-                total += file_counts[n]
-                where.append(f"{m.file}:{n}")
-            hits = total if HAS_EXEC_COUNTS[target] else None
-            rows.append({"target": target, "arm": label, "stage": stage, "level": level,
-                         "reached": total > 0, "hits": hits, "markers": " ".join(where)})
-    return rows
+    for s, l in keys:
+        n_inputs = sum(r[f"{s}_{l}"] for r in input_rows)
+        # The merged profile sums the inputs' profiles, so the two must agree on whether a line ran.
+        if (n_inputs > 0) != reached(merged, paths, lines[(s, l)]):
+            raise RuntimeError(f"{label}/{target}: per-input and merged coverage disagree on {s} {l}")
+        rows.append({"target": target, "arm": label, "stage": s, "level": l, "inputs": n_inputs,
+                     "markers": " ".join(f"{f}:{n}" for f, n in lines[(s, l)])})
+    return rows, input_rows
 
 
 # ────────────────────────────  ENTRY POINT  ────────────────────────────
@@ -411,31 +494,33 @@ def parse_cores(spec: str) -> list[int]:
     return cores
 
 
-def write_report(out_dir: Path, rows: list[dict], corpus: dict):
-    with open(out_dir / "depth.csv", "w", newline="") as f:
+def write_csv(path: Path, rows: list[dict]):
+    with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
 
+
+def write_report(out_dir: Path, rows: list[dict], input_rows: list[dict], corpus: dict):
+    write_csv(out_dir / "depth.csv", rows)
+    write_csv(out_dir / "depth-inputs.csv", input_rows)
+
     labels = sorted({r["arm"] for r in rows})
     with open(out_dir / "depth.md", "w") as f:
-        f.write("# Protocol depth\n\nHits are executions of the marker line across the replayed corpus; "
-                "targets without execution counts show none.\n\n")
+        f.write("# Protocol depth\n\nReplayed inputs whose coverage includes a marker line of the stage.\n\n")
         f.write("| Target | Stage | Level | " + " | ".join(labels) + " |\n")
         f.write("|---|---|---|" + "---|" * len(labels) + "\n")
         for target in dict.fromkeys(r["target"] for r in rows):
             for stage in STAGES:
                 for level in LEVELS:
-                    cells = []
-                    for label in labels:
-                        r = next(r for r in rows if (r["target"], r["arm"], r["stage"], r["level"])
-                                 == (target, label, stage, level))
-                        hits = "" if r["hits"] is None else f" ({r['hits']})"
-                        cells.append(f"{'yes' if r['reached'] else 'no'}{hits}")
+                    cells = [str(next(r["inputs"] for r in rows
+                                      if (r["target"], r["arm"], r["stage"], r["level"]) == (target, label, stage, level)))
+                             for label in labels]
                     f.write(f"| {target} | {stage} | {level} | " + " | ".join(cells) + " |\n")
-        f.write("\n| Target | Arm | Queue entries, all trials | Replayed after afl-cmin |\n|---|---|---|---|\n")
-        for (label, target), (queued, kept) in sorted(corpus.items()):
-            f.write(f"| {target} | {label} | {queued} | {kept} |\n")
+        f.write("\n| Target | Arm | Queue entries, all trials | Replayed after afl-cmin | With coverage data |\n"
+                "|---|---|---|---|---|\n")
+        for (label, target), (queued, kept, measured) in sorted(corpus.items()):
+            f.write(f"| {target} | {label} | {queued} | {kept} | {measured} |\n")
 
 
 def main():
@@ -445,7 +530,7 @@ def main():
     p.add_argument("--labels", default="encrypted_bytes,ir", help="Arms to measure; each label is its scenario")
     p.add_argument("--targets", default="cln,lnd,ldk,eclair")
     p.add_argument("--cores", default="0-7", help="Cores for the parallel afl-cmin runs")
-    p.add_argument("--jobs", type=int, default=16, help="Parallel replays per coverage run")
+    p.add_argument("--jobs", type=int, default=16, help="Parallel jobs for the replays and the per-input measure")
     p.add_argument("--nyx-image", default="smite-{label}-{target}-{scenario}",
                    help="Docker image the trials ran, as a format string")
     p.add_argument("--out-dir", type=Path)
@@ -474,14 +559,16 @@ def main():
         ensure_coverage_image(t, l, args.force)
         replay(args, l, t)
 
-    rows, corpus = [], {}
+    rows, input_rows, corpus = [], [], {}
     for l, t in combos:
-        rows += measure_stages(args, l, t)
+        stage_rows, inputs = measure_stages(args, l, t)
+        rows += stage_rows
+        input_rows += inputs
         kept = sum(1 for f in (args.out_dir / l / t / "cmin").iterdir() if f.is_file())
         queued = len(list(args.eval_dir.glob(f"{l}/{t}/trial-*/afl-out/default/queue/id:*")))
-        corpus[(l, t)] = (queued, kept)
+        corpus[(l, t)] = (queued, kept, len(inputs))
 
-    write_report(args.out_dir, rows, corpus)
+    write_report(args.out_dir, rows, input_rows, corpus)
     log(f"done: {args.out_dir}/depth.md")
 
 
