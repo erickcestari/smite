@@ -11,10 +11,10 @@ channel there, so only acceptance shows that the stage's state was reached.
 
 For each arm and target, the queues of all trials are merged, reduced with
 `afl-cmin -X` against the Nyx image the trials ran, and replayed with
-`coverage-report.sh` on a coverage build of the target. The coverage build is pinned
-to the versions of the production Dockerfile. Each stage is a marker line in the
-target's source, located by regex inside the coverage image, so line numbers always
-match the code that ran.
+`coverage-report.sh` on a coverage build of the target. The script refuses a
+Dockerfile.coverage that pins other versions than the fuzzed build. Each stage is a
+marker line in the target's source, located by regex inside the coverage image, so
+line numbers always match the code that ran.
 
 Requirements: Docker, an AFL++ checkout with Nyx mode, the trial images and the
 output layout of smite-scenario-compare.py (each arm's label is its scenario).
@@ -238,26 +238,26 @@ def coverage_image(target: str, scenario: str) -> str:
     return f"smite-{target}-{scenario}-coverage"
 
 
-def pinned_build_args(target: str) -> list[str]:
-    """Build args that pin the coverage build to the production Dockerfile's versions."""
+def check_coverage_pins(target: str):
+    """Fail if Dockerfile.coverage pins a version other than the one the trials fuzzed."""
     def args_of(path: Path) -> dict:
         return dict(re.findall(r"^ARG (\w+)=(\S+)", path.read_text(), re.M))
 
     prod = args_of(SMITE_DIR / "workloads" / target / "Dockerfile")
     cov = args_of(SMITE_DIR / "workloads" / target / "Dockerfile.coverage")
-    out = []
-    for name in sorted(cov.keys() & prod.keys()):
-        out += ["--build-arg", f"{name}={prod[name]}"]
-    return out
+    drift = [f"{n}={cov[n]} (fuzzed {prod[n]})" for n in sorted(cov.keys() & prod.keys()) if cov[n] != prod[n]]
+    if drift:
+        sys.exit(f"ERROR: workloads/{target}/Dockerfile.coverage drifted: {', '.join(drift)}")
 
 
 def ensure_coverage_image(target: str, scenario: str, force: bool):
+    check_coverage_pins(target)
     image = coverage_image(target, scenario)
     exists = subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode == 0
     if exists and not force:
         return
     log(f"[{scenario}/{target}] building {image}")
-    run(["docker", "build", "-t", image, *pinned_build_args(target), "--build-arg", f"SCENARIO={scenario}",
+    run(["docker", "build", "-t", image, "--build-arg", f"SCENARIO={scenario}",
          "-f", str(SMITE_DIR / "workloads" / target / "Dockerfile.coverage"), str(SMITE_DIR)])
 
 
