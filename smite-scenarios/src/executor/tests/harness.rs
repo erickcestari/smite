@@ -54,6 +54,7 @@ pub struct MockBitcoinCli {
     pub mine_blocks_calls: Vec<u8>,
     pub mined_private_mempool: Vec<String>,
     pub broadcast_calls: Vec<Transaction>,
+    pub sign_calls: Vec<Transaction>,
     pub block_position_lookups: Vec<Txid>,
     pub locked_outpoints: Vec<OutPoint>,
     utxos: Vec<Utxo>,

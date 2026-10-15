@@ -364,9 +364,8 @@ impl BitcoinCli {
             .expect("getnewaddress should return a valid address")
     }
 
-    /// Signs the wallet-owned inputs of `tx`, returning the partially or fully
-    /// signed transaction, or `None` if the node does not know how to sign any
-    /// of them.
+    /// Signs the wallet-owned inputs of `tx`, returning it with every input the
+    /// wallet cannot sign left untouched.
     ///
     /// Unlike [`Self::sign_and_broadcast_tx`], this does not require signing to
     /// be complete. A channel establishment v2 funding transaction also carries
@@ -377,34 +376,30 @@ impl BitcoinCli {
     ///
     /// # Panics
     ///
-    /// - If `bitcoin-cli signrawtransactionwithwallet` fails to execute.
+    /// - If `tx` has no inputs, since bitcoind cannot decode its serialization.
+    /// - If `bitcoin-cli signrawtransactionwithwallet` fails to execute or
+    ///   exits non-zero.
     /// - If the command succeeds but its output is not valid JSON, or its `hex`
     ///   field does not decode as a transaction.
     #[must_use]
-    pub fn sign_tx(&self, tx: &Transaction) -> Option<Transaction> {
-        let signed = self
-            .sign_raw_transaction_with_wallet(tx)
-            .inspect_err(|stderr| {
-                log::debug!("bitcoin-cli signrawtransactionwithwallet failed: {stderr}");
-            })
-            .ok()?;
-        Some(
-            deserialize(&hex::decode(&signed.hex).expect("signing should return valid hex"))
-                .expect("signing should return a valid transaction"),
-        )
+    pub fn sign_tx(&self, tx: &Transaction) -> Transaction {
+        let signed = self.sign_raw_transaction_with_wallet(tx);
+        deserialize(&hex::decode(&signed.hex).expect("signing should return valid hex"))
+            .expect("signing should return a valid transaction")
     }
 
-    /// Runs `signrawtransactionwithwallet`, returning the raw response, or the
-    /// command's stderr if it exits non-zero.
+    /// Runs `signrawtransactionwithwallet`, returning the raw response.
     ///
-    /// Whether a non-zero exit is fatal is the caller's to decide, so the
-    /// stderr is handed back rather than logged here: [`Self::sign_tx`] treats
-    /// it as a transaction the wallet cannot sign, while
-    /// [`Self::sign_and_broadcast_tx`] panics and needs it in the message.
-    fn sign_raw_transaction_with_wallet(
-        &self,
-        tx: &Transaction,
-    ) -> Result<SignRawTransactionResponse, String> {
+    /// Per-input failures, such as an input the wallet does not own, come back
+    /// in the response. The RPC itself fails only on a transaction with no
+    /// inputs or a broken node, so a non-zero exit is fatal.
+    ///
+    /// # Panics
+    ///
+    /// - If `bitcoin-cli signrawtransactionwithwallet` fails to execute or
+    ///   exits non-zero.
+    /// - If the command succeeds but its output is not valid JSON.
+    fn sign_raw_transaction_with_wallet(&self, tx: &Transaction) -> SignRawTransactionResponse {
         let signed_out = self
             .run()
             .arg("signrawtransactionwithwallet")
@@ -412,12 +407,14 @@ impl BitcoinCli {
             .output()
             .expect("bitcoin-cli signrawtransactionwithwallet should not fail");
 
-        if !signed_out.status.success() {
-            return Err(String::from_utf8_lossy(&signed_out.stderr).into_owned());
-        }
+        assert!(
+            signed_out.status.success(),
+            "bitcoin-cli signrawtransactionwithwallet failed: {}",
+            String::from_utf8_lossy(&signed_out.stderr)
+        );
 
-        Ok(serde_json::from_slice(&signed_out.stdout)
-            .expect("signrawtransactionwithwallet should return valid JSON"))
+        serde_json::from_slice(&signed_out.stdout)
+            .expect("signrawtransactionwithwallet should return valid JSON")
     }
 
     /// Signs and broadcasts a transaction, unless it is already confirmed.
@@ -461,11 +458,7 @@ impl BitcoinCli {
             return None;
         }
 
-        let signed_tx = self
-            .sign_raw_transaction_with_wallet(tx)
-            .unwrap_or_else(|stderr| {
-                panic!("bitcoin-cli signrawtransactionwithwallet failed: {stderr}")
-            });
+        let signed_tx = self.sign_raw_transaction_with_wallet(tx);
         if !signed_tx.complete {
             log::debug!(
                 "signrawtransactionwithwallet could not fully sign {txid}, not broadcasting"
