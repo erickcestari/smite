@@ -17,7 +17,7 @@ if [ $# -ne 2 ]; then
     echo "Usage: $0 <scenario> <crash-log>"
     echo ""
     echo "Arguments:"
-    echo "  scenario   Scenario name (encrypted_bytes, noise, ir, init)"
+    echo "  scenario   Scenario name (encrypted_bytes, encrypted_messages, noise, ir, init)"
     echo "  crash-log  File containing unsymbolized crash report"
     exit 1
 fi
