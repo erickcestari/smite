@@ -127,6 +127,40 @@ impl NoiseConnection {
 
         Ok(msg)
     }
+
+    /// Discards every message the peer has already sent, without waiting for
+    /// more, and returns how many were discarded.
+    ///
+    /// Keeps the peer from blocking on a full send buffer when its replies are
+    /// not otherwise read. Messages are decrypted rather than skipped as raw
+    /// bytes, so the cipher stays in sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if reading fails, or a Noise error if decryption fails.
+    pub fn drain(&mut self) -> Result<usize, ConnectionError> {
+        let mut drained = 0;
+        while self.has_pending_bytes()? {
+            // A started message is read to its end, blocking up to the read
+            // timeout for the remainder.
+            self.recv_message()?;
+            drained += 1;
+        }
+        Ok(drained)
+    }
+
+    /// Returns whether a read would return data right now. A closed connection
+    /// counts as no data.
+    fn has_pending_bytes(&self) -> Result<bool, ConnectionError> {
+        self.stream.set_nonblocking(true)?;
+        let peeked = self.stream.peek(&mut [0]);
+        self.stream.set_nonblocking(false)?;
+        match peeked {
+            Ok(n) => Ok(n > 0),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 /// Makes the kernel ACK the peer's next segments immediately.
@@ -212,5 +246,31 @@ mod tests {
         conn.send_message(b"ping").unwrap();
 
         assert!(quickack(&conn.stream));
+    }
+
+    #[test]
+    fn drain_discards_pending_messages_and_keeps_cipher_in_sync() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut conn = NoiseConnection {
+            stream,
+            cipher: NoiseCipher::new([1; 32], [2; 32], [3; 32]),
+        };
+        let mut peer_cipher = NoiseCipher::new([2; 32], [1; 32], [3; 32]);
+
+        assert_eq!(conn.drain().unwrap(), 0);
+
+        peer.write_all(&peer_cipher.encrypt(b"first")).unwrap();
+        peer.write_all(&peer_cipher.encrypt(b"second")).unwrap();
+        // Block until the data has arrived, so the drain cannot race it.
+        conn.stream.peek(&mut [0]).unwrap();
+        assert_eq!(conn.drain().unwrap(), 2);
+
+        peer.write_all(&peer_cipher.encrypt(b"third")).unwrap();
+        assert_eq!(conn.recv_message().unwrap(), b"third");
+
+        drop(peer);
+        assert_eq!(conn.drain().unwrap(), 0);
     }
 }

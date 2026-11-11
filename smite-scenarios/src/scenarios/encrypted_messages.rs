@@ -62,8 +62,8 @@ impl<T: Target> Scenario for EncryptedMessagesScenario<T> {
 
         let messages = split_messages(input);
         for (i, msg) in messages.iter().enumerate() {
-            // A failed send means the target closed the connection on an
-            // earlier message, so the rest cannot be delivered.
+            // A failed send or drain means the target closed the connection on
+            // an earlier message, so the rest cannot be delivered.
             if let Err(e) = self.conn.send_message(msg) {
                 log::debug!("[{:?}] send message {i}: {e}", start.elapsed());
                 break;
@@ -73,6 +73,13 @@ impl<T: Target> Scenario for EncryptedMessagesScenario<T> {
                 start.elapsed(),
                 msg.len()
             );
+
+            // Replies are never read here, so discard them: a target blocked
+            // on a full send buffer would stop reading our messages.
+            if let Err(e) = self.conn.drain() {
+                log::debug!("[{:?}] drain after message {i}: {e}", start.elapsed());
+                break;
+            }
         }
 
         // Synchronize so that every message was received and initially
